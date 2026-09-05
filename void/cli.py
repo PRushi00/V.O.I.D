@@ -263,6 +263,36 @@ def cmd_clear_stop() -> int:
     return 0
 
 
+def cmd_roots(action: str, path: str | None) -> int:
+    """Owner-only management of trusted filesystem roots.
+
+    This is an authorization boundary: it is a CLI command, never an agent
+    tool. Changes take effect on the next V.O.I.D run (config is loaded at
+    startup).
+    """
+    from void import roots as roots_mod
+
+    if action == "list":
+        print("Allowed filesystem roots:")
+        for r in roots_mod.list_roots():
+            print(f"  - {r}")
+        return 0
+    if not path:
+        print(f"'roots {action}' requires an exact directory path.")
+        return 1
+    try:
+        if action == "add":
+            added = roots_mod.add_root(path)
+            print(f"Authorized new allowed root: {added}")
+        else:  # remove
+            removed = roots_mod.remove_root(path)
+            print(f"Removed allowed root: {removed}")
+    except roots_mod.RootError as exc:
+        print(f"Could not {action} root: {exc}")
+        return 1
+    return 0
+
+
 def cmd_ui() -> int:
     try:
         from void.ui.widget import launch
@@ -306,6 +336,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("clear-stop", help="Clear an engaged stop")
     sub.add_parser("ui", help="Launch the circular widget")
 
+    p_roots = sub.add_parser(
+        "roots", help="Manage trusted filesystem roots (owner-only)")
+    p_roots.add_argument("action", choices=["list", "add", "remove"])
+    p_roots.add_argument("path", nargs="?", default=None,
+                         help="Exact directory path (for add/remove).")
+
     return parser
 
 
@@ -314,7 +350,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Convenience: `python -m void "goal text"` with no subcommand -> run.
     known = {"run", "resume", "set-key", "list-keys", "remove-key", "set-pin",
-             "tasks", "stop", "clear-stop", "ui", "-h", "--help"}
+             "tasks", "stop", "clear-stop", "ui", "roots", "-h", "--help"}
     if argv and argv[0] not in known:
         return cmd_run(" ".join(argv))
 
@@ -341,6 +377,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_clear_stop()
     if args.command == "ui":
         return cmd_ui()
+    if args.command == "roots":
+        return cmd_roots(args.action, args.path)
 
     parser.print_help()
     return 0

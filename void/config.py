@@ -19,6 +19,15 @@ _REPO_ROOT = _PKG_DIR.parent
 _CONFIG_DIR = _REPO_ROOT / "config"
 
 
+def local_config_path() -> Path:
+    """Path to the gitignored, machine-local config override file.
+
+    Machine-local settings (e.g. security.allowed_roots) live here, never in
+    the Git-tracked default config.
+    """
+    return _CONFIG_DIR / "local_config.yaml"
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge ``override`` into a copy of ``base``."""
     result = copy.deepcopy(base)
