@@ -49,6 +49,7 @@ class Assistant:
             allowed_roots=self.config.allowed_roots(),
             delete_to_recycle_bin=self.config.get(
                 "security.delete_to_recycle_bin", True),
+            protected_roots=self.config.protected_roots(),
         )
         app_actions = AppActions(file_actions)
         self.tools = ToolRegistry()

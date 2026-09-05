@@ -293,6 +293,35 @@ def cmd_roots(action: str, path: str | None) -> int:
     return 0
 
 
+def cmd_protect(action: str, path: str | None) -> int:
+    """Owner-only management of protected (excluded) filesystem roots.
+
+    Protected roots override allowed roots (deny-always). Like `roots`, this is
+    a CLI command, never an agent tool. Changes take effect on the next run.
+    """
+    from void import roots as roots_mod
+
+    if action == "list":
+        print("Protected (excluded) filesystem roots:")
+        for r in roots_mod.list_protected():
+            print(f"  - {r}")
+        return 0
+    if not path:
+        print(f"'protect {action}' requires an exact directory path.")
+        return 1
+    try:
+        if action == "add":
+            added = roots_mod.add_protected(path)
+            print(f"Protected (excluded) directory: {added}")
+        else:  # remove
+            removed = roots_mod.remove_protected(path)
+            print(f"Removed protected directory: {removed}")
+    except roots_mod.RootError as exc:
+        print(f"Could not {action} protected root: {exc}")
+        return 1
+    return 0
+
+
 def cmd_ui() -> int:
     try:
         from void.ui.widget import launch
@@ -342,6 +371,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_roots.add_argument("path", nargs="?", default=None,
                          help="Exact directory path (for add/remove).")
 
+    p_protect = sub.add_parser(
+        "protect",
+        help="Manage protected (excluded) filesystem roots (owner-only)")
+    p_protect.add_argument("action", choices=["list", "add", "remove"])
+    p_protect.add_argument("path", nargs="?", default=None,
+                           help="Exact directory path (for add/remove).")
+
     return parser
 
 
@@ -350,7 +386,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # Convenience: `python -m void "goal text"` with no subcommand -> run.
     known = {"run", "resume", "set-key", "list-keys", "remove-key", "set-pin",
-             "tasks", "stop", "clear-stop", "ui", "roots", "-h", "--help"}
+             "tasks", "stop", "clear-stop", "ui", "roots", "protect",
+             "-h", "--help"}
     if argv and argv[0] not in known:
         return cmd_run(" ".join(argv))
 
@@ -379,6 +416,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_ui()
     if args.command == "roots":
         return cmd_roots(args.action, args.path)
+    if args.command == "protect":
+        return cmd_protect(args.action, args.path)
 
     parser.print_help()
     return 0

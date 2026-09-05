@@ -46,6 +46,12 @@ security:
   # machine. Put machine-specific working folders in config/local_config.yaml.
   allowed_roots:
     - "~/VOID/workspace"
+  # Protected (excluded) directories. These OVERRIDE allowed_roots: anything
+  # inside a protected root is denied even if it also sits inside an allowed
+  # root. Use this to exclude a subtree (e.g. OneDrive Personal) after
+  # authorizing a broad root. Machine-specific paths go in local_config.yaml
+  # (never here, never in Git). Empty by default = nothing excluded.
+  protected_roots: []
   # Deletes go to the Recycle Bin, never a hard unlink, in V1.
   delete_to_recycle_bin: true
 

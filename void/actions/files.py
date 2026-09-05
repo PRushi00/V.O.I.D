@@ -27,16 +27,47 @@ class PathNotAllowed(Exception):
 
 
 class FileActions:
-    def __init__(self, allowed_roots: list[Path], delete_to_recycle_bin: bool = True):
+    def __init__(self, allowed_roots: list[Path], delete_to_recycle_bin: bool = True,
+                 protected_roots: list[Path] | None = None):
         # Resolve roots once; empty list means "no confinement" (discouraged).
         self.allowed_roots = [Path(r).resolve() for r in allowed_roots]
+        # Protected roots are EXCLUSIONS that override allowed_roots. Anything
+        # inside a protected root is denied even when it also sits inside an
+        # allowed root (e.g. OneDrive Personal under an authorized C:\).
+        self.protected_roots = [Path(r).resolve() for r in (protected_roots or [])]
         self.delete_to_recycle_bin = delete_to_recycle_bin
 
     # --- safety --------------------------------------------------------
 
+    def _is_protected(self, path: Path) -> bool:
+        """True if ``path`` is a protected root or a descendant of one.
+
+        Uses Path-based containment (never string prefixes), so a protected
+        root ``.../Projects`` does not accidentally match ``.../ProjectsBackup``.
+        """
+        for pr in self.protected_roots:
+            try:
+                if path == pr or path.is_relative_to(pr):
+                    return True
+            except ValueError:
+                continue
+        return False
+
     def _confine(self, path_str: str) -> Path:
-        """Resolve a path and ensure it lives under an allowed root."""
+        """Resolve a path and ensure it is allowed and not protected.
+
+        Precedence: canonicalize -> PROTECTED check (deny) -> allowed check.
+        Protected roots always win, so an excluded subtree is denied regardless
+        of what the caller (or the LLM) requests.
+        """
         path = Path(os.path.expanduser(path_str)).resolve()
+        # Protected roots override everything, evaluated after canonicalization
+        # (so traversal and symlinks cannot slip past the exclusion).
+        if self._is_protected(path):
+            raise PathNotAllowed(
+                f"'{path}' is inside a protected (excluded) directory and "
+                f"cannot be accessed."
+            )
         if not self.allowed_roots:
             # V1 safety: no configured roots means DENY everything (never
             # "allow the whole machine"). Configure security.allowed_roots.
@@ -80,16 +111,23 @@ class FileActions:
             return ToolResult.failure(str(exc), error=str(exc))
 
         for base in roots:
-            if not base.exists():
+            if not base.exists() or self._is_protected(base):
                 continue
             for dirpath, dirnames, filenames in os.walk(base):
-                dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS
-                               and not d.startswith(".")]
+                # Prune noise AND never descend into protected subtrees.
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d not in _SKIP_DIRS and not d.startswith(".")
+                    and not self._is_protected(Path(dirpath) / d)
+                ]
                 for name in filenames:
+                    full = Path(dirpath) / name
+                    if self._is_protected(full):
+                        continue  # protected files never surface in results
                     hit = (fnmatch.fnmatch(name.lower(), needle) if is_glob
                            else needle in name.lower())
                     if hit:
-                        matches.append(str(Path(dirpath) / name))
+                        matches.append(str(full))
                         if len(matches) >= max_results:
                             break
                 if len(matches) >= max_results:
@@ -139,7 +177,8 @@ class FileActions:
                     "No allowed roots are configured; all file access is denied. "
                     "Set security.allowed_roots in config."
                 )
-            bases = [r for r in self.allowed_roots if r.is_dir()]
+            bases = [r for r in self.allowed_roots
+                     if r.is_dir() and not self._is_protected(r)]
             if not bases:
                 return ToolResult.failure(
                     "No configured workspace directory exists yet "
@@ -162,6 +201,9 @@ class FileActions:
                 # Respect the same noise filter search uses for directories.
                 if is_dir and (child.name in _SKIP_DIRS
                                or child.name.startswith(".")):
+                    continue
+                # Never expose protected-root entries or their contents.
+                if self._is_protected(child):
                     continue
                 if len(entries) >= max_entries:
                     truncated = True

@@ -100,3 +100,12 @@ class Config:
     def allowed_roots(self) -> list[Path]:
         roots = self.get("security.allowed_roots", ["~"]) or []
         return [Path(os.path.expanduser(r)).resolve() for r in roots]
+
+    def protected_roots(self) -> list[Path]:
+        """Excluded directories that override allowed_roots (deny-always).
+
+        Machine-specific (e.g. OneDrive Personal); configured in the gitignored
+        local config, never in the tracked default.
+        """
+        roots = self.get("security.protected_roots", []) or []
+        return [Path(os.path.expanduser(r)).resolve() for r in roots]
