@@ -130,3 +130,106 @@ def test_max_steps_cap(tmp_path):
     assert result.status == Status.FAILED
     assert result.steps == 3
     assert "max_steps" in (result.task.error or "")
+
+
+# --- folder resolution (agent integration) -----------------------------
+
+def test_system_prompt_has_folder_resolution_policy():
+    # The behavioral change is prompt-driven; assert the policy text is present.
+    from void.core.agent import SYSTEM_PROMPT
+    p = SYSTEM_PROMPT.lower()
+    assert "list_directory" in p                 # directory discovery tool named
+    assert "search_files" in p                   # distinguished from file search
+    assert "invent" in p                         # do not invent paths
+    assert "ask" in p                            # clarification path exists
+
+
+def test_A_resolves_existing_directory_then_writes(tmp_path):
+    # User asks to create a file in an EXISTING directory. The agent discovers
+    # the folder with list_directory, then writes to the path it returned.
+    projects = tmp_path / "Projects"
+    projects.mkdir()
+    target = projects / "Testcase.txt"
+    agent = build_agent(tmp_path, [
+        LLMResponse(tool_calls=[tool_call("list_directory")]),
+        LLMResponse(tool_calls=[tool_call(
+            "write_file", path=str(target), content="hi")]),
+        LLMResponse(text="Created Testcase.txt in the Projects folder."),
+    ])
+    result = agent.run("Create Testcase.txt in the Projects folder")
+    assert result.status == Status.COMPLETED
+    assert target.exists() and target.read_text() == "hi"
+    tool_msgs = [m for m in result.task.messages if m["role"] == "tool"]
+    # list_directory actually ran and surfaced the Projects directory.
+    assert any(m["name"] == "list_directory" and "Projects" in m["content"]
+               for m in tool_msgs)
+
+
+def test_B_missing_directory_agent_can_ask_without_inventing_path(tmp_path):
+    # The Projects folder does NOT exist. The agent lists, sees it is absent,
+    # and asks for clarification instead of inventing a path or writing blindly.
+    agent = build_agent(tmp_path, [
+        LLMResponse(tool_calls=[tool_call("list_directory")]),
+        LLMResponse(text="I don't see a 'Projects' folder in your workspace. "
+                         "Should I create it?"),
+    ])
+    result = agent.run("Create Testcase.txt in the Projects folder")
+    assert result.status == Status.COMPLETED
+    # Nothing was created: no Projects dir, no Testcase.txt anywhere.
+    assert not (tmp_path / "Projects").exists()
+    assert list(tmp_path.rglob("Testcase.txt")) == []
+    # No write_file was ever executed.
+    tool_msgs = [m for m in result.task.messages if m["role"] == "tool"]
+    assert all(m["name"] != "write_file" for m in tool_msgs)
+    assert "create it" in (result.result or "").lower()
+
+
+def test_C_ambiguous_request_can_stop_and_ask(tmp_path):
+    # An ambiguous request: the agent stops and asks rather than broadening
+    # searches. A text-only turn ends the task cleanly in one step.
+    agent = build_agent(tmp_path, [
+        LLMResponse(text="Which folder do you mean by 'the project folder'? "
+                         "I can list your workspace if that helps."),
+    ])
+    result = agent.run("put this in the project folder")
+    assert result.status == Status.COMPLETED
+    assert result.steps == 1
+    # No tools were called at all - no search flailing.
+    tool_msgs = [m for m in result.task.messages if m["role"] == "tool"]
+    assert tool_msgs == []
+    assert "which folder" in (result.result or "").lower()
+
+
+def test_D_search_files_behavior_not_regressed(tmp_path):
+    # Existing search_files flow still works and still returns files.
+    (tmp_path / "cybersecurity_notes.md").write_text("x")
+    agent = build_agent(tmp_path, [
+        LLMResponse(tool_calls=[tool_call("search_files", query="cyber")]),
+        LLMResponse(text="Found your cybersecurity notes."),
+    ])
+    result = agent.run("find my cybersecurity notes")
+    assert result.status == Status.COMPLETED
+    tool_msgs = [m for m in result.task.messages if m["role"] == "tool"]
+    assert any(m["name"] == "search_files"
+               and "cybersecurity_notes.md" in m["content"] for m in tool_msgs)
+
+
+def test_E_resolution_flow_preserves_high_risk_gate(tmp_path):
+    # Discovering a folder must NOT bypass the HIGH-risk confirmation gate:
+    # overwriting an existing file in a resolved folder is still refused.
+    projects = tmp_path / "Projects"
+    projects.mkdir()
+    existing = projects / "keep.txt"
+    existing.write_text("original")
+    agent = build_agent(
+        tmp_path,
+        [LLMResponse(tool_calls=[tool_call("list_directory")]),
+         LLMResponse(tool_calls=[tool_call(
+             "write_file", path=str(existing), content="HACKED", overwrite=True)]),
+         LLMResponse(text="I did not modify it.")],
+        confirm_fn=lambda desc: False,  # owner refuses the HIGH-risk overwrite
+    )
+    result = agent.run("overwrite keep.txt in the Projects folder")
+    assert existing.read_text() == "original"  # unchanged
+    tool_msgs = [m for m in result.task.messages if m["role"] == "tool"]
+    assert any("not authorized" in m["content"] for m in tool_msgs)

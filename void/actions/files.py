@@ -19,6 +19,7 @@ _SKIP_DIRS = {
     "$Recycle.Bin", "AppData", ".cache",
 }
 _MAX_READ_BYTES = 200_000
+_MAX_LIST_ENTRIES = 200  # cap on entries returned by list_directory
 
 
 class PathNotAllowed(Exception):
@@ -102,6 +103,87 @@ class FileActions:
         return ToolResult.success(
             f"Found {len(matches)} file(s) matching '{query}':\n{listing}",
             data=matches,
+        )
+
+    def list_dir(self, path: str | None = None,
+                 max_entries: int = _MAX_LIST_ENTRIES) -> ToolResult:
+        """List the files and subdirectories directly inside a directory.
+
+        Non-recursive (one level, like ``ls``). Confined to ``allowed_roots``.
+        When ``path`` is omitted, lists the configured allowed root(s) so the
+        agent can discover the workspace layout. Each entry is typed as
+        ``file`` or ``directory`` and carries its full path for later calls.
+        """
+        try:
+            max_entries = int(max_entries)
+        except (TypeError, ValueError):
+            max_entries = _MAX_LIST_ENTRIES
+        if max_entries <= 0:
+            max_entries = _MAX_LIST_ENTRIES
+
+        # Resolve which directory/directories to list.
+        if path:
+            try:
+                base = self._confine(path)
+            except PathNotAllowed as exc:
+                return ToolResult.failure(str(exc), error=str(exc))
+            if not base.exists():
+                return ToolResult.failure(f"Directory does not exist: {base}")
+            if not base.is_dir():
+                return ToolResult.failure(f"Not a directory: {base}")
+            bases = [base]
+        else:
+            if not self.allowed_roots:
+                # Deny-by-default: no roots configured means no access at all.
+                return ToolResult.failure(
+                    "No allowed roots are configured; all file access is denied. "
+                    "Set security.allowed_roots in config."
+                )
+            bases = [r for r in self.allowed_roots if r.is_dir()]
+            if not bases:
+                return ToolResult.failure(
+                    "No configured workspace directory exists yet "
+                    f"({', '.join(str(r) for r in self.allowed_roots)})."
+                )
+
+        entries: list[dict] = []
+        truncated = False
+        for base in bases:
+            try:
+                children = sorted(
+                    base.iterdir(),
+                    key=lambda p: (not p.is_dir(), p.name.lower()),
+                )
+            except OSError as exc:
+                return ToolResult.failure(
+                    f"Could not list {base}: {exc}", error=str(exc))
+            for child in children:
+                is_dir = child.is_dir()
+                # Respect the same noise filter search uses for directories.
+                if is_dir and (child.name in _SKIP_DIRS
+                               or child.name.startswith(".")):
+                    continue
+                if len(entries) >= max_entries:
+                    truncated = True
+                    break
+                entries.append({
+                    "name": child.name,
+                    "type": "directory" if is_dir else "file",
+                    "path": str(child),
+                })
+            if truncated:
+                break
+
+        where = str(bases[0]) if len(bases) == 1 else "the configured roots"
+        if not entries:
+            return ToolResult.success(
+                f"{where} is empty (no listable entries).", data=[])
+        listing = "\n".join(f"[{e['type']}] {e['path']}" for e in entries)
+        note = f" (truncated to {max_entries})" if truncated else ""
+        return ToolResult.success(
+            f"Contents of {where} - {len(entries)} entr"
+            f"{'y' if len(entries) == 1 else 'ies'}{note}:\n{listing}",
+            data=entries,
         )
 
     def read(self, path: str, max_bytes: int = _MAX_READ_BYTES) -> ToolResult:
@@ -208,6 +290,30 @@ class FileActions:
                     "required": ["query"],
                 },
                 handler=self.search,
+                risk=RiskLevel.LOW,
+            ),
+            Tool(
+                name="list_directory",
+                description=(
+                    "List the files and subdirectories directly inside a "
+                    "directory (one level, not recursive). Use this to discover "
+                    "folders such as 'Projects' before creating or opening files "
+                    "in them. Omit 'path' to list the configured workspace "
+                    "root(s). Each entry is marked as a file or a directory and "
+                    "includes its full path for use in later tool calls."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string",
+                                 "description": ("Directory to list. Omit to list "
+                                                 "the workspace root(s).")},
+                        "max_entries": {"type": "integer",
+                                        "description": "Max entries (default 200)."},
+                    },
+                    "required": [],
+                },
+                handler=self.list_dir,
                 risk=RiskLevel.LOW,
             ),
             Tool(
