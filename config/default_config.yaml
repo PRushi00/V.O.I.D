@@ -1,0 +1,59 @@
+# V.O.I.D V1 default configuration.
+# Copy any keys you want to override into config/local_config.yaml
+# (which is gitignored). Never put API keys here - those live in the OS
+# secret store (see security/secrets.py).
+
+app:
+  name: "V.O.I.D"
+  version: "0.1.0"
+  # Directory (relative to user home) for runtime state: tasks, checkpoints, logs.
+  state_dir: ".void"
+
+llm:
+  # Which provider drives planning/tool-calling by default.
+  # Order defines fallback: if the primary is unavailable, the next is tried.
+  primary: "gemini"
+  fallback: ["local"]
+
+  gemini:
+    model: "gemini-3.6-flash"
+    # API key is NOT stored here. It is read from the OS secret store under
+    # service="void", key="gemini_api_key". Set it with:
+    #   python -m void set-key gemini
+    temperature: 0.2
+    max_output_tokens: 2048
+
+  local:
+    # V1: EXPERIMENTAL / unverified fallback. Gemini is the primary V1 brain.
+    # Local fallback via Ollama (https://ollama.com). Runs on the RTX 5070.
+    base_url: "http://localhost:11434"
+    model: "llama3.1:8b"
+    temperature: 0.2
+
+agent:
+  max_steps: 12          # safety cap on tool-call iterations per goal
+  max_retries: 2         # per-step retry on transient failure
+
+security:
+  # Actions at or above this risk require explicit owner confirmation.
+  # levels: low < medium < high
+  # Note: creating a new file is MEDIUM (autonomous); modifying/overwriting an
+  # EXISTING file is HIGH (requires confirmation); deleting is HIGH.
+  confirm_at_or_above: "high"
+  # File operations are confined to these roots (V1: an explicit set of working
+  # folders, NEVER the whole home directory). ~ expands to the user home.
+  # An EMPTY list denies all file access (deny-by-default), it does not open the
+  # machine. Put machine-specific working folders in config/local_config.yaml.
+  allowed_roots:
+    - "~/VOID/workspace"
+  # Deletes go to the Recycle Bin, never a hard unlink, in V1.
+  delete_to_recycle_bin: true
+
+kill_switch:
+  # The exact phrase that triggers an emergency stop.
+  phrase: "VOID, STOP EVERYTHING"
+  # V1: STOP requires the authenticated PIN stored in the OS secret store
+  # (service="void", key="stop_pin"). Set it with: python -m void set-pin
+  # Fail-safe: if require_pin is true but no PIN has been set yet, a stop is
+  # still allowed (you must never be unable to stop). Set a PIN to enforce auth.
+  require_pin: true

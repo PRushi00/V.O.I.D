@@ -1,0 +1,42 @@
+GEMINI MODELS AVAILABLE TO THIS KEY (support generateContent)
+count=39
+==========================================================================================
+models/gemini-2.5-flash  |  Gemini 2.5 Flash  |  in=1048576 out=65536  |  methods=generateContent,countTokens,createCachedContent,batchGenerateContent
+models/gemini-2.5-pro  |  Gemini 2.5 Pro  |  in=1048576 out=65536  |  methods=generateContent,countTokens,createCachedContent,batchGenerateContent
+models/gemini-2.5-flash-preview-tts  |  Gemini 2.5 Flash Preview TTS  |  in=8192 out=16384  |  methods=countTokens,generateContent
+models/gemini-2.5-pro-preview-tts  |  Gemini 2.5 Pro Preview TTS  |  in=8192 out=16384  |  methods=countTokens,generateContent,batchGenerateContent
+models/gemma-4-26b-a4b-it  |  Gemma 4 26B A4B IT  |  in=262144 out=32768  |  methods=generateContent,countTokens
+models/gemma-4-31b-it  |  Gemma 4 31B IT  |  in=262144 out=32768  |  methods=generateContent,countTokens
+models/gemini-flash-latest  |  Gemini Flash Latest  |  in=1048576 out=65536  |  methods=generateContent,countTokens,createCachedContent,batchGenerateContent
+models/gemini-flash-lite-latest  |  Gemini Flash-Lite Latest  |  in=1048576 out=65536  |  methods=generateContent,countTokens,createCachedContent,batchGenerateContent
+models/gemini-pro-latest  |  Gemini Pro Latest  |  in=1048576 out=65536  |  methods=generateContent,countTokens,createCachedContent,batchGenerateContent
+models/gemini-2.5-flash-lite  |  Gemini 2.5 Flash-Lite  |  in=1048576 out=65536  |  methods=generateContent,countTokens,createCachedContent,batchGenerateContent
+models/gemini-2.5-flash-image  |  Nano Banana  |  in=32768 out=32768  |  methods=generateContent,countTokens,batchGenerateContent
+models/gemini-3-flash-preview  |  Gemini 3 Flash Preview  |  in=1048576 out=65536  |  methods=generateContent,countTokens,createCachedContent,batchGenerateContent
+models/gemini-3.1-pro-preview  |  Gemini 3.1 Pro Preview  |  in=1048576 out=65536  |  methods=generateContent,countTokens,createCachedContent,batchGenerateContent
+models/gemini-3.1-pro-preview-customtools  |  Gemini 3.1 Pro Preview Custom Tools  |  in=1048576 out=65536  |  methods=generateContent,countTokens,createCachedContent,batchGenerateContent
+models/gemini-3.1-flash-lite-preview  |  Gemini 3.1 Flash Lite Preview  |  in=1048576 out=65536  |  methods=generateContent,countTokens,createCachedContent,batchGenerateContent
+models/gemini-3.1-flash-lite  |  Gemini 3.1 Flash Lite  |  in=1048576 out=65536  |  methods=generateContent,countTokens,createCachedContent,batchGenerateContent
+models/gemini-3-pro-image-preview  |  Nano Banana Pro  |  in=131072 out=32768  |  methods=generateContent,countTokens,batchGenerateContent
+models/gemini-3-pro-image  |  Nano Banana Pro  |  in=131072 out=32768  |  methods=generateContent,countTokens,batchGenerateContent
+models/nano-banana-pro-preview  |  Nano Banana Pro  |  in=131072 out=32768  |  methods=generateContent,countTokens,batchGenerateContent
+models/gemini-3.1-flash-image-preview  |  Nano Banana 2  |  in=65536 out=65536  |  methods=generateContent,countTokens,batchGenerateContent
+models/gemini-3.1-flash-image  |  Nano Banana 2  |  in=65536 out=65536  |  methods=generateContent,countTokens,batchGenerateContent
+models/gemini-3.1-flash-lite-image  |  Nano Banana 2 Lite  |  in=65536 out=65536  |  methods=generateContent,countTokens,batchGenerateContent
+models/gemini-3.5-flash  |  Gemini 3.5 Flash  |  in=1048576 out=65536  |  methods=generateContent,countTokens,createCachedContent,batchGenerateContent
+models/gemini-3.5-flash-lite  |  Gemini 3.5 Flash Lite  |  in=1048576 out=65536  |  methods=generateContent,countTokens,createCachedContent,batchGenerateContent
+models/gemini-omni-flash-preview  |  Gemini Omni Flash Preview  |  in=131072 out=65536  |  methods=generateContent,countTokens
+models/gemini-omni-1.1-flash  |  Gemini Omni 1.1 Flash  |  in=131072 out=65536  |  methods=generateContent,countTokens
+models/gemini-3.5-transcribe  |  Gemini 3.5 Transcribe  |  in=98304 out=32768  |  methods=generateContent,countTokens
+models/gemini-3.6-flash  |  Gemini 3.6 Flash  |  in=1048576 out=65536  |  methods=generateContent,countTokens,createCachedContent,batchGenerateContent
+models/gemini-3.7-flash  |  Gemini 3.7 Flash  |  in=1048576 out=65536  |  methods=generateContent,countTokens,createCachedContent,batchGenerateContent
+models/lyria-3-clip-preview  |  Lyria 3 Clip Preview  |  in=1048576 out=65536  |  methods=generateContent,countTokens
+models/lyria-3-pro-preview  |  Lyria 3 Pro Preview  |  in=1048576 out=65536  |  methods=generateContent,countTokens
+models/gemini-3.1-flash-tts-preview  |  Gemini 3.1 Flash TTS Preview  |  in=8192 out=16384  |  methods=generateContent,countTokens,batchGenerateContent
+models/gemini-robotics-er-1.6-preview  |  Gemini Robotics-ER 1.6 Preview  |  in=131072 out=65536  |  methods=generateContent,countTokens,createCachedContent,batchGenerateContent
+models/gemini-robotics-er-2-preview  |  Gemini Robotics-ER 2 Preview  |  in=131072 out=65536  |  methods=generateContent,countTokens,createCachedContent,batchGenerateContent
+models/gemini-2.5-computer-use-preview-10-2025  |  Gemini 2.5 Computer Use Preview 10-2025  |  in=131072 out=65536  |  methods=generateContent,countTokens
+models/antigravity-preview-05-2026  |  Antigravity Agent Preview  |  in=131072 out=65536  |  methods=generateContent,countTokens
+models/deep-research-max-preview-04-2026  |  Deep Research Max Preview (Apr-21-2026)  |  in=131072 out=65536  |  methods=generateContent,countTokens
+models/deep-research-preview-04-2026  |  Deep Research Preview (Apr-21-2026)  |  in=131072 out=65536  |  methods=generateContent,countTokens
+models/deep-research-pro-preview-12-2025  |  Deep Research Pro Preview (Dec-12-2025)  |  in=131072 out=65536  |  methods=generateContent,countTokens

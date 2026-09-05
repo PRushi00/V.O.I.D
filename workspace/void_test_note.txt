@@ -1,0 +1,10 @@
+V.O.I.D test note
+==================
+
+This is a harmless, non-sensitive test file used to verify V.O.I.D's live
+Gemini tool-calling on Windows (locate + open a file). Safe to delete.
+
+Topic: cybersecurity basics
+- Enable multi-factor authentication everywhere.
+- Patch and update software regularly.
+- Use a password manager and unique passwords.

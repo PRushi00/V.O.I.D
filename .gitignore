@@ -1,0 +1,26 @@
+# V.O.I.D
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Local runtime state (tasks, checkpoints, logs) - never commit
+.void/
+*.sqlite
+*.sqlite3
+*.db
+*.log
+
+# Never commit secrets or local config overrides
+config/local_config.yaml
+.env
+*.key
+secrets.*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

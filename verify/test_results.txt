@@ -1,0 +1,8 @@
+.............................................                            [100%]
+============================== warnings summary ===============================
+..\.venv\Lib\site-packages\_pytest\cacheprovider.py:469
+  C:\Users\nanda\OneDrive\Desktop\Studies\AI\Assistant\V.O.I.D\.venv\Lib\site-packages\_pytest\cacheprovider.py:469: PytestCacheWarning: could not create cache path C:\Users\nanda\OneDrive\Desktop\Studies\AI\Assistant\V.O.I.D\.pytest_cache\v\cache\nodeids: [WinError 5] Access is denied: 'C:\\Users\\nanda\\OneDrive\\Desktop\\Studies\\AI\\Assistant\\V.O.I.D\\pytest-cache-files-frhr8cc8' -> 'C:\\Users\\nanda\\OneDrive\\Desktop\\Studies\\AI\\Assistant\\V.O.I.D\\.pytest_cache'
+    config.cache.set("cache/nodeids", sorted(self.cached_nodeids))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+45 passed, 1 warning in 0.73s

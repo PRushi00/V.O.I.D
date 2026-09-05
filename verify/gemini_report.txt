@@ -1,0 +1,12 @@
+V.O.I.D GEMINI RE-VERIFICATION
+Time: 2026-08-29T23:37:40
+Python: 3.14.7
+======================================================================
+[PASS] 1. Gemini connectivity
+    Test performed : Minimal live generate_content call on 'gemini-3.6-flash' using the stored key (key never printed)
+    Command/action : secrets.get_secret('gemini_api_key') -> genai.GenerativeModel('<model>').generate_content('Reply with exactly: OK')
+    Expected       : A non-empty text response from Gemini (e.g. 'OK')
+    Actual         : HTTP call succeeded in 2.32s; response text = 'OK'
+    Error          : (none)
+    Recommended fix: (none)
+----------------------------------------------------------------------

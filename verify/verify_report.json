@@ -1,0 +1,49 @@
+{
+  "timestamp": "2026-08-29T21:50:32",
+  "python": "3.14.7",
+  "executable": "C:\\Users\\nanda\\OneDrive\\Desktop\\Studies\\AI\\Assistant\\V.O.I.D\\.venv\\Scripts\\python.exe",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "in_venv": true,
+  "results": [
+    {
+      "name": "1. Gemini connectivity",
+      "test": "Read key from Windows Credential Manager; make a minimal live call",
+      "command": "secrets.get_secret('gemini_api_key') -> genai.GenerativeModel('<model>').generate_content('Reply with exactly: OK')",
+      "expected": "A non-empty text response from Gemini (e.g. 'OK')",
+      "actual": "No Gemini API key found in the OS credential store; a live call cannot be made without one.",
+      "status": "FAIL",
+      "error": "no key stored",
+      "fix": "Run 'python -m void set-key gemini' (the key is entered hidden and never printed), then re-run this check."
+    },
+    {
+      "name": "2. Local Ollama connectivity",
+      "test": "HTTP GET /api/tags on the local Ollama server",
+      "command": "HTTP GET http://localhost:11434/api/tags",
+      "expected": "HTTP 200 with a JSON list of locally installed models",
+      "actual": "Could not connect: URLError",
+      "status": "FAIL",
+      "error": "<urlopen error [WinError 10061] No connection could be made because the target machine actively refused it>",
+      "fix": "Ollama is the OPTIONAL offline fallback (Gemini is primary). To enable: install Ollama (free, local), run 'ollama serve', then 'ollama pull llama3.1:8b'."
+    },
+    {
+      "name": "3. Windows app launching / os.startfile",
+      "test": "Open a fresh temp .txt via os.startfile and launch Calculator, both through void's real AppActions code",
+      "command": "AppActions.open_path(<temp .txt>) [os.startfile]; AppActions.launch_app('calc')",
+      "expected": "Both return ok=True (a text viewer and Calculator open); no personal files touched",
+      "actual": "open_path -> ok=True ('Opened C:\\\\Users\\\\nanda\\\\AppData\\\\Local\\\\Temp\\\\void_verify_open.txt.'); launch_app('calc') -> ok=True ('Launched calc (calc).')",
+      "status": "PASS",
+      "error": "",
+      "fix": ""
+    },
+    {
+      "name": "4. PySide6 circular widget",
+      "test": "Construct QApplication + VoidWidget and render it to a PNG",
+      "command": "VoidWidget().grab().save('verify/widget_render.png')",
+      "expected": "Widget class constructs and renders; a PNG image is produced",
+      "actual": "Constructed OK; PNG saved=True; file=widget_render.png; bytes=9030; pixmap=510x450",
+      "status": "PASS",
+      "error": "",
+      "fix": ""
+    }
+  ]
+}
