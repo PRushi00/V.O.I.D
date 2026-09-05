@@ -5,8 +5,8 @@ keyring>=24.0          # secure secret storage (Windows Credential Manager backe
 send2trash>=1.8        # safe delete -> Recycle Bin (recoverable)
 
 # LLM providers
-google-generativeai>=0.7   # Gemini (cloud brain)
-requests>=2.31             # local provider talks to Ollama over HTTP
+google-genai>=2.0              # Gemini (cloud brain; google.genai Client)
+requests>=2.31                 # local provider talks to Ollama over HTTP
 
 # UI (optional at runtime; CLI works without it)
 PySide6>=6.6

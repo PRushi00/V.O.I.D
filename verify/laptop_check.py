@@ -43,7 +43,8 @@ def add(name, test, command, expected, actual, passed, error="", fix=""):
 def check_gemini():
     name = "1. Gemini connectivity"
     command = ("secrets.get_secret('gemini_api_key') -> "
-               "genai.GenerativeModel('<model>').generate_content('Reply with exactly: OK')")
+               "genai.Client(api_key=...).models.generate_content("
+               "model, 'Reply with exactly: OK')")
     expected = "A non-empty text response from Gemini (e.g. 'OK')"
     key = None
     try:
@@ -67,18 +68,20 @@ def check_gemini():
                     "hidden and never printed), then re-run this check.")
             return
         try:
-            import google.generativeai as genai
+            from google import genai
         except ImportError as e:
-            add(name, "Import google-generativeai", command, expected,
-                "google-generativeai is not installed in this environment.",
+            add(name, "Import google-genai", command, expected,
+                "google-genai is not installed in this environment.",
                 False, error=str(e),
                 fix="pip install -r requirements.txt")
             return
 
-        genai.configure(api_key=key)
-        model = genai.GenerativeModel(model_name)
+        client = genai.Client(api_key=key)
         t0 = time.time()
-        resp = model.generate_content("Reply with exactly: OK")
+        resp = client.models.generate_content(
+            model=model_name,
+            contents="Reply with exactly: OK",
+        )
         dt = time.time() - t0
         text = (getattr(resp, "text", "") or "").strip()
         add(name,

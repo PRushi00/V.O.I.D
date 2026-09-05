@@ -1,6 +1,6 @@
 """Read-only capability probe: list Gemini models available to the stored key.
 
-Calls google-generativeai's list_models() (a read-only ListModels API call) and
+Calls google-genai's models.list() (a read-only ListModels API call) and
 reports every model that supports generateContent, with its display name,
 supported methods, and token limits. The API key is read from the OS credential
 store, never printed, and scrubbed from any error text.
@@ -31,12 +31,14 @@ def main() -> int:
         return s.replace(key, "***REDACTED***") if key else s
 
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=key)
+        from google import genai
+        client = genai.Client(api_key=key)
         rows = []
-        for m in genai.list_models():
-            methods = list(getattr(m, "supported_generation_methods", []) or [])
-            if "generateContent" not in methods:
+        for m in client.models.list():
+            methods = list(getattr(m, "supported_actions", None)
+                           or getattr(m, "supported_generation_methods", None)
+                           or [])
+            if methods and "generateContent" not in methods:
                 continue
             rows.append({
                 "name": m.name,

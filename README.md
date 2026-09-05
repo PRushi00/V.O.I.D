@@ -100,7 +100,7 @@ the allowed roots, or to require a stop PIN.
 
 Run the suite: `python -m pytest`
 
-**Covered by automated tests (platform-agnostic, 41 tests passing):**
+**Covered by automated tests (platform-agnostic, 56 tests passing):**
 file search/read/write/confinement, delete-to-trash, risk gate, task
 checkpoint/recovery, kill switch (incl. cross-process file + PIN auth),
 provider selection/fallback, Gemini & Ollama message/tool translation, and the

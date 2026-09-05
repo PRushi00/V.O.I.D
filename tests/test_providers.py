@@ -1,4 +1,7 @@
 """Tests for provider selection and message/tool translation."""
+import base64
+import json
+
 import pytest
 
 from void.providers.base import (
@@ -43,9 +46,32 @@ def test_registry_raises_when_none_available():
         reg.select()
 
 
+# --- google-genai import / init ----------------------------------------
+
+def test_google_genai_imports():
+    from google import genai
+    from google.genai import types
+    assert genai.Client is not None
+    assert types.Part is not None
+    assert types.FunctionCall is not None
+    assert types.GenerateContentConfig is not None
+
+
+def test_gemini_provider_initializes_with_google_genai():
+    g = GeminiProvider(model="gemini-3.6-flash")
+    assert g.name == "gemini"
+    assert g.model == "gemini-3.6-flash"
+    genai, types = g._sdk()
+    assert genai.__name__ == "google.genai"
+    assert types.Part is not None
+    # No client until a key is loaded — translation does not need the API.
+    assert g._client is None
+
+
 # --- Gemini translation (no network) -----------------------------------
 
 def test_gemini_to_contents_extracts_system():
+    from google.genai import types
     g = GeminiProvider()
     messages = [
         {"role": "system", "content": "you are void"},
@@ -56,37 +82,58 @@ def test_gemini_to_contents_extracts_system():
     ]
     system, contents = g._to_contents(messages)
     assert system == "you are void"
-    assert contents[0] == {"role": "user", "parts": [{"text": "hi"}]}
-    # assistant tool call -> model role with function_call part
-    assert contents[1]["role"] == "model"
-    assert contents[1]["parts"][0]["function_call"]["name"] == "search_files"
-    # tool result -> function_response part
-    assert contents[2]["parts"][0]["function_response"]["name"] == "search_files"
+    assert isinstance(contents[0], types.Content)
+    assert contents[0].role == "user"
+    assert contents[0].parts[0].text == "hi"
+    assert contents[1].role == "model"
+    assert contents[1].parts[0].function_call.name == "search_files"
+    assert contents[1].parts[0].function_call.args == {"query": "x"}
+    fr = contents[2].parts[0].function_response
+    assert fr.name == "search_files"
+    assert fr.response == {"result": "found 1"}
 
 
 def test_gemini_to_tools():
     g = GeminiProvider()
-    specs = [ToolSpec("t", "desc", {"type": "object", "properties": {}})]
+    schema = {"type": "object", "properties": {"q": {"type": "string"}},
+              "required": ["q"]}
+    specs = [ToolSpec("search_files", "desc", schema)]
     out = g._to_tools(specs)
-    assert out[0]["function_declarations"][0]["name"] == "t"
+    decl = out[0].function_declarations[0]
+    assert decl.name == "search_files"
+    assert decl.description == "desc"
+    assert decl.parameters_json_schema == schema
     assert g._to_tools(None) is None
 
 
-class _FakeArgs(dict):
-    pass
+def test_automatic_function_calling_is_disabled():
+    g = GeminiProvider()
+    specs = [ToolSpec("t", "desc", {"type": "object", "properties": {}})]
+    cfg = g._generate_config("sys", specs)
+    assert cfg.automatic_function_calling is not None
+    assert cfg.automatic_function_calling.disable is True
+    # Declarations only — no Python callables for the SDK to execute.
+    assert cfg.tools[0].function_declarations[0].name == "t"
+    assert cfg.system_instruction == "sys"
 
+
+# Duck-typed doubles matching google.genai attribute shape (not live responses).
 
 class _FakeFuncCall:
-    def __init__(self, name, args):
+    def __init__(self, name, args, id=None, thought_signature=None):
         self.name = name
         self.args = args
+        self.id = id
+        self.thought_signature = thought_signature
 
 
 class _FakePart:
-    def __init__(self, text=None, function_call=None, thought_signature=None):
+    def __init__(self, text=None, function_call=None, thought_signature=None,
+                 thought=False):
         self.text = text
         self.function_call = function_call
         self.thought_signature = thought_signature
+        self.thought = thought
 
 
 class _FakeContent:
@@ -107,13 +154,13 @@ class _FakeResponse:
 def test_gemini_parse_tool_call():
     g = GeminiProvider()
     resp = _FakeResponse([
-        _FakePart(function_call=_FakeFuncCall("search_files",
-                                              _FakeArgs(query="cyber")))
+        _FakePart(function_call=_FakeFuncCall("search_files", {"query": "cyber"}))
     ])
     parsed = g._parse(resp)
     assert parsed.has_tool_calls
     assert parsed.tool_calls[0].name == "search_files"
     assert parsed.tool_calls[0].arguments == {"query": "cyber"}
+    assert parsed.raw is resp
 
 
 def test_gemini_parse_text():
@@ -122,6 +169,34 @@ def test_gemini_parse_text():
     parsed = g._parse(resp)
     assert not parsed.has_tool_calls
     assert parsed.text == "all done"
+
+
+def test_gemini_parse_preserves_function_call_id():
+    g = GeminiProvider()
+    resp = _FakeResponse([
+        _FakePart(function_call=_FakeFuncCall(
+            "search_files", {"query": "x"}, id="fc-1"))
+    ])
+    parsed = g._parse(resp)
+    assert parsed.tool_calls[0].id == "fc-1"
+
+
+def test_function_call_id_roundtrip_onto_function_response():
+    g = GeminiProvider()
+    resp = _FakeResponse([
+        _FakePart(function_call=_FakeFuncCall(
+            "search_files", {"query": "x"}, id="fc-99"))
+    ])
+    tc = g._parse(resp).tool_calls[0]
+    messages = [
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"name": tc.name, "arguments": tc.arguments,
+                         "id": tc.id, "signature": tc.signature}]},
+        {"role": "tool", "name": "search_files", "content": "found 1"},
+    ]
+    _system, contents = g._to_contents(messages)
+    assert contents[0].parts[0].function_call.id == "fc-99"
+    assert contents[1].parts[0].function_response.id == "fc-99"
 
 
 # --- Local (Ollama) translation ----------------------------------------
@@ -145,50 +220,64 @@ def test_local_parse_string_arguments():
     assert parsed.tool_calls[0].arguments == {"a": 1}
 
 
-# --- Gemini thought_signature preservation (3.x tool-calling) ----------
+# --- thought_signature preservation (shape-level; not live Gemini) -----
 
 def test_gemini_parse_captures_thought_signature():
-    import base64
     g = GeminiProvider()
-    sig = b"\x01\x02\x03thought-sig"
+    payload = b"\x01\x02\x03shape-only"
     resp = _FakeResponse([
-        _FakePart(function_call=_FakeFuncCall("search_files",
-                                              _FakeArgs(query="x")),
-                  thought_signature=sig),
+        _FakePart(function_call=_FakeFuncCall("search_files", {"query": "x"}),
+                  thought_signature=payload),
     ])
     parsed = g._parse(resp)
-    assert parsed.tool_calls[0].signature == base64.b64encode(sig).decode("ascii")
+    assert parsed.tool_calls[0].signature == base64.b64encode(payload).decode("ascii")
 
 
 def test_thought_signature_survives_response_to_request_roundtrip():
-    """Gemini response -> neutral message -> JSON checkpoint -> Gemini request."""
-    import base64
-    import json
+    """Parse -> agent message -> JSON checkpoint -> typed model Part."""
     g = GeminiProvider()
-    sig = b"gemini-3.x-signature-\x00\xff\x10"
+    payload = b"opaque-bytes-\x00\xff\x10"
 
-    # 1) Gemini response -> neutral ToolCall (as _parse would produce).
     resp = _FakeResponse([
         _FakePart(function_call=_FakeFuncCall("search_files",
-                                              _FakeArgs(query="void_test_note")),
-                  thought_signature=sig),
+                                              {"query": "void_test_note"}),
+                  thought_signature=payload),
     ])
     tc = g._parse(resp).tool_calls[0]
 
-    # 2) Neutral message exactly as the agent stores it on the task.
     msg = {"role": "assistant", "content": None,
            "tool_calls": [{"name": tc.name, "arguments": tc.arguments,
                            "id": tc.id, "signature": tc.signature}]}
-
-    # 3) Checkpoint serialization (task.py persists messages via json).
     msg_roundtripped = json.loads(json.dumps(msg))
 
-    # 4) Rebuild Gemini request contents.
     _system, contents = g._to_contents([msg_roundtripped])
-    part = contents[0]["parts"][0]
-    assert part["function_call"]["name"] == "search_files"
-    # The exact signature bytes are re-attached for the next turn.
-    assert part["thought_signature"] == sig
+    part = contents[0].parts[0]
+    assert part.function_call.name == "search_files"
+    # Same bytes, on the original function-call Part (not a neighbour).
+    assert part.thought_signature == payload
+    assert len(contents[0].parts) == 1
+
+
+def test_typed_part_signature_stays_on_original_part_position():
+    """google.genai.types.Part shape: signature stays on that Part index."""
+    from google.genai import types
+    g = GeminiProvider()
+    payload = b"\xaa\xbb"
+    typed = types.Part(
+        function_call=types.FunctionCall(name="search_files", args={"q": "1"}),
+        thought_signature=payload,
+    )
+    parsed = g._parse(_FakeResponse([typed]))
+    msg = {"role": "assistant", "content": None,
+           "tool_calls": [{"name": parsed.tool_calls[0].name,
+                           "arguments": parsed.tool_calls[0].arguments,
+                           "id": parsed.tool_calls[0].id,
+                           "signature": parsed.tool_calls[0].signature}]}
+    _system, contents = g._to_contents([msg])
+    part = contents[0].parts[0]
+    assert isinstance(part, types.Part)
+    assert part.thought_signature == payload
+    assert part.function_call.name == "search_files"
 
 
 def test_to_contents_without_signature_is_backward_compatible():
@@ -196,9 +285,63 @@ def test_to_contents_without_signature_is_backward_compatible():
     msg = {"role": "assistant", "content": None,
            "tool_calls": [{"name": "t", "arguments": {}}]}  # no signature key
     _system, contents = g._to_contents([msg])
-    part = contents[0]["parts"][0]
-    assert part["function_call"]["name"] == "t"
-    assert "thought_signature" not in part
+    part = contents[0].parts[0]
+    assert part.function_call.name == "t"
+    assert part.thought_signature is None
+
+
+def test_multiple_function_calls_keep_first_signature():
+    """Parallel calls: signature on the first function_call Part only."""
+    g = GeminiProvider()
+    first = b"\x11first"
+    resp = _FakeResponse([
+        _FakePart(function_call=_FakeFuncCall("search_files", {"query": "a"}),
+                  thought_signature=first),
+        _FakePart(function_call=_FakeFuncCall("read_file", {"path": "a.txt"})),
+    ])
+    parsed = g._parse(resp)
+    assert parsed.tool_calls[0].signature == base64.b64encode(first).decode("ascii")
+    assert parsed.tool_calls[1].signature is None
+
+    msg = {"role": "assistant", "content": None,
+           "tool_calls": [
+               {"name": parsed.tool_calls[0].name,
+                "arguments": parsed.tool_calls[0].arguments,
+                "id": parsed.tool_calls[0].id,
+                "signature": parsed.tool_calls[0].signature},
+               {"name": parsed.tool_calls[1].name,
+                "arguments": parsed.tool_calls[1].arguments,
+                "id": parsed.tool_calls[1].id,
+                "signature": parsed.tool_calls[1].signature},
+           ]}
+    _system, contents = g._to_contents([msg])
+    parts = contents[0].parts
+    assert len(parts) == 2
+    assert parts[0].function_call.name == "search_files"
+    assert parts[0].thought_signature == first
+    assert parts[1].function_call.name == "read_file"
+    assert parts[1].thought_signature is None
+
+
+def test_text_and_function_calls_stay_separate_parts():
+    g = GeminiProvider()
+    payload = b"\x22sig"
+    msg = {
+        "role": "assistant",
+        "content": "looking it up",
+        "tool_calls": [{
+            "name": "search_files",
+            "arguments": {"query": "x"},
+            "signature": base64.b64encode(payload).decode("ascii"),
+        }],
+    }
+    _system, contents = g._to_contents([msg])
+    parts = contents[0].parts
+    assert parts[0].text == "looking it up"
+    assert parts[0].function_call is None
+    assert parts[0].thought_signature is None
+    assert parts[1].function_call.name == "search_files"
+    assert parts[1].thought_signature == payload
 
 
 def test_local_to_messages_roles():
