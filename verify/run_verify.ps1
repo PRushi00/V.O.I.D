@@ -5,7 +5,7 @@
 # Reversible: delete the .venv folder to undo everything this sets up.
 
 $ErrorActionPreference = "Continue"
-$proj = "C:\Users\nanda\OneDrive\Desktop\Studies\AI\Assistant\V.O.I.D"
+$proj = "C:\V.O.I.D"
 Set-Location $proj
 
 $log = Join-Path $proj "verify\setup_log.txt"
