@@ -214,6 +214,62 @@ def test_D_search_files_behavior_not_regressed(tmp_path):
                and "cybersecurity_notes.md" in m["content"] for m in tool_msgs)
 
 
+# --- find_directory agent integration (Phase 6) ------------------------
+
+def test_find_directory_is_registered(tmp_path):
+    agent = build_agent(tmp_path, [LLMResponse(text="hi")])
+    assert "find_directory" in agent.tools.names()
+    # No policy-mutating tools are exposed to the agent.
+    assert not (set(agent.tools.names()) & {
+        "add_root", "remove_root", "add_protected", "remove_protected",
+        "roots", "protect"})
+
+
+def test_find_directory_output_is_untrusted(tmp_path):
+    (tmp_path / "Hackathon").mkdir()
+    agent = build_agent(tmp_path, [
+        LLMResponse(tool_calls=[tool_call("find_directory", query="Hackathon")]),
+        LLMResponse(text="found it"),
+    ])
+    result = agent.run("find the hackathon folder")
+    tool_msgs = [m for m in result.task.messages if m["role"] == "tool"]
+    assert tool_msgs and tool_msgs[0]["content"].startswith(
+        "[UNTRUSTED TOOL OUTPUT")
+    assert "Hackathon" in tool_msgs[0]["content"]
+
+
+def test_find_directory_unique_then_write(tmp_path):
+    hack = tmp_path / "a" / "Hackathon"
+    hack.mkdir(parents=True)
+    target = hack / "notes.txt"
+    agent = build_agent(tmp_path, [
+        LLMResponse(tool_calls=[tool_call("find_directory", query="Hackathon")]),
+        LLMResponse(tool_calls=[tool_call(
+            "write_file", path=str(target), content="hello")]),
+        LLMResponse(text="created notes.txt in Hackathon"),
+    ])
+    result = agent.run("open Hackathon and create notes.txt")
+    assert result.status == Status.COMPLETED
+    assert target.exists() and target.read_text() == "hello"
+
+
+def test_find_directory_multiple_flagged_ambiguous_no_autoselect(tmp_path):
+    (tmp_path / "x" / "Data").mkdir(parents=True)
+    (tmp_path / "y" / "Data").mkdir(parents=True)
+    # The model only searches, then asks (no write/open) - deterministic script.
+    agent = build_agent(tmp_path, [
+        LLMResponse(tool_calls=[tool_call("find_directory", query="Data")]),
+        LLMResponse(text="I found two 'Data' folders - which one do you mean?"),
+    ])
+    result = agent.run("open the Data folder")
+    assert result.status == Status.COMPLETED
+    tool_msgs = [m for m in result.task.messages if m["role"] == "tool"]
+    assert "ambiguous" in tool_msgs[0]["content"].lower()
+    # No file was created/opened automatically.
+    assert not any(m["role"] == "tool" and m["name"] == "write_file"
+                   for m in result.task.messages)
+
+
 def test_E_resolution_flow_preserves_high_risk_gate(tmp_path):
     # Discovering a folder must NOT bypass the HIGH-risk confirmation gate:
     # overwriting an existing file in a resolved folder is still refused.

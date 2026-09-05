@@ -18,8 +18,18 @@ _SKIP_DIRS = {
     "node_modules", ".git", "__pycache__", ".venv", "venv",
     "$Recycle.Bin", "AppData", ".cache",
 }
+# Extra system/noise directories skipped when scanning from a drive root.
+# Kept small and deliberate - not a configurable subsystem.
+_SYSTEM_NOISE_DIRS = {
+    "Windows", "WinSxS", "$Recycle.Bin", "System Volume Information",
+    "Recovery", "ProgramData",
+}
 _MAX_READ_BYTES = 200_000
 _MAX_LIST_ENTRIES = 200  # cap on entries returned by list_directory
+# find_directory bounds (fixed for this phase; not configurable).
+_FIND_DEFAULT_RESULTS = 25
+_FIND_MAX_RESULTS = 50        # hard ceiling
+_FIND_MAX_VISITED = 20_000    # directory-visit budget before giving up
 
 
 class PathNotAllowed(Exception):
@@ -52,6 +62,15 @@ class FileActions:
             except ValueError:
                 continue
         return False
+
+    def _is_reparse_point(self, path: Path) -> bool:
+        """True for symlinks/junctions (reparse points). Conservative: we never
+        traverse or match these, so a link/junction cannot lead a name-based
+        walk out of the allowed area or into a protected subtree."""
+        try:
+            return path.is_symlink()
+        except OSError:
+            return True  # if we cannot tell, treat as a link and skip it
 
     def _confine(self, path_str: str) -> Path:
         """Resolve a path and ensure it is allowed and not protected.
@@ -140,6 +159,105 @@ class FileActions:
         listing = "\n".join(matches)
         return ToolResult.success(
             f"Found {len(matches)} file(s) matching '{query}':\n{listing}",
+            data=matches,
+        )
+
+    def find_dir(self, query: str, root: str | None = None,
+                 max_results: int = _FIND_DEFAULT_RESULTS) -> ToolResult:
+        """Locate DIRECTORIES by name under the authorized roots.
+
+        Exact case-insensitive name match (glob if the query has * ? [ ]); never
+        substring, so 'Project' does not match 'Projects'. Bounded, pruned walk
+        that never descends into protected subtrees, symlinks/junctions, noise,
+        or system directories. Every emitted match is re-confined (allowed and
+        NOT protected). The tool never picks a winner among multiple matches.
+        """
+        query = (query or "").strip()
+        if not query:
+            return ToolResult.failure("Search query was empty.")
+        try:
+            max_results = int(max_results)
+        except (TypeError, ValueError):
+            max_results = _FIND_DEFAULT_RESULTS
+        if max_results <= 0:
+            max_results = _FIND_DEFAULT_RESULTS
+        max_results = min(max_results, _FIND_MAX_RESULTS)
+
+        is_glob = any(ch in query for ch in "*?[")
+        needle = query.lower()
+
+        # Resolve search roots. An explicit root is confined by _search_roots;
+        # a protected or out-of-bounds root fails here with the standard message.
+        try:
+            roots = self._search_roots(root)
+        except PathNotAllowed as exc:
+            return ToolResult.failure(str(exc), error=str(exc))
+        if root:
+            base0 = roots[0]
+            if not base0.exists():
+                return ToolResult.failure(f"Directory does not exist: {base0}")
+            if not base0.is_dir():
+                return ToolResult.failure(f"Not a directory: {base0}")
+
+        skip = _SKIP_DIRS | _SYSTEM_NOISE_DIRS
+        matches: list[dict] = []
+        visited = 0
+        visited_truncated = False
+        capped = False
+
+        for base in roots:
+            if not base.exists() or not base.is_dir() or self._is_protected(base):
+                continue
+            for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+                visited += 1
+                if visited > _FIND_MAX_VISITED:
+                    visited_truncated = True
+                    break
+
+                # Match the current directory's own name.
+                name = Path(dirpath).name
+                hit = (fnmatch.fnmatch(name.lower(), needle) if is_glob
+                       else name.lower() == needle)
+                if hit:
+                    try:
+                        confined = self._confine(dirpath)  # canonical + policy
+                    except PathNotAllowed:
+                        confined = None
+                    if confined is not None and not self._is_protected(confined):
+                        matches.append({"name": name, "path": str(confined)})
+                        if len(matches) >= max_results:
+                            capped = True
+                            break
+
+                # Prune before descending: noise/system, dotted, protected
+                # subtrees, and reparse points (symlinks/junctions).
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d not in skip and not d.startswith(".")
+                    and not self._is_protected(Path(dirpath) / d)
+                    and not self._is_reparse_point(Path(dirpath) / d)
+                ]
+            if capped or visited_truncated:
+                break
+
+        incomplete = capped or visited_truncated
+        if not matches:
+            if visited_truncated:
+                return ToolResult.success(
+                    f"Search was INCOMPLETE (reached the directory-visit limit) "
+                    f"before a match for '{query}' could be confirmed; the folder "
+                    f"may still exist. Narrow the search with a 'root'.", data=[])
+            return ToolResult.success(f"No directories matched '{query}'.", data=[])
+        if len(matches) == 1:
+            note = " (results may be incomplete)" if incomplete else ""
+            return ToolResult.success(
+                f"Found 1 directory matching '{query}'{note}: "
+                f"{matches[0]['path']}", data=matches)
+        listing = "\n".join(m["path"] for m in matches)
+        note = " (results may be incomplete)" if incomplete else ""
+        return ToolResult.success(
+            f"Found {len(matches)} directories matching '{query}' "
+            f"(ambiguous - do NOT pick one; ask the owner which){note}:\n{listing}",
             data=matches,
         )
 
@@ -332,6 +450,33 @@ class FileActions:
                     "required": ["query"],
                 },
                 handler=self.search,
+                risk=RiskLevel.LOW,
+            ),
+            Tool(
+                name="find_directory",
+                description=(
+                    "Find FOLDERS by name anywhere under the allowed roots "
+                    "(use this to locate a directory such as 'Hackathon' before "
+                    "opening it or writing inside it). Matches the directory "
+                    "name exactly (case-insensitive), or as a glob if the query "
+                    "contains * ? or []. It never returns files and never picks "
+                    "a winner: if several folders match, ALL are returned and "
+                    "you must ask the owner which one."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string",
+                                  "description": "Exact folder name or glob."},
+                        "root": {"type": "string",
+                                 "description": ("Optional directory to search "
+                                                 "under (must be allowed).")},
+                        "max_results": {"type": "integer",
+                                        "description": "Max matches (default 25)."},
+                    },
+                    "required": ["query"],
+                },
+                handler=self.find_dir,
                 risk=RiskLevel.LOW,
             ),
             Tool(

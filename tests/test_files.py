@@ -210,3 +210,138 @@ def test_list_directory_registered_as_low_risk_tool(fs):
     assert tool.risk is RiskLevel.LOW
     assert "path" in tool.parameters["properties"]
     assert tool.parameters["required"] == []
+
+
+# --- find_directory -----------------------------------------------------
+
+def test_find_directory_finds_nested(tmp_path):
+    target = tmp_path / "a" / "b" / "Hackathon"
+    target.mkdir(parents=True)
+    fa = FileActions(allowed_roots=[tmp_path])
+    res = fa.find_dir("Hackathon")
+    assert res.ok
+    assert len(res.data) == 1
+    assert res.data[0]["name"] == "Hackathon"
+    assert Path(res.data[0]["path"]) == target.resolve()
+
+
+def test_find_directory_nonexistent(tmp_path):
+    (tmp_path / "something").mkdir()
+    fa = FileActions(allowed_roots=[tmp_path])
+    res = fa.find_dir("Nope")
+    assert res.ok and res.data == []
+    assert "No directories matched" in res.summary
+
+
+def test_find_directory_case_insensitive_exact(tmp_path):
+    (tmp_path / "Hackathon").mkdir()
+    fa = FileActions(allowed_roots=[tmp_path])
+    assert fa.find_dir("hackathon").data[0]["name"] == "Hackathon"
+    assert fa.find_dir("HACKATHON").data[0]["name"] == "Hackathon"
+
+
+def test_find_directory_no_substring_match(tmp_path):
+    (tmp_path / "Projects").mkdir()
+    fa = FileActions(allowed_roots=[tmp_path])
+    assert fa.find_dir("Project").data == []      # exact only, not substring
+    assert len(fa.find_dir("Projects").data) == 1
+
+
+def test_find_directory_glob(tmp_path):
+    (tmp_path / "Proj_A").mkdir()
+    (tmp_path / "Proj_B").mkdir()
+    (tmp_path / "Other").mkdir()
+    fa = FileActions(allowed_roots=[tmp_path])
+    res = fa.find_dir("Proj*")
+    names = {d["name"] for d in res.data}
+    assert names == {"Proj_A", "Proj_B"}
+
+
+def test_find_directory_empty_query_fails(tmp_path):
+    fa = FileActions(allowed_roots=[tmp_path])
+    assert not fa.find_dir("   ").ok
+
+
+def test_find_directory_multiple_is_ambiguous(tmp_path):
+    (tmp_path / "x" / "Data").mkdir(parents=True)
+    (tmp_path / "y" / "Data").mkdir(parents=True)
+    fa = FileActions(allowed_roots=[tmp_path])
+    res = fa.find_dir("Data")
+    assert res.ok and len(res.data) == 2
+    assert "ambiguous" in res.summary.lower()
+    # Tool does not pick a winner: both paths present.
+    assert {Path(d["path"]).parent.name for d in res.data} == {"x", "y"}
+
+
+def test_find_directory_max_results_caps(tmp_path):
+    for i in range(5):
+        (tmp_path / f"p{i}" / "Dup").mkdir(parents=True)
+    fa = FileActions(allowed_roots=[tmp_path])
+    res = fa.find_dir("Dup", max_results=2)
+    assert len(res.data) == 2
+    assert "results may be incomplete" in res.summary
+
+
+def test_find_directory_hard_ceiling(tmp_path):
+    for i in range(51):
+        (tmp_path / f"p{i:02d}" / "Dup").mkdir(parents=True)
+    fa = FileActions(allowed_roots=[tmp_path])
+    res = fa.find_dir("Dup", max_results=100)   # request over the ceiling
+    assert len(res.data) == 50                  # clamped to hard ceiling
+
+
+def test_find_directory_visited_truncation(tmp_path, monkeypatch):
+    import void.actions.files as filesmod
+    for i in range(5):
+        (tmp_path / f"d{i}").mkdir()
+    monkeypatch.setattr(filesmod, "_FIND_MAX_VISITED", 1)
+    fa = FileActions(allowed_roots=[tmp_path])
+    res = fa.find_dir("does_not_exist")
+    assert res.ok and res.data == []
+    assert "INCOMPLETE" in res.summary          # must NOT claim "no directories"
+    assert "No directories matched" not in res.summary
+
+
+def test_find_directory_prunes_noise_and_dotdirs(tmp_path):
+    (tmp_path / "Windows" / "Target").mkdir(parents=True)      # system noise
+    (tmp_path / "node_modules" / "Target").mkdir(parents=True)  # _SKIP_DIRS
+    (tmp_path / ".hidden" / "Target").mkdir(parents=True)       # dotted
+    (tmp_path / "normal" / "Target").mkdir(parents=True)        # should be found
+    fa = FileActions(allowed_roots=[tmp_path])
+    res = fa.find_dir("Target")
+    assert len(res.data) == 1
+    assert Path(res.data[0]["path"]).parent.name == "normal"
+
+
+def test_find_directory_root_authorized(tmp_path):
+    (tmp_path / "sub" / "Target").mkdir(parents=True)
+    (tmp_path / "other" / "Target").mkdir(parents=True)
+    fa = FileActions(allowed_roots=[tmp_path])
+    res = fa.find_dir("Target", root=str(tmp_path / "sub"))
+    assert len(res.data) == 1
+    assert Path(res.data[0]["path"]).parent.name == "sub"
+
+
+def test_find_directory_root_unauthorized(tmp_path):
+    (tmp_path / "allowed").mkdir()
+    fa = FileActions(allowed_roots=[tmp_path / "allowed"])
+    res = fa.find_dir("x", root=str(tmp_path.parent))   # outside allowed
+    assert not res.ok
+    assert "outside the allowed roots" in res.summary
+
+
+def test_find_directory_root_is_a_file(tmp_path):
+    f = tmp_path / "afile.txt"
+    f.write_text("x")
+    fa = FileActions(allowed_roots=[tmp_path])
+    res = fa.find_dir("x", root=str(f))
+    assert not res.ok
+    assert "Not a directory" in res.summary
+
+
+def test_find_directory_registered_as_low_risk_tool(fs):
+    from void.security.risk import RiskLevel
+    tool = next((t for t in fs.tools() if t.name == "find_directory"), None)
+    assert tool is not None
+    assert tool.risk is RiskLevel.LOW
+    assert tool.parameters["required"] == ["query"]

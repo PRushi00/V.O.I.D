@@ -325,6 +325,61 @@ def test_cli_protect_rejects_file(local, monkeypatch, tmp_path):
 
 # P & 17. Mechanical security regression --------------------------------
 
+# --- find_directory vs protected roots ---------------------------------
+
+def test_find_directory_never_returns_protected(tree):
+    fa = tree["fa"]
+    (tree["onedrive"] / "Secret").mkdir()
+    (tree["desktop"] / "Secret").mkdir()   # a non-protected 'Secret' sibling
+    res = fa.find_dir("Secret")
+    paths = {Path(d["path"]) for d in res.data}
+    assert (tree["onedrive"] / "Secret").resolve() not in paths
+    assert (tree["desktop"] / "Secret").resolve() in paths
+
+
+def test_find_directory_does_not_traverse_protected_subtree(tree):
+    fa = tree["fa"]
+    (tree["onedrive"] / "Deep" / "Buried").mkdir(parents=True)
+    assert fa.find_dir("Buried").data == []      # never descended into OneDrive
+
+
+def test_find_directory_protected_root_itself_not_returned(tree):
+    fa = tree["fa"]
+    # 'OneDrive' is the protected root; it must not be discoverable/disclosed.
+    res = fa.find_dir("OneDrive")
+    assert res.data == []
+    assert "OneDrive" not in res.summary or "No directories matched" in res.summary
+    assert str(tree["onedrive"]) not in res.summary
+
+
+def test_find_directory_sibling_prefix_is_searchable(tree):
+    fa = tree["fa"]
+    # backup fixture dir is 'OneDriveBackup' - a sibling, NOT protected.
+    res = fa.find_dir("OneDriveBackup")
+    assert len(res.data) == 1
+    assert Path(res.data[0]["path"]) == tree["backup"].resolve()
+
+
+def test_find_directory_root_inside_protected_denied(tree):
+    fa = tree["fa"]
+    res = fa.find_dir("x", root=str(tree["onedrive"]))
+    assert not res.ok                            # confined -> denied
+
+
+def test_find_directory_symlink_into_protected_dropped(tree, tmp_path):
+    fa = tree["fa"]
+    link = tree["desktop"] / "link_to_onedrive"
+    try:
+        os.symlink(tree["onedrive"], link, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation not permitted in this environment")
+    (tree["onedrive"] / "Buried2").mkdir()
+    # The junction/symlink is a reparse point: not traversed, not matched, and
+    # its target subtree stays protected.
+    assert fa.find_dir("link_to_onedrive").data == []
+    assert fa.find_dir("Buried2").data == []
+
+
 def test_agent_has_no_filesystem_policy_tool(tmp_path):
     fa = FileActions(allowed_roots=[tmp_path])
     aa = AppActions(fa)
