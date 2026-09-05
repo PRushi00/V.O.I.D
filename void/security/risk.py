@@ -46,8 +46,19 @@ class RiskGate:
     def requires_confirmation(self, level: RiskLevel) -> bool:
         return level >= self.threshold
 
-    def authorize(self, level: RiskLevel, description: str) -> bool:
-        """Return True if the action is allowed to run."""
+    def authorize(self, level: RiskLevel, description: str,
+                  owner_decision: bool | None = None) -> bool:
+        """Return True if the action is allowed to run.
+
+        ``owner_decision`` lets a durable, owner-driven approve/deny (made
+        out-of-band via the CLI/app, never by the LLM) flow through this single
+        authorization point instead of the synchronous ``confirm_fn``. When it
+        is ``None`` (the default) behavior is identical to before: below the
+        threshold auto-allow, at/above it consult ``confirm_fn``. It only has
+        effect for actions that actually require confirmation.
+        """
         if not self.requires_confirmation(level):
             return True
+        if owner_decision is not None:
+            return bool(owner_decision)
         return bool(self.confirm_fn(description))

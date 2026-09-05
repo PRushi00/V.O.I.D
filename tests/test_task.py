@@ -50,3 +50,82 @@ def test_list_by_status(tmp_path):
     store.save(Task(goal="x", status=Status.COMPLETED))
     store.save(Task(goal="y", status=Status.FAILED))
     assert len(store.list(status=Status.COMPLETED)) == 1
+
+
+# --- Phase 5B: expanded states, pending, legacy compatibility ----------
+
+import json
+import sqlite3
+
+
+def test_new_states_round_trip(tmp_path):
+    store = TaskStore(tmp_path / "t.sqlite")
+    for st in (Status.AWAITING_CONFIRMATION, Status.BLOCKED, Status.CANCELLED):
+        t = Task(goal=f"g-{st}", status=st)
+        store.save(t)
+        assert store.load(t.id).status == st
+
+
+def test_status_sets():
+    assert Status.AWAITING_CONFIRMATION in Status.RESUMABLE
+    assert Status.CANCELLED in Status.TERMINAL
+    assert Status.CANCELLED not in Status.RESUMABLE
+
+
+def test_resumable_includes_awaiting_confirmation(tmp_path):
+    store = TaskStore(tmp_path / "t.sqlite")
+    a = Task(goal="awaiting", status=Status.AWAITING_CONFIRMATION)
+    c = Task(goal="cancelled", status=Status.CANCELLED)
+    store.save(a)
+    store.save(c)
+    ids = {t.id for t in store.resumable()}
+    assert a.id in ids and c.id not in ids
+
+
+def test_pending_round_trip(tmp_path):
+    store = TaskStore(tmp_path / "t.sqlite")
+    t = Task(goal="g", status=Status.AWAITING_CONFIRMATION)
+    t.pending = {"assistant_text": "deleting",
+                 "tool_calls": [{"name": "delete_file",
+                                 "arguments": {"path": "x.txt"},
+                                 "id": None, "signature": None,
+                                 "risk": "HIGH", "requires_confirmation": True}]}
+    store.save(t)
+    loaded = store.load(t.id)
+    assert loaded.pending == t.pending
+    assert loaded.status == Status.AWAITING_CONFIRMATION
+
+
+def test_pending_defaults_none(tmp_path):
+    store = TaskStore(tmp_path / "t.sqlite")
+    t = Task(goal="g")
+    store.save(t)
+    assert store.load(t.id).pending is None
+
+
+def test_legacy_db_without_pending_column_loads(tmp_path):
+    # Simulate a pre-5B database: create the OLD schema (no 'pending' column),
+    # insert a legacy row, then open it with the current TaskStore.
+    db = tmp_path / "legacy.sqlite"
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            """CREATE TABLE tasks (
+                id TEXT PRIMARY KEY, goal TEXT NOT NULL, status TEXT NOT NULL,
+                messages TEXT NOT NULL, steps INTEGER NOT NULL, result TEXT,
+                error TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL)""")
+        conn.execute(
+            "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?)",
+            ("legacy1", "old goal", "paused",
+             json.dumps([{"role": "user", "content": "hi"}]), 2,
+             None, None, 1.0, 2.0))
+    store = TaskStore(str(db))          # migrates: adds 'pending' column
+    loaded = store.load("legacy1")
+    assert loaded is not None
+    assert loaded.status == "paused"    # old state still loads
+    assert loaded.steps == 2
+    assert loaded.pending is None
+    # And the migrated store can still write/read the new field.
+    loaded.pending = {"assistant_text": None, "tool_calls": []}
+    store.save(loaded)
+    assert store.load("legacy1").pending == {"assistant_text": None,
+                                             "tool_calls": []}

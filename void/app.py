@@ -11,7 +11,7 @@ from void.actions.registry import ToolRegistry
 from void.config import Config
 from void.core.agent import Agent, AgentResult
 from void.core.kill_switch import KillSwitch
-from void.core.task import Task, TaskStore
+from void.core.task import Status, Task, TaskStore
 from void.providers.registry import ProviderRegistry
 from void.security.risk import RiskGate
 
@@ -25,6 +25,10 @@ class Assistant:
                  on_event: OnEvent | None = None):
         self.config = config or Config.load()
         self.on_event = on_event or (lambda _m: None)
+        # No synchronous confirmer (headless/unattended) -> HIGH-risk actions
+        # are deferred as a durable AWAITING_CONFIRMATION state instead of
+        # being decided inline. A present confirmer keeps synchronous prompts.
+        self._confirm_fn = confirm_fn
 
         # Persistence directory is needed early for the cross-process stop file.
         state_dir = self.config.state_dir()
@@ -70,6 +74,7 @@ class Assistant:
             max_steps=self.config.get("agent.max_steps", 12),
             max_retries=self.config.get("agent.max_retries", 2),
             on_event=self.on_event,
+            defer_confirmation=self._confirm_fn is None,
         )
 
     def run(self, goal: str) -> AgentResult:
@@ -80,6 +85,34 @@ class Assistant:
         if task is None:
             raise ValueError(f"No such task: {task_id}")
         return self._agent().resume(task)
+
+    def approve(self, task_id: str) -> AgentResult:
+        """Owner approves a task's pending HIGH-risk step; execute it once."""
+        task = self._load_awaiting(task_id)
+        return self._agent().resume_pending(task, decision=True)
+
+    def deny(self, task_id: str) -> AgentResult:
+        """Owner denies a task's pending HIGH-risk step; it will not execute."""
+        task = self._load_awaiting(task_id)
+        return self._agent().resume_pending(task, decision=False)
+
+    def cancel(self, task_id: str) -> Task:
+        """Owner cancels a task (terminal). No pending action executes."""
+        task = self.store.load(task_id)
+        if task is None:
+            raise ValueError(f"No such task: {task_id}")
+        task.pending = None
+        task.status = Status.CANCELLED
+        self.store.save(task)
+        return task
+
+    def _load_awaiting(self, task_id: str) -> Task:
+        task = self.store.load(task_id)
+        if task is None:
+            raise ValueError(f"No such task: {task_id}")
+        if task.status != Status.AWAITING_CONFIRMATION or not task.pending:
+            raise ValueError(f"Task {task_id} has no pending confirmation.")
+        return task
 
     def stop(self, reason: str = "manual stop", pin: str | None = None) -> bool:
         return self.kill_switch.engage(reason=reason, pin=pin)

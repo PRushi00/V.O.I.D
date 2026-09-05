@@ -18,12 +18,17 @@ from pathlib import Path
 class Status:
     PENDING = "pending"
     RUNNING = "running"
-    PAUSED = "paused"       # stopped/interrupted but resumable
+    PAUSED = "paused"                       # stopped/interrupted but resumable
+    AWAITING_CONFIRMATION = "awaiting_confirmation"  # a HIGH-risk step needs owner OK
+    BLOCKED = "blocked"                     # halted awaiting an external condition
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"                 # owner-cancelled; not resumable
 
-    RESUMABLE = {RUNNING, PAUSED}
-    TERMINAL = {COMPLETED, FAILED}
+    # Resumable = can still make progress (with owner input where needed).
+    RESUMABLE = {RUNNING, PAUSED, AWAITING_CONFIRMATION}
+    # Terminal = no further execution.
+    TERMINAL = {COMPLETED, FAILED, CANCELLED}
 
 
 @dataclass
@@ -35,6 +40,12 @@ class Task:
     steps: int = 0
     result: str | None = None
     error: str | None = None
+    # A proposed-but-not-yet-executed step held for owner confirmation. Shape:
+    # {"assistant_text": str|None,
+    #  "tool_calls": [{"name","arguments","id","signature",
+    #                  "risk","requires_confirmation"}]}.
+    # Contains only tool names/arguments/risk metadata - never secrets/keys.
+    pending: dict | None = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -65,10 +76,17 @@ class TaskStore:
                     result      TEXT,
                     error       TEXT,
                     created_at  REAL NOT NULL,
-                    updated_at  REAL NOT NULL
+                    updated_at  REAL NOT NULL,
+                    pending     TEXT
                 )
                 """
             )
+            # Migrate pre-existing databases that predate the 'pending' column.
+            # Deterministic, additive, non-destructive: old rows keep their data
+            # and get pending=NULL.
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+            if "pending" not in cols:
+                conn.execute("ALTER TABLE tasks ADD COLUMN pending TEXT")
 
     def save(self, task: Task) -> None:
         """Insert or update a task - this is the checkpoint operation."""
@@ -78,8 +96,8 @@ class TaskStore:
                 """
                 INSERT INTO tasks
                     (id, goal, status, messages, steps, result, error,
-                     created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     created_at, updated_at, pending)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     goal=excluded.goal,
                     status=excluded.status,
@@ -87,21 +105,27 @@ class TaskStore:
                     steps=excluded.steps,
                     result=excluded.result,
                     error=excluded.error,
-                    updated_at=excluded.updated_at
+                    updated_at=excluded.updated_at,
+                    pending=excluded.pending
                 """,
                 (
                     task.id, task.goal, task.status,
                     json.dumps(task.messages), task.steps,
                     task.result, task.error,
                     task.created_at, task.updated_at,
+                    json.dumps(task.pending) if task.pending is not None else None,
                 ),
             )
 
     def _row_to_task(self, row: sqlite3.Row) -> Task:
+        keys = row.keys()
+        pending_raw = row["pending"] if "pending" in keys else None
+        pending = json.loads(pending_raw) if pending_raw else None
         return Task(
             id=row["id"], goal=row["goal"], status=row["status"],
             messages=json.loads(row["messages"]), steps=row["steps"],
             result=row["result"], error=row["error"],
+            pending=pending,
             created_at=row["created_at"], updated_at=row["updated_at"],
         )
 
