@@ -14,6 +14,7 @@ tool calls. V.O.I.D's Agent / RiskGate / ToolRegistry remain the executor.
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timedelta, timezone
 
 from void.providers.base import (
     LLMProvider,
@@ -23,6 +24,11 @@ from void.providers.base import (
     ToolSpec,
 )
 from void.security import secrets
+from void.security.credentials import (
+    CredentialMissing,
+    CredentialPool,
+    CredentialsExhausted,
+)
 
 
 def _coerce_args(args) -> dict:
@@ -75,16 +81,88 @@ def _decode_signature(sig: str | None) -> bytes | None:
     return raw or None
 
 
+# --- error classification & cooldown policy ----------------------------
+#
+# Cooldowns are in-memory for the life of a run. Because free-tier daily quota
+# is the real blocker, we drop an exhausted/invalid credential for a
+# conservative default so the current run rotates to other credentials instead
+# of re-hammering the same one. An explicit retry delay from the SDK is honored
+# only when it is LONGER than the floor (never shorter, to avoid re-hammering).
+_QUOTA_COOLDOWN_S = 3600     # 429 RESOURCE_EXHAUSTED
+_AUTH_COOLDOWN_S = 3600      # 401/403 invalid credential
+_MISSING_COOLDOWN_S = 3600   # credential has no stored value
+
+
+def _classify_error(exc: Exception) -> str:
+    """Classify a Gemini SDK error as 'quota', 'auth', or 'other'.
+
+    Uses the SDK's structured ``code`` (HTTP status) / ``status`` fields first
+    (google.genai APIError exposes both), with a cautious message fallback.
+    Never reads or emits the API key.
+    """
+    code = getattr(exc, "code", None)
+    status = getattr(exc, "status", None)
+    if code == 429 or status == "RESOURCE_EXHAUSTED":
+        return "quota"
+    if code in (401, 403) or status in ("UNAUTHENTICATED", "PERMISSION_DENIED"):
+        return "auth"
+    text = str(getattr(exc, "message", None) or exc)
+    if "RESOURCE_EXHAUSTED" in text or " 429" in text:
+        return "quota"
+    return "other"
+
+
+def _retry_delay_seconds(exc: Exception) -> float | None:
+    """Best-effort, never-raising extraction of an explicit retry delay (s)."""
+    details = getattr(exc, "details", None)
+    try:
+        if isinstance(details, dict):
+            items = (details.get("error", {}).get("details")
+                     or details.get("details") or [])
+        elif isinstance(details, list):
+            items = details
+        else:
+            return None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            rd = item.get("retryDelay") or item.get("retry_delay")
+            if isinstance(rd, str) and rd.endswith("s"):
+                return float(rd[:-1])
+            if isinstance(rd, (int, float)):
+                return float(rd)
+            if isinstance(rd, dict) and "seconds" in rd:
+                return float(rd["seconds"])
+    except Exception:
+        return None
+    return None
+
+
+def _cooldown_until(now: datetime, base_seconds: int,
+                    exc: Exception | None = None) -> datetime:
+    seconds = float(base_seconds)
+    if exc is not None:
+        rd = _retry_delay_seconds(exc)
+        if rd is not None and rd > seconds:
+            seconds = rd
+    return now + timedelta(seconds=seconds)
+
+
 class GeminiProvider(LLMProvider):
     name = "gemini"
 
     def __init__(self, model: str = "gemini-1.5-flash",
-                 temperature: float = 0.2, max_output_tokens: int = 2048):
+                 temperature: float = 0.2, max_output_tokens: int = 2048,
+                 credential_pool: CredentialPool | None = None):
         self.model = model
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
         self._genai = None
         self._types = None
+        self._credentials = credential_pool
+        # No client/key is bound for the life of the provider: clients are
+        # short-lived and rebuilt per credential during rotation. These stay
+        # None (kept for backward compatibility / introspection).
         self._client = None
         self._api_key: str | None = None
 
@@ -105,26 +183,37 @@ class GeminiProvider(LLMProvider):
         self._types = types
         return genai, types
 
-    def _load(self):
-        """Return a configured ``genai.Client`` (needs a stored API key)."""
-        if self._client is not None:
-            return self._client
+    def _pool(self) -> CredentialPool:
+        if self._credentials is None:
+            self._credentials = CredentialPool()
+        return self._credentials
+
+    def _client_for(self, credential):
+        """Build a short-lived client for one credential.
+
+        The secret value is read on demand and handed straight to the SDK; it
+        is never stored on the provider or logged. Raises CredentialMissing if
+        the credential has no stored value.
+        """
         genai, _types = self._sdk()
-        key = secrets.get_secret(secrets.GEMINI_API_KEY)
-        if not key:
-            raise ProviderUnavailable(
-                "No Gemini API key stored. Set it with: "
-                "python -m void set-key gemini"
-            )
-        self._client = genai.Client(api_key=key)
-        self._api_key = key
-        return self._client
+        key = self._pool().get_value(credential)  # raises CredentialMissing
+        return genai.Client(api_key=key)
 
     def available(self) -> bool:
+        """True if the SDK is importable and a usable credential exists.
+
+        Does not construct a client or make any network call.
+        """
         try:
-            self._load()
-            return True
+            self._sdk()
         except ProviderUnavailable:
+            return False
+        pool = self._pool()
+        try:
+            cred = pool.get_next_available()
+            pool.get_value(cred)  # confirm a value exists (no client/network)
+            return True
+        except (CredentialsExhausted, CredentialMissing, secrets.SecretStoreError):
             return False
 
     # --- translation ---------------------------------------------------
@@ -274,11 +363,63 @@ class GeminiProvider(LLMProvider):
 
     def generate(self, messages: list[dict],
                  tools: list[ToolSpec] | None = None) -> LLMResponse:
-        client = self._load()
+        """Generate one turn, rotating credentials on quota/auth failures.
+
+        Rotation happens INSIDE a single call so the agent sees one provider
+        operation. On a 429 the current credential is cooled and the next
+        available one is tried; when all are exhausted, ProviderUnavailable is
+        raised (the agent treats that as fail-fast, never re-hammering a key).
+        Other (transient/permanent) errors are re-raised unchanged so existing
+        retry behavior is preserved.
+        """
         system, contents = self._to_contents(messages)
-        response = client.models.generate_content(
-            model=self.model,
-            contents=contents,
-            config=self._generate_config(system, tools),
-        )
-        return self._parse(response)
+        config = self._generate_config(system, tools)
+        pool = self._pool()
+        last_exc: Exception | None = None
+
+        # Bounded by the credential count so the loop always terminates: each
+        # iteration either succeeds, re-raises, or cools one credential.
+        for _ in range(len(pool) + 1):
+            now = datetime.now(timezone.utc)
+            try:
+                cred = pool.get_next_available(now=now)
+            except CredentialsExhausted as exc:
+                raise ProviderUnavailable(
+                    "All Gemini credentials are exhausted (quota/cooldown). "
+                    "Add or wait for a credential."
+                ) from (last_exc or exc)
+
+            try:
+                client = self._client_for(cred)
+            except CredentialMissing as exc:
+                # No value for this reference: cool it and rotate.
+                pool.mark_unavailable(
+                    cred.name, _cooldown_until(now, _MISSING_COOLDOWN_S))
+                last_exc = exc
+                continue
+
+            try:
+                response = client.models.generate_content(
+                    model=self.model, contents=contents, config=config)
+                return self._parse(response)
+            except Exception as exc:
+                kind = _classify_error(exc)
+                if kind == "quota":
+                    pool.mark_unavailable(
+                        cred.name, _cooldown_until(now, _QUOTA_COOLDOWN_S, exc))
+                    last_exc = exc
+                    continue
+                if kind == "auth":
+                    # Invalid credential: cool it and try others - never retry
+                    # the same invalid credential.
+                    pool.mark_unavailable(
+                        cred.name, _cooldown_until(now, _AUTH_COOLDOWN_S))
+                    last_exc = exc
+                    continue
+                # Transient/permanent non-quota error: preserve existing
+                # behavior (the agent's retry loop handles these).
+                raise
+
+        raise ProviderUnavailable(
+            "All Gemini credentials are exhausted (quota/cooldown)."
+        ) from last_exc

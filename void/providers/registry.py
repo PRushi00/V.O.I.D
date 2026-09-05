@@ -18,12 +18,14 @@ class ProviderRegistry:
     def from_config(cls, cfg) -> "ProviderRegistry":
         from void.providers.gemini_provider import GeminiProvider
         from void.providers.local_provider import LocalProvider
+        from void.security.credentials import CredentialPool
 
         providers: dict[str, LLMProvider] = {
             "gemini": GeminiProvider(
                 model=cfg.get("llm.gemini.model", "gemini-1.5-flash"),
                 temperature=cfg.get("llm.gemini.temperature", 0.2),
                 max_output_tokens=cfg.get("llm.gemini.max_output_tokens", 2048),
+                credential_pool=CredentialPool(),
             ),
             "local": LocalProvider(
                 base_url=cfg.get("llm.local.base_url", "http://localhost:11434"),

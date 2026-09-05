@@ -10,6 +10,7 @@ from void.providers.base import (
 from void.providers.registry import ProviderRegistry
 from void.providers.gemini_provider import GeminiProvider
 from void.providers.local_provider import LocalProvider
+from void.security import credentials, secrets
 
 
 class _Stub(LLMProvider):
@@ -353,3 +354,264 @@ def test_local_to_messages_roles():
     ])
     assert msgs[0]["role"] == "system"
     assert msgs[2] == {"role": "tool", "content": "r", "name": "read_file"}
+
+
+# --- Gemini credential rotation (no network, no real keys) -------------
+#
+# The SDK/client boundary is mocked. Key VALUES are obvious fakes and must
+# never appear in exceptions/reprs/task state.
+
+PRIMARY = secrets.GEMINI_API_KEY
+K1, K2, K3 = "FAKE_KEY_ONE", "FAKE_KEY_TWO", "FAKE_KEY_THREE"
+
+
+class _FakeAPIError(Exception):
+    """Duck-types google.genai.errors.APIError (code/status/message/details)."""
+    def __init__(self, code=None, status=None, message="", details=None):
+        super().__init__(message or status or str(code))
+        self.code = code
+        self.status = status
+        self.message = message
+        self.details = details
+
+
+def _err_429(details=None):
+    return _FakeAPIError(code=429, status="RESOURCE_EXHAUSTED",
+                         message="quota exceeded", details=details)
+
+
+def _err_auth():
+    return _FakeAPIError(code=403, status="PERMISSION_DENIED",
+                         message="invalid credential")
+
+
+def _err_other():
+    return _FakeAPIError(code=400, status="INVALID_ARGUMENT", message="bad request")
+
+
+def _ok():
+    return _FakeResponse([_FakePart(text="ok")])
+
+
+class _FakeModels:
+    def __init__(self, behavior):
+        self._behavior = behavior
+
+    def generate_content(self, model, contents, config):
+        return self._behavior()
+
+
+class _FakeClient:
+    def __init__(self, behavior):
+        self.models = _FakeModels(behavior)
+
+
+class _FakeGenai:
+    """Stands in for the google.genai module; records the keys it built."""
+    def __init__(self, behavior_by_key):
+        self._behavior_by_key = behavior_by_key
+        self.built_keys: list[str] = []
+
+    def Client(self, api_key):
+        self.built_keys.append(api_key)
+        return _FakeClient(self._behavior_by_key[api_key])
+
+
+def _fake_get_secret(values, names):
+    data = dict(values)
+    if len(names) > 1:
+        data[credentials.MANIFEST_KEY] = json.dumps(names)
+    return lambda k: data.get(k)
+
+
+def _build(names, values, behavior_by_key):
+    """A GeminiProvider whose SDK boundary is a fake; real types for translation."""
+    from google.genai import types as real_types
+    pool = credentials.CredentialPool(get_secret=_fake_get_secret(values, names))
+    provider = GeminiProvider(credential_pool=pool)
+    fake_genai = _FakeGenai(behavior_by_key)
+    provider._sdk = lambda: (fake_genai, real_types)
+    return provider, pool, fake_genai
+
+
+_MSG = [{"role": "user", "content": "hi"}]
+
+
+def _never():
+    raise AssertionError("this credential should not have been used")
+
+
+# A. single credential success ------------------------------------------
+
+def test_rotation_single_credential_success():
+    provider, pool, fg = _build([PRIMARY], {PRIMARY: K1}, {K1: _ok})
+    resp = provider.generate(_MSG)
+    assert resp.text == "ok"
+    assert fg.built_keys == [K1]
+
+
+# B. multiple credentials, first succeeds -------------------------------
+
+def test_rotation_first_of_many_succeeds():
+    provider, pool, fg = _build(
+        [PRIMARY, "gemini_02"], {PRIMARY: K1, "gemini_02": K2},
+        {K1: _ok, K2: _never})
+    resp = provider.generate(_MSG)
+    assert resp.text == "ok"
+    assert fg.built_keys == [K1]  # second credential never used
+
+
+# C. 429 rotation -------------------------------------------------------
+
+def test_rotation_on_429_moves_to_next_and_succeeds():
+    provider, pool, fg = _build(
+        [PRIMARY, "gemini_02"], {PRIMARY: K1, "gemini_02": K2},
+        {K1: lambda: (_ for _ in ()).throw(_err_429()), K2: _ok})
+    resp = provider.generate(_MSG)
+    assert resp.text == "ok"
+    assert fg.built_keys == [K1, K2]              # rebuilt for the next cred
+    assert len(fg.built_keys) == len(set(fg.built_keys))  # no key reused
+    primary = pool.credentials()[0]
+    assert primary.name == PRIMARY
+    assert primary.cooldown_until is not None      # cooled after 429
+
+
+# D. multiple consecutive failures then success -------------------------
+
+def test_rotation_two_429s_then_success_in_order():
+    provider, pool, fg = _build(
+        [PRIMARY, "gemini_02", "gemini_03"],
+        {PRIMARY: K1, "gemini_02": K2, "gemini_03": K3},
+        {K1: lambda: (_ for _ in ()).throw(_err_429()),
+         K2: lambda: (_ for _ in ()).throw(_err_429()),
+         K3: _ok})
+    resp = provider.generate(_MSG)
+    assert resp.text == "ok"
+    assert fg.built_keys == [K1, K2, K3]           # ordered rotation
+
+
+# E. all credentials exhausted ------------------------------------------
+
+def test_rotation_all_429_raises_provider_unavailable():
+    provider, pool, fg = _build(
+        [PRIMARY, "gemini_02", "gemini_03"],
+        {PRIMARY: K1, "gemini_02": K2, "gemini_03": K3},
+        {K1: lambda: (_ for _ in ()).throw(_err_429()),
+         K2: lambda: (_ for _ in ()).throw(_err_429()),
+         K3: lambda: (_ for _ in ()).throw(_err_429())})
+    with pytest.raises(ProviderUnavailable) as exc:
+        provider.generate(_MSG)
+    assert fg.built_keys == [K1, K2, K3]           # each tried exactly once
+    for k in (K1, K2, K3):                         # J: no secret in the error
+        assert k not in str(exc.value)
+
+
+# F. credential missing value -------------------------------------------
+
+def test_rotation_skips_missing_value():
+    # Primary has NO stored value; second one works.
+    provider, pool, fg = _build(
+        [PRIMARY, "gemini_02"], {"gemini_02": K2}, {K2: _ok})
+    resp = provider.generate(_MSG)
+    assert resp.text == "ok"
+    assert fg.built_keys == [K2]                   # no client built for primary
+    assert pool.credentials()[0].cooldown_until is not None
+
+
+# G. authentication failure ---------------------------------------------
+
+def test_rotation_on_auth_error_does_not_retry_same_credential():
+    provider, pool, fg = _build(
+        [PRIMARY, "gemini_02"], {PRIMARY: K1, "gemini_02": K2},
+        {K1: lambda: (_ for _ in ()).throw(_err_auth()), K2: _ok})
+    resp = provider.generate(_MSG)
+    assert resp.text == "ok"
+    assert fg.built_keys == [K1, K2]               # primary tried once, not hammered
+
+
+def test_rotation_all_auth_raises_provider_unavailable():
+    provider, pool, fg = _build(
+        [PRIMARY, "gemini_02"], {PRIMARY: K1, "gemini_02": K2},
+        {K1: lambda: (_ for _ in ()).throw(_err_auth()),
+         K2: lambda: (_ for _ in ()).throw(_err_auth())})
+    with pytest.raises(ProviderUnavailable):
+        provider.generate(_MSG)
+    assert fg.built_keys == [K1, K2]               # each once, no repeats
+
+
+# H. non-429 provider error is re-raised (existing behavior preserved) --
+
+def test_non_quota_error_is_reraised_not_rotated():
+    provider, pool, fg = _build(
+        [PRIMARY, "gemini_02"], {PRIMARY: K1, "gemini_02": K2},
+        {K1: lambda: (_ for _ in ()).throw(_err_other()), K2: _never})
+    with pytest.raises(_FakeAPIError):
+        provider.generate(_MSG)
+    assert fg.built_keys == [K1]                   # not rotated
+    assert pool.credentials()[0].cooldown_until is None  # not cooled
+
+
+# I. agent retry interaction --------------------------------------------
+
+def test_agent_does_not_retry_when_provider_signals_exhaustion(tmp_path):
+    from void.core.agent import Agent
+    from void.actions.registry import ToolRegistry
+    from void.core.kill_switch import KillSwitch
+    from void.core.task import Status, TaskStore
+    from void.security.risk import RiskGate
+
+    calls = {"n": 0}
+
+    class _Exhausted(LLMProvider):
+        name = "gemini"
+
+        def available(self):
+            return True
+
+        def generate(self, messages, tools=None):
+            calls["n"] += 1
+            raise ProviderUnavailable("All Gemini credentials are exhausted")
+
+    agent = Agent(_Exhausted(), ToolRegistry(),
+                  RiskGate(confirm_at_or_above="high"), KillSwitch(),
+                  TaskStore(tmp_path / "t.sqlite"), max_retries=2)
+    result = agent.run("hi")
+    assert result.status == Status.FAILED
+    assert calls["n"] == 1                          # NOT retried on exhaustion
+
+
+# J & K. non-disclosure + client recreation -----------------------------
+
+def test_rotation_keys_absent_from_reprs_and_errors():
+    provider, pool, fg = _build(
+        [PRIMARY, "gemini_02"], {PRIMARY: K1, "gemini_02": K2},
+        {K1: lambda: (_ for _ in ()).throw(_err_429()),
+         K2: lambda: (_ for _ in ()).throw(_err_429())})
+    with pytest.raises(ProviderUnavailable) as exc:
+        provider.generate(_MSG)
+    blobs = [str(exc.value), repr(pool), repr(pool.credentials())]
+    for blob in blobs:
+        assert K1 not in blob and K2 not in blob
+
+
+def test_classify_error_uses_structured_fields():
+    from void.providers.gemini_provider import _classify_error
+    assert _classify_error(_err_429()) == "quota"
+    assert _classify_error(_err_auth()) == "auth"
+    assert _classify_error(_err_other()) == "other"
+    # message fallback still works when structured fields are absent
+    assert _classify_error(Exception("boom RESOURCE_EXHAUSTED")) == "quota"
+
+
+def test_cooldown_honors_longer_retry_delay_only():
+    from datetime import datetime, timezone
+    from void.providers.gemini_provider import _cooldown_until, _QUOTA_COOLDOWN_S
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    # A short retry delay does not shorten the conservative floor.
+    short = _err_429(details=[{"retryDelay": "9s"}])
+    assert (_cooldown_until(now, _QUOTA_COOLDOWN_S, short) - now).total_seconds() \
+        == _QUOTA_COOLDOWN_S
+    # A longer explicit delay is honored.
+    long = _err_429(details=[{"retryDelay": "7200s"}])
+    assert (_cooldown_until(now, _QUOTA_COOLDOWN_S, long) - now).total_seconds() \
+        == 7200
