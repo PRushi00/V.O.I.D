@@ -46,6 +46,21 @@ class Task:
     #                  "risk","requires_confirmation"}]}.
     # Contains only tool names/arguments/risk metadata - never secrets/keys.
     pending: dict | None = None
+    # Engine-owned execution ledger: one entry per COMMITTED logical step,
+    # built by the Agent from ACTUAL tool execution (never written by the LLM).
+    # Entry shape: {"index": int,
+    #               "calls": [{"tool": str, "arguments_summary": str}],
+    #               "status": "executing|succeeded|failed|cancelled|
+    #                          awaiting_confirmation",
+    #               "outcome_summary": str,
+    #               "unresolved_failure": bool (optional; True when a tool
+    #                 execution failed and still needs handling)}.
+    # Observability/recovery context only - NOT an executable script, and never
+    # a place for secrets or raw tool output.
+    plan: list[dict] = field(default_factory=list)
+    # Engine-owned pointer to the current/most-recent logical step (index into
+    # plan). Never set by the LLM.
+    current_step: int = 0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -77,16 +92,22 @@ class TaskStore:
                     error       TEXT,
                     created_at  REAL NOT NULL,
                     updated_at  REAL NOT NULL,
-                    pending     TEXT
+                    pending     TEXT,
+                    plan        TEXT,
+                    current_step INTEGER
                 )
                 """
             )
-            # Migrate pre-existing databases that predate the 'pending' column.
-            # Deterministic, additive, non-destructive: old rows keep their data
-            # and get pending=NULL.
+            # Migrate pre-existing databases additively (deterministic,
+            # non-destructive). Old rows keep their data; new columns default to
+            # NULL and load as an empty ledger / step 0.
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
             if "pending" not in cols:
                 conn.execute("ALTER TABLE tasks ADD COLUMN pending TEXT")
+            if "plan" not in cols:
+                conn.execute("ALTER TABLE tasks ADD COLUMN plan TEXT")
+            if "current_step" not in cols:
+                conn.execute("ALTER TABLE tasks ADD COLUMN current_step INTEGER")
 
     def save(self, task: Task) -> None:
         """Insert or update a task - this is the checkpoint operation."""
@@ -96,8 +117,8 @@ class TaskStore:
                 """
                 INSERT INTO tasks
                     (id, goal, status, messages, steps, result, error,
-                     created_at, updated_at, pending)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     created_at, updated_at, pending, plan, current_step)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     goal=excluded.goal,
                     status=excluded.status,
@@ -106,7 +127,9 @@ class TaskStore:
                     result=excluded.result,
                     error=excluded.error,
                     updated_at=excluded.updated_at,
-                    pending=excluded.pending
+                    pending=excluded.pending,
+                    plan=excluded.plan,
+                    current_step=excluded.current_step
                 """,
                 (
                     task.id, task.goal, task.status,
@@ -114,6 +137,8 @@ class TaskStore:
                     task.result, task.error,
                     task.created_at, task.updated_at,
                     json.dumps(task.pending) if task.pending is not None else None,
+                    json.dumps(task.plan) if task.plan else None,
+                    task.current_step,
                 ),
             )
 
@@ -121,11 +146,27 @@ class TaskStore:
         keys = row.keys()
         pending_raw = row["pending"] if "pending" in keys else None
         pending = json.loads(pending_raw) if pending_raw else None
+        # Malformed stored ledger data must fail safely to an empty ledger,
+        # never crash load or corrupt engine state.
+        plan: list[dict] = []
+        if "plan" in keys and row["plan"]:
+            try:
+                loaded = json.loads(row["plan"])
+                if isinstance(loaded, list):
+                    plan = loaded
+            except (ValueError, TypeError):
+                plan = []
+        current_step = 0
+        if "current_step" in keys and row["current_step"] is not None:
+            try:
+                current_step = int(row["current_step"])
+            except (ValueError, TypeError):
+                current_step = 0
         return Task(
             id=row["id"], goal=row["goal"], status=row["status"],
             messages=json.loads(row["messages"]), steps=row["steps"],
             result=row["result"], error=row["error"],
-            pending=pending,
+            pending=pending, plan=plan, current_step=current_step,
             created_at=row["created_at"], updated_at=row["updated_at"],
         )
 

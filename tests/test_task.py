@@ -80,6 +80,11 @@ def test_resumable_includes_awaiting_confirmation(tmp_path):
     store.save(c)
     ids = {t.id for t in store.resumable()}
     assert a.id in ids and c.id not in ids
+    blocked = Task(goal="blocked", status=Status.BLOCKED)
+    store.save(blocked)
+    assert blocked.id not in {t.id for t in store.resumable()}
+    assert Status.BLOCKED not in Status.RESUMABLE
+    assert Status.BLOCKED not in Status.TERMINAL
 
 
 def test_pending_round_trip(tmp_path):
@@ -129,3 +134,61 @@ def test_legacy_db_without_pending_column_loads(tmp_path):
     store.save(loaded)
     assert store.load("legacy1").pending == {"assistant_text": None,
                                              "tool_calls": []}
+
+
+# --- Phase 7: execution ledger (plan / current_step) -------------------
+
+def test_plan_round_trip(tmp_path):
+    store = TaskStore(tmp_path / "t.sqlite")
+    t = Task(goal="g")
+    t.plan = [{"index": 0,
+               "calls": [{"tool": "search_files", "arguments_summary": "query=x"}],
+               "status": "succeeded", "outcome_summary": "ok"}]
+    t.current_step = 0
+    store.save(t)
+    loaded = store.load(t.id)
+    assert loaded.plan == t.plan
+    assert loaded.current_step == 0
+
+
+def test_plan_defaults_empty(tmp_path):
+    store = TaskStore(tmp_path / "t.sqlite")
+    t = Task(goal="g")
+    store.save(t)
+    loaded = store.load(t.id)
+    assert loaded.plan == [] and loaded.current_step == 0
+
+
+def test_legacy_db_without_plan_columns_loads(tmp_path):
+    db = tmp_path / "legacy2.sqlite"
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            """CREATE TABLE tasks (
+                id TEXT PRIMARY KEY, goal TEXT NOT NULL, status TEXT NOT NULL,
+                messages TEXT NOT NULL, steps INTEGER NOT NULL, result TEXT,
+                error TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                pending TEXT)""")   # has pending but NOT plan/current_step
+        conn.execute(
+            "INSERT INTO tasks (id,goal,status,messages,steps,created_at,updated_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            ("leg2", "g", "completed",
+             json.dumps([{"role": "user", "content": "hi"}]), 3, 1.0, 2.0))
+    store = TaskStore(str(db))   # migrates: adds plan + current_step columns
+    loaded = store.load("leg2")
+    assert loaded is not None
+    assert loaded.plan == [] and loaded.current_step == 0
+    loaded.plan = [{"index": 0, "calls": [], "status": "succeeded",
+                    "outcome_summary": ""}]
+    store.save(loaded)
+    assert store.load("leg2").plan[0]["status"] == "succeeded"
+
+
+def test_malformed_plan_fails_safe(tmp_path):
+    db = tmp_path / "m.sqlite"
+    store = TaskStore(str(db))
+    t = Task(goal="g")
+    store.save(t)
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute("UPDATE tasks SET plan=? WHERE id=?", ("not json{{", t.id))
+    loaded = store.load(t.id)
+    assert loaded.plan == []          # malformed ledger -> empty, no crash

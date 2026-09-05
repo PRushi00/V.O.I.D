@@ -145,21 +145,42 @@ class Agent:
                 time.sleep(min(2 ** attempt, 5))
         raise last_exc  # type: ignore[misc]
 
-    def _run_named(self, name: str, arguments: dict,
-                   owner_decision: bool | None = None) -> dict:
-        """Run one tool call through the risk gate; return a tool message.
+    @staticmethod
+    def _find_directory_match_count(name: str, result) -> int | None:
+        """Structured find_directory cardinality, or None if not applicable.
 
-        ALL tool execution funnels through here, so every call passes through
-        ``RiskGate.authorize`` exactly once. ``owner_decision`` carries a
-        durable owner approve/deny for a confirmation-required action; it is
-        only ever set by the owner-driven approve/deny path, never by the LLM.
+        Uses ToolResult.data only (the Phase 6 contract). Never parses summary
+        prose. None means 'this call is not a structured find_directory hit'.
+        """
+        if name != "find_directory" or not result.ok:
+            return None
+        data = result.data
+        if not isinstance(data, list):
+            return None
+        return len(data)
+
+    def _run_call(self, name: str, arguments: dict,
+                  owner_decision: bool | None = None) -> tuple[dict, bool, str, str, int | None]:
+        """Run one tool call through the risk gate.
+
+        Returns (tool_message, ok, first_line, kind, find_dir_matches).
+        ``kind`` is engine-owned: 'ok', 'unauthorized', 'unknown', or
+        'tool_failure'. ``find_dir_matches`` is the structured match count for
+        find_directory, else None. ALL tool execution funnels through here, so
+        every call passes through ``RiskGate.authorize`` once. ``ok`` is the
+        DETERMINISTIC success signal (``ToolResult.ok`` / False for
+        unknown/unauthorized) - the LLM never decides it. ``owner_decision``
+        carries a durable owner approve/deny, only ever set by the owner-driven
+        approve/deny path, never by the LLM.
         """
         self.kill_switch.raise_if_engaged()
         tool = self.tools.get(name)
         if tool is None:
             summary = f"Unknown tool '{name}'."
             self.on_event(summary)
-            return {"role": "tool", "name": name, "content": _untrusted(summary)}
+            return ({"role": "tool", "name": name,
+                     "content": _untrusted(summary)}, False, "unknown tool",
+                    "unknown", None)
 
         description = f"{name}({arguments})"
         # Risk is evaluated per call (e.g. overwriting an existing file is HIGH).
@@ -171,18 +192,70 @@ class Agent:
                 f"(risk={risk.name}). Skipped."
             )
             self.on_event(summary)
-            return {"role": "tool", "name": name,
-                    "content": _untrusted(summary)}
+            return ({"role": "tool", "name": name,
+                     "content": _untrusted(summary)}, False, "not authorized",
+                    "unauthorized", None)
 
         self.on_event(f"-> {description}")
         result = self.tools.execute(name, arguments)
-        self.on_event(f"   {result.summary.splitlines()[0] if result.summary else ''}")
+        first = result.summary.splitlines()[0] if result.summary else ""
+        self.on_event(f"   {first}")
+        kind = "ok" if result.ok else "tool_failure"
+        n = self._find_directory_match_count(name, result)
         # Tool output (which may include file contents) is untrusted DATA.
-        return {"role": "tool", "name": name,
-                "content": _untrusted(result.summary)}
+        return ({"role": "tool", "name": name,
+                 "content": _untrusted(result.summary)}, bool(result.ok), first,
+                kind, n)
+
+    def _run_named(self, name: str, arguments: dict,
+                   owner_decision: bool | None = None) -> dict:
+        msg, _ok, _first, _kind, _n = self._run_call(
+            name, arguments, owner_decision=owner_decision)
+        return msg
 
     def _execute_tool_call(self, tc) -> dict:
         return self._run_named(tc.name, tc.arguments)
+
+    # --- execution ledger (engine-owned; the LLM never writes these) ---
+
+    @staticmethod
+    def _summarize_args(arguments: dict) -> str:
+        """Compact, redacted argument summary for the ledger (never raw dumps,
+        never secrets - tool args are paths/queries/content, truncated)."""
+        parts = []
+        for k, v in (arguments or {}).items():
+            sv = str(v)
+            if len(sv) > 40:
+                sv = sv[:40] + "..."
+            parts.append(f"{k}={sv}")
+        return ", ".join(parts)[:200]
+
+    @staticmethod
+    def _step_outcome(names: list[str], oks: list, stopped: bool) -> str:
+        if stopped:
+            ran = sum(1 for o in oks if o is not None)
+            return (f"interrupted by stop: {ran}/{len(names)} call(s) ran "
+                    f"before the kill switch")
+        succeeded = sum(1 for o in oks if o)
+        if succeeded == len(names):
+            return f"{', '.join(names)} succeeded"
+        failed = [n for n, o in zip(names, oks) if not o]
+        return (f"{succeeded}/{len(names)} succeeded; "
+                f"failed: {', '.join(failed)}")[:200]
+
+    def _ledger_entry(self, index: int, names: list[str], args_list: list[dict],
+                      status: str, outcome: str,
+                      unresolved_failure: bool = False) -> dict:
+        entry = {
+            "index": index,
+            "calls": [{"tool": n, "arguments_summary": self._summarize_args(a)}
+                      for n, a in zip(names, args_list)],
+            "status": status,
+            "outcome_summary": outcome[:300],
+        }
+        if unresolved_failure:
+            entry["unresolved_failure"] = True
+        return entry
 
     def _cancelled_msg(self, name: str) -> dict:
         """An honest (non-success) tool response for a call that did NOT run.
@@ -213,6 +286,12 @@ class Agent:
                 f"Task {task.id} is awaiting owner confirmation; "
                 f"approve or deny to proceed.")
             return AgentResult(task, task.status, task.result, task.steps)
+        # Ambiguous find_directory (or other engine BLOCKED state) stays
+        # blocked until the owner clarifies; do not resume into COMPLETED.
+        if task.status == Status.BLOCKED:
+            self.on_event(
+                f"Task {task.id} is blocked pending clarification.")
+            return AgentResult(task, task.status, task.result, task.steps)
         self.on_event(f"Resuming task {task.id} from step {task.steps}.")
         return self._loop(task)
 
@@ -231,19 +310,46 @@ class Agent:
                 for c in pending["tool_calls"]
             ],
         }
-        tool_msgs = []
+        names = [c["name"] for c in pending["tool_calls"]]
+        args_list = [c.get("arguments", {}) for c in pending["tool_calls"]]
+        # The awaiting ledger entry for THIS logical step (created at suspend
+        # time) is updated in place - one entry per logical step.
+        ledger_idx = (len(task.plan) - 1
+                      if task.plan and
+                      task.plan[-1].get("status") == "awaiting_confirmation"
+                      else None)
+
+        def _record(step_status, oks, stopped, unresolved_failure=False):
+            entry = self._ledger_entry(
+                ledger_idx if ledger_idx is not None else len(task.plan),
+                names, args_list, step_status,
+                self._step_outcome(names, oks, stopped),
+                unresolved_failure=unresolved_failure)
+            if ledger_idx is not None:
+                task.plan[ledger_idx] = entry
+                task.current_step = ledger_idx
+            else:
+                task.plan.append(entry)
+                task.current_step = len(task.plan) - 1
+
+        tool_msgs, oks, kinds, find_ns = [], [], [], []
         try:
             for c in pending["tool_calls"]:
                 # owner_decision only applies to confirmation-required calls;
                 # others authorize normally (owner_decision=None).
                 od = decision if c.get("requires_confirmation") else None
-                tool_msgs.append(self._run_named(c["name"], c.get("arguments", {}),
-                                                 owner_decision=od))
+                msg, ok, _first, kind, n = self._run_call(
+                    c["name"], c.get("arguments", {}), owner_decision=od)
+                tool_msgs.append(msg)
+                oks.append(ok)
+                kinds.append(kind)
+                find_ns.append(n)
         except StopRequested:
             # Kill switch during approved execution: commit consistently.
-            done = len(tool_msgs)
-            for c in pending["tool_calls"][done:]:
+            for c in pending["tool_calls"][len(tool_msgs):]:
                 tool_msgs.append(self._cancelled_msg(c["name"]))
+                oks.append(None)
+            _record("cancelled", oks, stopped=True)
             task.messages.append(assistant_msg)
             task.messages.extend(tool_msgs)
             task.steps += 1
@@ -253,10 +359,15 @@ class Agent:
             self.store.save(task)
             return AgentResult(task, task.status, task.result, task.steps)
 
+        unresolved = self._has_unresolved_failure(kinds)
+        _record("succeeded" if all(oks) else "failed", oks, stopped=False,
+                unresolved_failure=unresolved)
         task.messages.append(assistant_msg)
         task.messages.extend(tool_msgs)
         task.steps += 1
         task.pending = None
+        if self._apply_find_directory_block(task, find_ns):
+            return AgentResult(task, task.status, task.result, task.steps)
         task.status = Status.RUNNING
         self.store.save(task)
         return self._loop(task)
@@ -264,7 +375,8 @@ class Agent:
     def _commit_step(self, task: Task, response) -> str:
         """Execute one tool-call step ATOMICALLY.
 
-        Returns a control signal: 'continue', 'paused', or 'awaiting'. The
+        Returns a control signal: 'continue', 'paused', 'awaiting', or
+        'blocked'. The
         assistant function-call message and ALL of its tool responses are
         appended to history together (never a dangling half-step), and the
         checkpoint is saved once at the end.
@@ -289,6 +401,13 @@ class Agent:
                 task.pending = {"assistant_text": response.text,
                                 "tool_calls": pend_calls}
                 task.status = Status.AWAITING_CONFIRMATION
+                # Ledger: record this logical step as awaiting (NOT succeeded).
+                index = len(task.plan)
+                task.plan.append(self._ledger_entry(
+                    index, [c["name"] for c in pend_calls],
+                    [c.get("arguments", {}) for c in pend_calls],
+                    "awaiting_confirmation", "awaiting owner confirmation"))
+                task.current_step = index
                 self.store.save(task)   # no assistant msg committed -> consistent
                 self.on_event("Awaiting owner confirmation for a HIGH-risk action.")
                 return "awaiting"
@@ -302,7 +421,7 @@ class Agent:
                 for tc in tool_calls
             ],
         }
-        tool_msgs, stopped = [], False
+        tool_msgs, oks, kinds, find_ns, stopped = [], [], [], [], False
         for tc in tool_calls:
             # Kill switch is checked before every tool call. Once stopped, the
             # remaining calls get honest 'cancelled' responses (never executed,
@@ -310,12 +429,36 @@ class Agent:
             if stopped or self.kill_switch.engaged:
                 stopped = True
                 tool_msgs.append(self._cancelled_msg(tc.name))
+                oks.append(None)   # not run
                 continue
             try:
-                tool_msgs.append(self._execute_tool_call(tc))
+                msg, ok, _first, kind, n = self._run_call(tc.name, tc.arguments)
+                tool_msgs.append(msg)
+                oks.append(ok)
+                kinds.append(kind)
+                find_ns.append(n)
             except StopRequested:
                 stopped = True
                 tool_msgs.append(self._cancelled_msg(tc.name))
+                oks.append(None)
+
+        # Ledger entry built from ACTUAL outcomes (ToolResult.ok), not the LLM.
+        names = [tc.name for tc in tool_calls]
+        if stopped:
+            step_status = "cancelled"
+            unresolved = False
+        elif all(oks):
+            step_status = "succeeded"
+            unresolved = False
+        else:
+            step_status = "failed"
+            unresolved = self._has_unresolved_failure(kinds)
+        index = len(task.plan)
+        task.plan.append(self._ledger_entry(
+            index, names, [tc.arguments for tc in tool_calls],
+            step_status, self._step_outcome(names, oks, stopped),
+            unresolved_failure=unresolved))
+        task.current_step = index
 
         # Atomic commit: append the complete step, then checkpoint once.
         task.messages.append(assistant_msg)
@@ -328,8 +471,54 @@ class Agent:
             self.store.save(task)
             self.on_event(f"Task {task.id} paused by kill switch. Resumable.")
             return "paused"
+        if self._apply_find_directory_block(task, find_ns):
+            return "blocked"
         self.store.save(task)
         return "continue"
+
+    @staticmethod
+    def _has_unresolved_failure(kinds: list[str]) -> bool:
+        """True when a tool actually failed (not an owner authorization skip)."""
+        return any(k in ("tool_failure", "unknown") for k in kinds)
+
+    def _apply_find_directory_block(self, task: Task,
+                                    match_counts: list[int | None]) -> bool:
+        """BLOCKED when structured find_directory data has multiple matches."""
+        n = max((c for c in match_counts if c is not None), default=None)
+        if n is None or n <= 1:
+            return False
+        task.status = Status.BLOCKED
+        task.error = (
+            f"find_directory returned {n} matches (ambiguous); "
+            "owner clarification required."
+        )
+        self.store.save(task)
+        self.on_event(task.error)
+        return True
+
+    def _cannot_complete_reason(self, task: Task) -> str | None:
+        """Engine-owned completion guard. No semantic goal verification.
+
+        Inspects deterministic engine state only. Returns a reason string if
+        COMPLETED is not valid, else None.
+        """
+        if task.pending or task.status == Status.AWAITING_CONFIRMATION:
+            return "pending confirmation"
+        if task.status == Status.BLOCKED:
+            return "blocked pending clarification"
+        if not task.plan:
+            return None
+        idx = task.current_step
+        if 0 <= idx < len(task.plan):
+            entry = task.plan[idx]
+        else:
+            entry = task.plan[-1]
+        st = entry.get("status")
+        if st == "executing" or st == "awaiting_confirmation":
+            return f"unresolved execution step ({st})"
+        if st == "failed" and entry.get("unresolved_failure"):
+            return "unresolved execution failure"
+        return None
 
     def _loop(self, task: Task) -> AgentResult:
         task.status = Status.RUNNING
@@ -343,16 +532,24 @@ class Agent:
 
                 if response.has_tool_calls:
                     outcome = self._commit_step(task, response)
-                    if outcome == "paused":
-                        return AgentResult(task, task.status, task.result, task.steps)
-                    if outcome == "awaiting":
+                    if outcome in ("paused", "awaiting", "blocked"):
                         return AgentResult(task, task.status, task.result, task.steps)
                     continue  # 'continue'
 
-                # No tool calls -> this is the final answer.
+                # No tool calls -> LLM offered a final answer. The engine
+                # decides whether COMPLETED is valid.
+                reason = self._cannot_complete_reason(task)
                 task.steps += 1
                 final = response.text or "(no output)"
                 task.messages.append({"role": "assistant", "content": final})
+                if reason:
+                    if task.pending or task.status == Status.AWAITING_CONFIRMATION:
+                        task.status = Status.AWAITING_CONFIRMATION
+                    elif task.status != Status.BLOCKED:
+                        task.status = Status.FAILED
+                        task.error = f"Completion refused: {reason}"
+                    self.store.save(task)
+                    return AgentResult(task, task.status, task.result, task.steps)
                 task.result = final
                 task.status = Status.COMPLETED
                 self.store.save(task)

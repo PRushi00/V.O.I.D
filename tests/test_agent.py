@@ -262,7 +262,8 @@ def test_find_directory_multiple_flagged_ambiguous_no_autoselect(tmp_path):
         LLMResponse(text="I found two 'Data' folders - which one do you mean?"),
     ])
     result = agent.run("open the Data folder")
-    assert result.status == Status.COMPLETED
+    assert result.status == Status.BLOCKED
+    assert result.status != Status.COMPLETED
     tool_msgs = [m for m in result.task.messages if m["role"] == "tool"]
     assert "ambiguous" in tool_msgs[0]["content"].lower()
     # No file was created/opened automatically.
