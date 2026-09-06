@@ -1315,3 +1315,127 @@ def test_ptt_during_dispatched_is_ignored_single_flight():
     assert seen["state"] == VoiceState.DISPATCHED   # ignored, still dispatched
     assert seen["opens"] == 1                        # no second capture
     assert a.calls == ["hello void"]                 # exactly one Assistant.run
+
+
+# --- Phase 9B step 4: real integration wiring (controller worker routing) ---
+#
+# The controller runs the blocking release-chain (finalize -> STT -> Assistant
+# -> speak) on a dedicated serial worker so the PTT/hook thread stays
+# responsive. VoiceSession is unchanged; these tests drive the controller.
+
+class ManualWorker:
+    """Deterministic stand-in for the serial voice worker: records submitted
+    jobs so the test runs them explicitly (no real thread, no sleeps)."""
+    def __init__(self):
+        self.jobs = []
+        self.started = False
+        self.stopped = False
+
+    def start(self):
+        self.started = True
+
+    def submit(self, fn):
+        if not self.stopped:
+            self.jobs.append(fn)
+
+    def run_all(self):
+        while self.jobs:
+            self.jobs.pop(0)()
+
+    def stop(self, timeout=2.0):
+        self.stopped = True
+
+
+def _worker_controller(**kw):
+    s, cap, stt, tts, asst, ks, ev = _session(**kw)
+    mw = ManualWorker()
+    ctrl = VoiceController(s, None, worker=mw)
+    ctrl._activation = FakeActivation(ctrl.on_ptt_press, ctrl.on_ptt_release)
+    ctrl.start(monitor=False)
+    return ctrl, s, mw, cap, stt, tts, asst, ks, ev
+
+
+def test_worker_press_inline_release_deferred():
+    ctrl, s, mw, cap, stt, tts, asst, ks, ev = _worker_controller()
+    ctrl.on_ptt_press()                          # inline: mic opens immediately
+    assert s.state == VoiceState.LISTENING and cap.is_open
+    ctrl.on_ptt_release()                         # deferred: nothing dispatched yet
+    assert len(mw.jobs) == 1 and asst.calls == []
+    assert s.state == VoiceState.LISTENING        # chain has not run on the input thread
+    mw.run_all()                                  # worker runs the blocking chain
+    assert asst.calls == ["hello void"]
+    assert s.state == VoiceState.SPEAKING
+
+
+def test_worker_full_cycle_and_repeated_cycles():
+    ctrl, s, mw, cap, stt, tts, asst, ks, ev = _worker_controller()
+    for i in range(3):
+        ctrl.on_ptt_press(); ctrl.on_ptt_release()
+        mw.run_all()
+        assert s.state == VoiceState.SPEAKING
+        s.notify_speech_finished()                # TTS completion -> IDLE
+        assert s.state == VoiceState.IDLE
+    assert asst.calls == ["hello void", "hello void", "hello void"]
+
+
+def test_worker_barge_in_during_stt_drops_old_result():
+    # A barge-in press (inline on the input thread) arrives WHILE the worker is
+    # running STT. It starts a fresh session; the old STT result is stale and
+    # must never dispatch. This is the real value of press-inline/release-worker.
+    holder = {}
+
+    def press_during_stt():
+        holder["ctrl"].on_ptt_press()             # inline barge-in mid-STT
+
+    ctrl, s, mw, cap, stt, tts, asst, ks, ev = _worker_controller(
+        stt=FakeSTT(text="old command", hook=press_during_stt))
+    holder["ctrl"] = ctrl
+    ctrl.on_ptt_press(); ctrl.on_ptt_release()   # release-chain queued
+    gen0 = s.generation
+    mw.run_all()                                  # worker runs finalize -> STT (hook fires) -> ...
+    assert s.generation > gen0                     # barge-in bumped the generation
+    assert asst.calls == []                        # stale STT result never dispatched
+    assert s.state == VoiceState.LISTENING         # fresh session underway
+
+
+def test_worker_killswitch_then_late_release_chain_is_dropped():
+    ks = KillSwitch()
+    ctrl, s, mw, cap, stt, tts, asst, k, ev = _worker_controller(kill_switch=ks)
+    ctrl.on_ptt_press(); ctrl.on_ptt_release()   # chain queued
+    ks.engage(reason="stop before worker runs")
+    s.poll()                                       # coordinator latches STOPPED
+    assert s.state == VoiceState.STOPPED
+    mw.run_all()                                   # late chain executes now
+    assert asst.calls == [] and tts.spoke == []    # dropped; nothing dispatched/spoken
+    assert s.state == VoiceState.STOPPED           # latch not resurrected
+
+
+def test_worker_shutdown_then_late_release_chain_keeps_closed():
+    ctrl, s, mw, cap, stt, tts, asst, ks, ev = _worker_controller()
+    ctrl.on_ptt_press(); ctrl.on_ptt_release()   # chain queued
+    ctrl.shutdown()                                # -> CLOSED, worker stopped
+    assert s.state == VoiceState.CLOSED and mw.stopped
+    mw.run_all()                                   # deliver the stale chain anyway
+    assert asst.calls == [] and s.state == VoiceState.CLOSED
+
+
+def test_worker_real_thread_completes_cycle():
+    # Exercise the actual _SerialVoiceWorker thread end to end (no manual pump).
+    from void.voice.runtime import _SerialVoiceWorker
+    import time as _t
+    s, cap, stt, tts, asst, ks, ev = _session()
+    worker = _SerialVoiceWorker()
+    ctrl = VoiceController(s, None, worker=worker)
+    ctrl._activation = FakeActivation(ctrl.on_ptt_press, ctrl.on_ptt_release)
+    ctrl.start(monitor=False)
+    try:
+        ctrl.on_ptt_press()
+        ctrl.on_ptt_release()                     # runs on the worker thread
+        deadline = _t.time() + 2.0
+        while s.state != VoiceState.SPEAKING and _t.time() < deadline:
+            _t.sleep(0.01)
+        assert s.state == VoiceState.SPEAKING
+        assert asst.calls == ["hello void"]
+    finally:
+        ctrl.shutdown()
+    assert s.state == VoiceState.CLOSED

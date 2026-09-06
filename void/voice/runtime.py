@@ -16,6 +16,7 @@ dependency error surfaces at start()/first use with an actionable message.
 """
 from __future__ import annotations
 
+import queue
 import threading
 from typing import Callable
 
@@ -27,14 +28,62 @@ from void.voice.state import VoiceState
 from void.voice.tts import create_tts_provider
 
 
+class _SerialVoiceWorker:
+    """ONE dedicated thread that runs the blocking release-chain (capture
+    finalize -> STT -> Assistant.run -> speak) off the PTT/keyboard-hook and
+    monitor threads. Strictly serial (not a pool), so at most one chain runs at
+    a time - single-flight is still enforced by the VoiceSession itself. Voice
+    lifecycle safety is unchanged: results carry their generation, so anything
+    that finishes late is dropped by the session's existing stale guard."""
+
+    def __init__(self, name: str = "void-voice-worker"):
+        self._q: "queue.Queue" = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._name = name
+        self._alive = False
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._alive = True
+        self._thread = threading.Thread(
+            target=self._run, name=self._name, daemon=True)
+        self._thread.start()
+
+    def submit(self, fn: Callable[[], None]) -> None:
+        if self._alive:
+            self._q.put(fn)
+
+    def _run(self) -> None:
+        while True:
+            fn = self._q.get()
+            if fn is None:
+                break
+            try:
+                fn()
+            except Exception:  # pragma: no cover - defensive; never kill worker
+                pass
+
+    def stop(self, timeout: float = 2.0) -> None:
+        if self._thread is None:
+            return
+        self._alive = False
+        self._q.put(None)
+        self._thread.join(timeout=timeout)
+        self._thread = None
+
+
 class VoiceController:
     def __init__(self, session: VoiceSession, activation, *,
-                 poll_interval: float = 0.1):
+                 poll_interval: float = 0.1, worker=None):
         self._session = session
         self._activation = activation
         self._poll_interval = poll_interval
         self._monitor: threading.Thread | None = None
         self._stop_evt = threading.Event()
+        # Optional serial worker for the blocking release-chain. When absent
+        # (e.g. unit tests), on_ptt_release runs inline exactly as before.
+        self._worker = worker
 
     # --- construction from config -------------------------------------
     @classmethod
@@ -65,11 +114,31 @@ class VoiceController:
             on_message=on_message,
             speak_response=config.get("voice.speak_responses", True),
         )
-        activation = PTTActivation(
-            session.on_ptt_press, session.on_ptt_release,
+        worker = _SerialVoiceWorker()
+        controller = cls(session, None, poll_interval=poll_interval,
+                         worker=worker)
+        # PTT edges go through the controller: press is quick (mic open / barge-
+        # in) and runs inline on the hook thread; release runs the blocking
+        # STT/Assistant/TTS chain on the serial worker so the hook thread stays
+        # responsive (real barge-in / new PTT remain observable during a reply).
+        controller._activation = PTTActivation(
+            controller.on_ptt_press, controller.on_ptt_release,
             hotkey=config.get("voice.ptt_hotkey", "ctrl+space"),
         )
-        return cls(session, activation, poll_interval=poll_interval)
+        return controller
+
+    # --- PTT edges (input thread -> session; blocking work -> worker) --
+    def on_ptt_press(self) -> None:
+        # Quick: IDLE->LISTENING (mic open) or SPEAKING barge-in (TTS stop).
+        self._session.on_ptt_press()
+
+    def on_ptt_release(self) -> None:
+        # Finalize capture + STT + Assistant.run + speak is blocking; run it off
+        # the input/hook thread when a worker is present.
+        if self._worker is not None:
+            self._worker.submit(self._session.on_ptt_release)
+        else:
+            self._session.on_ptt_release()
 
     # --- observability ------------------------------------------------
     @property
@@ -88,6 +157,8 @@ class VoiceController:
         the live loop deterministically via poll_once().
         """
         self._stop_evt.clear()
+        if self._worker is not None:
+            self._worker.start()
         self._activation.start()
         if monitor and self._monitor is None:
             self._monitor = threading.Thread(
@@ -121,7 +192,10 @@ class VoiceController:
             self._monitor.join(timeout=1.0)
             self._monitor = None
         # SHUTDOWN: halt mic/STT/TTS, invalidate generation, release resources.
+        # Done before the worker stops so any late chain result is stale-dropped.
         self._session.close()
+        if self._worker is not None:
+            self._worker.stop()
 
     @property
     def stopped(self) -> bool:
