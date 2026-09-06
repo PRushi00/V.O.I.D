@@ -94,6 +94,12 @@ class _ResilientTTS(TTS):
         except Exception:
             pass
 
+    def close(self) -> None:
+        try:
+            self.delegate.close()
+        except Exception:
+            pass
+
 
 # --- provider registry (the replaceable seam) ---------------------------
 #

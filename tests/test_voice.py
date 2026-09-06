@@ -832,3 +832,290 @@ def test_tts_failure_is_non_fatal_through_session():
     assert a.calls == ["hello void"]
     assert s._last_result.result == "the answer is 42"
     assert s.state == VoiceState.IDLE
+
+
+# --- Phase 9B step 2: interruptible async SAPI provider --------------------
+#
+# The SAPI provider runs speech on ONE COM-owning worker thread. These tests
+# inject a fake SpVoice (no real COM, no audio, cross-platform) and drive
+# completion/interruption with deterministic synchronization primitives - no
+# sleeps for correctness.
+
+import time as _time                                              # noqa: E402
+
+
+class FakeSpVoice:
+    """Deterministic stand-in for a SAPI SpVoice used on the worker thread.
+
+    Records every Speak(text, flags); a PURGE flag ends the current utterance
+    when the backend is interruptible. WaitUntilDone(ms) blocks (up to ms) on a
+    per-utterance 'finished' event the test controls, mirroring async SAPI.
+    """
+    _PURGE = 2
+
+    def __init__(self, raise_on_speak=False, interruptible=True):
+        self._cond = __import__("threading").Condition()
+        self._finish = __import__("threading").Event()
+        self._purged = __import__("threading").Event()
+        self.calls = []
+        self._raise_on_speak = raise_on_speak
+        self._interruptible = interruptible
+
+    def Speak(self, text, flags):
+        with self._cond:
+            self.calls.append((text, flags))
+            self._cond.notify_all()
+        if flags & self._PURGE:
+            self._purged.set()
+            if self._interruptible:
+                self._finish.set()
+        if text:
+            if self._raise_on_speak:
+                raise RuntimeError("speak backend failed")
+            self._finish.clear()
+        return 0
+
+    def WaitUntilDone(self, ms):
+        return self._finish.wait(ms / 1000.0)
+
+    # --- test controls ---
+    def finish_utterance(self):
+        self._finish.set()
+
+    def wait_purged(self, timeout=2.0):
+        return self._purged.wait(timeout)
+
+    @property
+    def utterances(self):
+        return [t for (t, f) in self.calls if t]
+
+    def wait_utterances(self, n, timeout=2.0):
+        end = _time.time() + timeout
+        with self._cond:
+            while len([t for (t, f) in self.calls if t]) < n:
+                remaining = end - _time.time()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(remaining)
+        return True
+
+
+def _sapi(fake=None, *, teardown=None, before_start=None, **fake_kw):
+    fake = fake if fake is not None else FakeSpVoice(**fake_kw)
+    tts = SapiTTS(
+        _voice_factory=lambda: fake,
+        _com_setup=lambda: None,
+        _com_teardown=(teardown or (lambda: None)),
+        _poll_ms=10,
+        _before_start=before_start,
+    )
+    return tts, fake
+
+
+def test_sapi_normal_speak_and_natural_completion():
+    tts, fake = _sapi()
+    try:
+        tts.speak("hello there")
+        assert tts.is_speaking is True                # (2) reaches speaking
+        assert fake.wait_utterances(1)               # (1) speech started async
+        assert fake.utterances == ["hello there"]
+        fake.finish_utterance()
+        assert tts._idle.wait(2.0)                    # (3) converges to idle
+        assert tts.is_speaking is False
+    finally:
+        tts.close()
+
+
+def test_sapi_stop_while_speaking_interrupts():
+    tts, fake = _sapi()
+    try:
+        tts.speak("a long sentence")
+        assert fake.wait_utterances(1)
+        tts.stop()
+        assert tts.is_speaking is False              # converges immediately
+        assert fake.wait_purged()                    # backend was purged
+    finally:
+        tts.close()
+
+
+def test_sapi_stop_while_idle_is_noop():
+    tts, fake = _sapi()
+    try:
+        tts.stop()                                   # never spoke -> no worker
+        assert tts.is_speaking is False
+        assert fake.calls == []
+    finally:
+        tts.close()
+
+
+def test_sapi_repeated_stop_is_safe():
+    tts, fake = _sapi()
+    try:
+        tts.speak("x")
+        assert fake.wait_utterances(1)
+        tts.stop(); tts.stop(); tts.stop()
+        assert tts.is_speaking is False
+    finally:
+        tts.close()
+
+
+def test_sapi_speak_while_speaking_replaces_no_overlap():
+    tts, fake = _sapi()
+    try:
+        tts.speak("first")
+        assert fake.wait_utterances(1)
+        tts.speak("second")                          # replace in-progress
+        assert fake.wait_utterances(2)
+        assert fake.utterances == ["first", "second"]   # ordered, one worker
+        # a purge occurred (replacement, not overlap)
+        assert any(f & FakeSpVoice._PURGE for _, f in fake.calls)
+        fake.finish_utterance()
+        assert tts._idle.wait(2.0)
+    finally:
+        tts.close()
+
+
+def test_sapi_provider_failure_during_speech_is_non_fatal():
+    tts, fake = _sapi(raise_on_speak=True)
+    try:
+        tts.speak("boom")                            # backend raises in worker
+        assert tts._idle.wait(2.0)
+        assert tts.is_speaking is False              # no crash, converges idle
+    finally:
+        tts.close()
+
+
+def test_sapi_initialization_failure_raises_ttserror():
+    def boom():
+        raise RuntimeError("no SAPI here")
+    tts = SapiTTS(_voice_factory=boom, _com_setup=lambda: None,
+                  _com_teardown=lambda: None, _poll_ms=10)
+    try:
+        with pytest.raises(TTSError):
+            tts.speak("hello")                       # init failure surfaces
+    finally:
+        tts.close()
+
+
+def test_sapi_non_interruptible_provider_starts_no_new_speech_after_stop():
+    tts, fake = _sapi(interruptible=False)
+    try:
+        tts.speak("only utterance")
+        assert fake.wait_utterances(1)
+        tts.stop()
+        assert fake.wait_purged()
+        assert tts.is_speaking is False
+        # Contract: a provider that cannot cut current speech must still begin
+        # NO further utterances after stop().
+        assert fake.utterances == ["only utterance"]
+    finally:
+        tts.close()
+
+
+def test_sapi_shutdown_while_speaking_releases_resources():
+    torn = []
+    tts, fake = _sapi(teardown=lambda: torn.append(1))
+    tts.speak("mid sentence")
+    assert fake.wait_utterances(1)
+    tts.close()                                      # shutdown while speaking
+    assert tts._worker is None                       # worker joined, not hung
+    assert torn == [1]                               # COM teardown ran
+    assert tts.is_speaking is False
+
+
+def test_sapi_start_stop_race_starts_no_audio():
+    # A stop that arrives after the worker dequeues speak but BEFORE it starts
+    # audio must prevent any audio (deterministic via the _before_start seam).
+    raced = __import__("threading").Event()
+    holder = {}
+
+    def before():
+        holder["tts"].stop()                         # stop wins the race
+        raced.set()
+
+    tts, fake = _sapi(before_start=before)
+    holder["tts"] = tts
+    try:
+        tts.speak("should never be spoken")
+        assert raced.wait(2.0)
+        assert fake.wait_utterances(1, timeout=0.3) is False
+        assert fake.utterances == []                 # no audio ever started
+        assert tts.is_speaking is False
+    finally:
+        tts.close()
+
+
+def test_sapi_honors_provider_agnostic_interface():
+    tts, fake = _sapi()
+    try:
+        assert isinstance(tts, TTS)
+        for name in ("is_speaking", "speak", "stop", "close"):
+            assert hasattr(tts, name)
+    finally:
+        tts.close()
+
+
+# --- KillSwitch <-> TTS coordination (no KillSwitch->TTS dependency) --------
+
+def test_killswitch_engaged_stops_tts_via_coordinator():
+    ks = KillSwitch()
+    s, cap, stt, tts, asst, k, ev = _session(
+        assistant=FakeAssistant(FakeResult(Status.COMPLETED, "speaking")),
+        kill_switch=ks)
+    s.on_ptt_press(); s.on_ptt_release()
+    assert s.state == VoiceState.SPEAKING
+    ks.engage(reason="global stop")                  # authoritative, not a voice call
+    s.poll()                                         # coordinator observes + stops TTS
+    assert tts.stops >= 1 and s.state == VoiceState.STOPPED
+
+
+def test_killswitch_is_independent_of_tts():
+    # KillSwitch must not import or reference voice/TTS in any way.
+    import inspect
+    import void.core.kill_switch as ksmod
+    src = inspect.getsource(ksmod).lower()
+    assert "voice" not in src and "tts" not in src and "speak" not in src
+    ks = KillSwitch()
+    assert not hasattr(ks, "tts") and not hasattr(ks, "_tts")
+
+
+# --- task-state isolation & response finalization (B5) ---------------------
+
+def test_interrupting_speech_does_not_mutate_task_state():
+    asst = FakeAssistant(FakeResult(Status.COMPLETED, "done"))
+    s, cap, stt, tts, a, ks, ev = _session(assistant=asst)
+    s.on_ptt_press(); s.on_ptt_release()
+    assert a.calls == ["hello void"] and s.state == VoiceState.SPEAKING
+    prev = s._last_result
+    s.on_ptt_press()                                 # interrupt speech only
+    assert tts.stops >= 1
+    # No task authority was exercised: no re-run, no approve/deny/cancel.
+    assert a.calls == ["hello void"] and s._last_result is prev
+    for attr in ("approve", "deny", "cancel", "approved", "cancelled"):
+        assert not hasattr(a, attr)
+
+
+def test_finalized_response_text_is_what_reaches_tts():
+    order = []
+
+    class OrderAssistant:
+        def run(self, transcript):
+            order.append("run")                      # task completes first
+            return FakeResult(Status.COMPLETED, "final answer")
+
+    class OrderTTS(FakeTTS):
+        def speak(self, text):
+            order.append(("speak", text))
+            super().speak(text)
+
+    s, cap, stt, tts, a, ks, ev = _session(assistant=OrderAssistant(),
+                                           tts=OrderTTS())
+    s.on_ptt_press(); s.on_ptt_release()
+    assert order == ["run", ("speak", "final answer")]   # finalized before speak
+    assert tts.spoke == ["final answer"] == [s._last_result.result]
+
+
+def test_null_tts_close_is_safe():
+    t = NullTTS()
+    t.speak("hi"); t.stop(); t.close(); t.close()     # no raise, idempotent
+    assert t.is_speaking is False

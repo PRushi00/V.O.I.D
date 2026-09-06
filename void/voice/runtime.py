@@ -120,6 +120,8 @@ class VoiceController:
         if self._monitor is not None:
             self._monitor.join(timeout=1.0)
             self._monitor = None
+        # Release provider resources (TTS worker/COM, mic) after halting.
+        self._session.close()
 
     @property
     def stopped(self) -> bool:

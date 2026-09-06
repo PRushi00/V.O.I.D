@@ -78,6 +78,15 @@ class VoiceSession:
             self._sm.force_stopped()
             self._msg(f"Voice stopped ({reason}).")
 
+    def close(self) -> None:
+        """Release voice I/O resources (TTS worker/COM, mic). Lifecycle only -
+        no task/authority semantics. Safe to call after stop()."""
+        try:
+            self._tts.close()
+        except Exception:
+            pass
+        self._safe_close_mic()
+
     def reset(self) -> None:
         """Return a STOPPED session to IDLE - only if the kill switch is clear."""
         with self._lock:

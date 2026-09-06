@@ -262,6 +262,15 @@ class FasterWhisperSTT(STT):
 # --- text to speech -----------------------------------------------------
 
 class TTS:
+    """Provider-agnostic text-to-speech contract.
+
+    Minimal by design: ``speak`` starts speech asynchronously (replacing any
+    current utterance), ``stop`` is a responsive, idempotent interrupt, and
+    ``is_speaking`` converges to False after completion/stop/failure/shutdown.
+    ``close`` releases provider resources (default: nothing). No queue, pause,
+    resume, volume, or provider-specific surface is exposed.
+    """
+
     @property
     def is_speaking(self) -> bool:
         raise NotImplementedError
@@ -271,55 +280,239 @@ class TTS:
 
     def stop(self) -> None:
         raise NotImplementedError
+
+    def close(self) -> None:
+        """Release any provider resources. Default: nothing to release."""
+        return None
 
 
 class SapiTTS(TTS):
-    """Interruptible local Windows SAPI TTS via win32com (verified by the
-    Phase 9A SAPI spike: async speak + immediate purge from another path)."""
+    """Interruptible local Windows SAPI TTS.
+
+    ALL SAPI/COM work happens on ONE dedicated owner thread that CoInitializes
+    COM and owns the ``SpVoice`` for its whole life; no COM object ever crosses
+    a thread boundary. The public ``speak``/``stop``/``is_speaking``/``close``
+    are provider-agnostic and thread-safe: callers only record intent into a
+    single latest-command slot (guarded by a lock) and wake the worker - they
+    never call COM. A monotonic command sequence makes the semantics
+    deterministic:
+
+      * speak while idle       -> start speech asynchronously.
+      * speak while speaking    -> REPLACE (purge current, start new); no queue.
+      * stop while speaking     -> purge current; no further utterance starts.
+      * stop while idle / repeat-> safe no-op.
+      * stop arriving before the worker starts audio -> no audio starts at all
+        (the pre-start supersede check honours the latest-command slot).
+
+    The heavy imports (pywin32 / pythoncom) are lazy; a missing dependency is
+    surfaced as VoiceDependencyError on first speak(), which the resilient TTS
+    wrapper turns into a non-fatal TTSError.
+
+    The ``_voice_factory`` / ``_com_setup`` / ``_com_teardown`` / ``_poll_ms`` /
+    ``_before_start`` parameters are internal seams for deterministic tests
+    (inject a fake SpVoice, skip real COM, force a start/stop race); production
+    code constructs ``SapiTTS()`` with no arguments.
+    """
 
     _SVSF_ASYNC = 1
     _SVSF_PURGE = 2
-    _RS_SPEAKING = 2
+    _POLL_MS = 50            # worker responsiveness to stop/replace/shutdown
 
-    def __init__(self):
-        self._voice = None
+    def __init__(self, *, _voice_factory=None, _com_setup=None,
+                 _com_teardown=None, _poll_ms=None, _before_start=None):
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._ready = threading.Event()      # worker finished init (ok or error)
+        self._idle = threading.Event()       # set whenever speech is not running
+        self._idle.set()
+        self._latest = None                  # (kind, text, seq): newest request
+        self._seq = 0
+        self._speaking = False
+        self._shutdown = False
+        self._closed = False
+        self._started = False
+        self._worker: threading.Thread | None = None
+        self._start_error: Exception | None = None
+        # test seams (None in production)
+        self._voice_factory = _voice_factory
+        self._com_setup = _com_setup
+        self._com_teardown = _com_teardown
+        self._poll_ms = _poll_ms or self._POLL_MS
+        self._before_start = _before_start
 
-    def _load(self):
-        if self._voice is not None:
-            return self._voice
-        try:
-            import win32com.client
-        except ImportError as exc:
-            raise VoiceDependencyError(
-                "Windows TTS needs pywin32 (pip install -r requirements.txt)"
-            ) from exc
-        try:
-            self._voice = win32com.client.Dispatch("SAPI.SpVoice")
-        except Exception as exc:
-            raise TTSError(f"could not initialize SAPI voice: {exc}") from exc
-        return self._voice
-
+    # --- public, provider-agnostic API --------------------------------
     @property
     def is_speaking(self) -> bool:
-        if self._voice is None:
-            return False
-        try:
-            return self._voice.Status.RunningState == self._RS_SPEAKING
-        except Exception:
-            return False
+        with self._lock:
+            return self._speaking
 
     def speak(self, text: str) -> None:
-        v = self._load()
-        try:
-            v.Speak(text, self._SVSF_ASYNC)   # async: returns immediately
-        except Exception as exc:
-            raise TTSError(f"speak failed: {exc}") from exc
+        with self._lock:
+            if self._closed:
+                return                       # terminal: never speak after close
+        self._ensure_worker()                # may raise (missing dep / init fail)
+        with self._lock:
+            if self._closed:
+                return
+            self._seq += 1
+            self._latest = ("speak", text, self._seq)
+            self._speaking = True            # optimistic: intent to speak
+            self._idle.clear()
+            self._wake.set()
 
     def stop(self) -> None:
-        if self._voice is None:
-            return
+        # Idempotent and non-blocking: only records intent; never joins/blocks.
+        with self._lock:
+            if self._closed or not self._started:
+                self._speaking = False
+                return
+            self._seq += 1
+            self._latest = ("stop", None, self._seq)
+            self._speaking = False           # converge immediately on request
+            self._wake.set()
+
+    def close(self) -> None:
+        with self._lock:
+            worker = self._worker
+            self._closed = True
+            self._shutdown = True
+            self._speaking = False
+            self._wake.set()
+        if worker is not None:
+            worker.join(timeout=2.0)         # bounded: worker ticks every poll
+        with self._lock:
+            self._worker = None
+            self._started = False
+            self._idle.set()
+
+    # --- worker lifecycle ---------------------------------------------
+    def _ensure_worker(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            if self._started:
+                if self._start_error is not None:
+                    raise self._start_error
+                return
+            if self._voice_factory is None:
+                # Fail fast with a clean error if the dependency is absent.
+                try:
+                    import pythoncom  # noqa: F401
+                    import win32com.client  # noqa: F401
+                except ImportError as exc:
+                    self._started = True
+                    self._start_error = VoiceDependencyError(
+                        "Windows TTS needs pywin32 "
+                        "(pip install -r requirements.txt)")
+                    raise self._start_error from exc
+            self._started = True
+            self._ready.clear()
+            self._worker = threading.Thread(
+                target=self._run, name="void-tts-sapi", daemon=True)
+            self._worker.start()
+        # Wait (bounded) for init so a Dispatch failure surfaces synchronously.
+        self._ready.wait(timeout=5.0)
+        with self._lock:
+            if self._start_error is not None:
+                raise self._start_error
+
+    def _make_voice(self):
+        if self._voice_factory is not None:
+            return self._voice_factory()
+        import win32com.client
+        return win32com.client.Dispatch("SAPI.SpVoice")
+
+    def _run(self) -> None:
+        setup = self._com_setup
+        teardown = self._com_teardown
+        if setup is None or teardown is None:
+            import pythoncom
+            setup = setup or pythoncom.CoInitialize
+            teardown = teardown or pythoncom.CoUninitialize
         try:
-            # Purge queue + stop current utterance immediately.
-            self._voice.Speak("", self._SVSF_ASYNC | self._SVSF_PURGE)
+            setup()
+        except Exception as exc:              # COM init failure
+            with self._lock:
+                self._start_error = TTSError(f"COM init failed: {exc}")
+            self._ready.set()
+            return
+        voice = None
+        try:
+            voice = self._make_voice()
+        except Exception as exc:
+            with self._lock:
+                self._start_error = TTSError(
+                    f"could not initialize SAPI voice: {exc}")
+            self._ready.set()
+            try:
+                teardown()
+            except Exception:
+                pass
+            return
+        self._ready.set()
+        try:
+            self._loop(voice)
+        finally:
+            try:
+                teardown()
+            except Exception:
+                pass
+
+    def _purge(self, voice) -> None:
+        try:
+            voice.Speak("", self._SVSF_ASYNC | self._SVSF_PURGE)
         except Exception:
             pass
+
+    def _loop(self, voice) -> None:
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            with self._lock:
+                if self._shutdown:
+                    break
+                cmd, self._latest = self._latest, None
+            if cmd is None:
+                continue
+            kind, text, seq = cmd
+            if kind == "stop":
+                self._purge(voice)
+                with self._lock:
+                    self._speaking = False
+                    if self._latest is None:
+                        self._idle.set()
+                continue
+            # kind == "speak": if a newer command already arrived, don't start.
+            if self._before_start is not None:
+                self._before_start()          # test seam to force a race
+            with self._lock:
+                superseded = self._latest is not None or self._shutdown
+            if superseded:
+                continue                      # newer stop/speak wins; no audio
+            self._purge(voice)                # replace anything currently playing
+            try:
+                voice.Speak(text, self._SVSF_ASYNC)
+            except Exception:
+                with self._lock:
+                    if self._latest is None:
+                        self._speaking = False
+                        self._idle.set()
+                continue
+            self._await_utterance(voice)
+
+    def _await_utterance(self, voice) -> None:
+        while True:
+            try:
+                done = bool(voice.WaitUntilDone(self._poll_ms))
+            except Exception:
+                done = True
+            with self._lock:
+                interrupted = self._latest is not None or self._shutdown
+                if not interrupted and done:
+                    self._speaking = False
+                    self._idle.set()
+            if interrupted:
+                self._purge(voice)            # cut current; outer loop handles next
+                return
+            if done:
+                return
