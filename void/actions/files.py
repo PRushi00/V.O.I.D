@@ -30,6 +30,14 @@ _MAX_LIST_ENTRIES = 200  # cap on entries returned by list_directory
 _FIND_DEFAULT_RESULTS = 25
 _FIND_MAX_RESULTS = 50        # hard ceiling
 _FIND_MAX_VISITED = 20_000    # directory-visit budget before giving up
+# Filler words in a natural-language location hint that describe the RELATIONSHIP
+# ("the Projects folder ON MY Desktop"), not the location itself. Dropped so the
+# context matcher narrows by the real location word(s). Deliberately small.
+_CONTEXT_FILLER = frozenset({
+    "the", "a", "an", "my", "our", "your", "in", "on", "of", "at", "to",
+    "into", "inside", "within", "under", "below", "from", "folder",
+    "directory", "dir", "named", "called", "please",
+})
 
 
 class PathNotAllowed(Exception):
@@ -250,16 +258,15 @@ class FileActions:
 
         incomplete = capped or visited_truncated
 
-        # Deterministic contextual narrowing (never ranking/order). Every token
-        # of the owner-supplied context must appear in the candidate's real path.
+        # Deterministic, structure-aware contextual narrowing (never ranking or
+        # traversal/depth order). See _narrow_by_context: the owner's location
+        # hint is matched against each candidate's real ANCESTOR segments, most
+        # specific tier first. It only ever FILTERS; cardinality below still
+        # decides RESOLVED / AMBIGUOUS / NOT_FOUND.
         ctx = (context or "").strip()
         pre_filter_count = len(matches)
         if ctx:
-            tokens = [t for t in ctx.lower().replace("/", " ").replace("\\", " ").split()
-                      if t]
-            if tokens:
-                matches = [m for m in matches
-                           if all(tok in m["path"].lower() for tok in tokens)]
+            matches = self._narrow_by_context(matches, ctx, needle)
 
         note = " (results may be incomplete)" if incomplete else ""
         if not matches:
@@ -286,6 +293,70 @@ class FileActions:
             f"(ambiguous - do NOT pick one; ask the owner which){note}:\n{listing}",
             data=matches,
         )
+
+    def _narrow_by_context(self, matches: list[dict], context: str,
+                           needle: str) -> list[dict]:
+        """Filter directory candidates by a natural-language location hint,
+        using real filesystem STRUCTURE - never ranking, order, or depth.
+
+        The hint is tokenized; filler words and any token equal to the directory
+        name itself are dropped (so "OneDrive Projects" hints the *parent*
+        OneDrive, not the target). Candidates are then filtered by the most
+        specific tier that yields any match:
+
+          Tier 1 - immediate-parent anchor: the most specific (last) meaningful
+                   token equals the candidate's immediate parent directory, and
+                   every earlier meaningful token is one of its ancestor
+                   segments. ("Desktop" -> .../Desktop/Projects only.)
+          Tier 2 - exact ancestor-segment: every meaningful token matches an
+                   exact ancestor segment. Handles a hint that names a higher
+                   ancestor ("StudioVerse" -> .../StudioVerse/code/Projects).
+          Tier 3 - substring-anywhere over the full path: the original
+                   (pre-9A) behavior, kept only as a backward-compatible
+                   fallback when the structural tiers find nothing.
+
+        Returns the filtered subset. The caller's cardinality check still
+        decides the outcome, so a hint that leaves >1 candidate stays AMBIGUOUS
+        and a hint that matches none is NOT_FOUND - this never picks a winner.
+        """
+        raw = [t for t in context.lower().replace("/", " ").replace("\\", " ").split()
+               if t]
+        tokens = [t for t in raw if t not in _CONTEXT_FILLER and t != needle]
+
+        def ancestor_segments(path: str) -> list[str]:
+            # All path components ABOVE the matched directory, lowercased.
+            return [p.lower() for p in Path(path).parts[:-1]]
+
+        if not tokens:
+            # Only filler / the name itself: no usable location. Fall back to a
+            # substring pass so an odd hint can still help, else leave as-is.
+            if raw:
+                sub = [m for m in matches
+                       if all(t in m["path"].lower() for t in raw)]
+                return sub if sub else matches
+            return matches
+
+        # Tier 1: immediate-parent anchor (+ earlier tokens as ancestors).
+        anchor, earlier = tokens[-1], tokens[:-1]
+        tier1 = []
+        for m in matches:
+            ancestors = ancestor_segments(m["path"])
+            if not ancestors:
+                continue
+            if ancestors[-1] == anchor and all(e in ancestors for e in earlier):
+                tier1.append(m)
+        if tier1:
+            return tier1
+
+        # Tier 2: every meaningful token is an exact ancestor segment.
+        tier2 = [m for m in matches
+                 if all(t in ancestor_segments(m["path"]) for t in tokens)]
+        if tier2:
+            return tier2
+
+        # Tier 3: backward-compatible substring-anywhere over the full path.
+        return [m for m in matches
+                if all(t in m["path"].lower() for t in raw)]
 
     def list_dir(self, path: str | None = None,
                  max_entries: int = _MAX_LIST_ENTRIES) -> ToolResult:

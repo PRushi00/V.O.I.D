@@ -446,3 +446,102 @@ def test_ctx_explicit_absolute_path_still_writes(ptree):
     target = Path(res.data[0]["path"]) / "testing.txt"
     w = fa.write(str(target), "hi")
     assert w.ok and target.exists() and target.read_text() == "hi"
+
+
+# --- structure-aware context narrowing (mirrors the real acceptance case) ---
+#
+# Replicates the exact layout observed on the owner's machine, entirely under
+# tmp_path (no real user files touched):
+#   d_desktop = .../OneDrive/Desktop/Projects            (parent: Desktop)
+#   d_nested  = .../OneDrive/Desktop/Projects/StudioVerse/app/projects (parent: app)
+#   d_onedrive= .../OneDrive/Projects                    (parent: OneDrive)
+
+@pytest.fixture
+def ptree_real(tmp_path):
+    onedrive = tmp_path / "Users" / "nanda" / "OneDrive"
+    d_desktop = onedrive / "Desktop" / "Projects"
+    d_nested = onedrive / "Desktop" / "Projects" / "StudioVerse" / "app" / "projects"
+    d_onedrive = onedrive / "Projects"
+    for d in (d_desktop, d_nested, d_onedrive):
+        d.mkdir(parents=True)
+    return FileActions(allowed_roots=[tmp_path]), {
+        "desktop": d_desktop, "nested": d_nested, "onedrive": d_onedrive}
+
+
+def test_real_no_context_is_ambiguous(ptree_real):
+    fa, d = ptree_real
+    res = fa.find_dir("Projects")
+    assert len(res.data) == 3 and "ambiguous" in res.summary.lower()
+    assert _paths(res) == {d["desktop"].resolve(), d["nested"].resolve(),
+                           d["onedrive"].resolve()}
+
+
+def test_real_context_onedrive_resolves_sibling(ptree_real):
+    # "the Projects folder in OneDrive" -> immediate parent OneDrive.
+    fa, d = ptree_real
+    res = fa.find_dir("Projects", context="OneDrive")
+    assert len(res.data) == 1
+    assert Path(res.data[0]["path"]) == d["onedrive"].resolve()
+
+
+def test_real_context_desktop_resolves_desktop(ptree_real):
+    # "the Projects folder on my Desktop" -> immediate parent Desktop.
+    fa, d = ptree_real
+    res = fa.find_dir("Projects", context="Desktop")
+    assert len(res.data) == 1
+    assert Path(res.data[0]["path"]) == d["desktop"].resolve()
+
+
+def test_real_context_onedrive_desktop_resolves_desktop(ptree_real):
+    # Outer->inner phrasing: Desktop is the anchor, OneDrive an ancestor.
+    fa, d = ptree_real
+    res = fa.find_dir("Projects", context="OneDrive Desktop")
+    assert len(res.data) == 1
+    assert Path(res.data[0]["path"]) == d["desktop"].resolve()
+
+
+def test_real_context_onedrive_projects_anchors_on_onedrive(ptree_real):
+    # "OneDrive Projects": the token equal to the query name ("projects") is
+    # dropped, leaving OneDrive as the parent anchor -> the OneDrive sibling.
+    fa, d = ptree_real
+    res = fa.find_dir("Projects", context="OneDrive Projects")
+    assert len(res.data) == 1
+    assert Path(res.data[0]["path"]) == d["onedrive"].resolve()
+
+
+def test_real_nested_duplicate_never_wins_by_depth(ptree_real):
+    # The deep .../app/projects must NOT win for a Desktop/OneDrive hint just
+    # because it is deeper and lies under both Desktop and OneDrive.
+    fa, d = ptree_real
+    for ctx in ("Desktop", "OneDrive", "OneDrive Desktop"):
+        res = fa.find_dir("Projects", context=ctx)
+        assert d["nested"].resolve() not in _paths(res), ctx
+
+
+def test_real_natural_phrasing_with_filler_words(ptree_real):
+    # Filler ("on my") is ignored; the location word drives the result.
+    fa, d = ptree_real
+    res = fa.find_dir("Projects", context="on my Desktop")
+    assert len(res.data) == 1
+    assert Path(res.data[0]["path"]) == d["desktop"].resolve()
+
+
+def test_real_context_targeting_nested_parent_resolves_it(ptree_real):
+    # When the hint uniquely identifies the deep dir's own parent ("app"), it
+    # resolves - it wins on structure, not on depth.
+    fa, d = ptree_real
+    res = fa.find_dir("Projects", context="app")
+    assert len(res.data) == 1
+    assert Path(res.data[0]["path"]) == d["nested"].resolve()
+
+
+def test_real_ambiguous_context_still_asks(tmp_path):
+    # Two 'Projects' each directly inside a folder named 'code' -> the anchor
+    # matches both -> stays AMBIGUOUS (never guesses).
+    a = tmp_path / "alpha" / "code" / "Projects"
+    b = tmp_path / "beta" / "code" / "Projects"
+    a.mkdir(parents=True)
+    b.mkdir(parents=True)
+    fa = FileActions(allowed_roots=[tmp_path])
+    res = fa.find_dir("Projects", context="code")
+    assert len(res.data) == 2 and "ambiguous" in res.summary.lower()
