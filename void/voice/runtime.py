@@ -20,10 +20,11 @@ import threading
 from typing import Callable
 
 from void.voice.adapters import (
-    FasterWhisperSTT, MicAudioCapture, PTTActivation, SapiTTS,
+    FasterWhisperSTT, MicAudioCapture, PTTActivation,
 )
 from void.voice.session import VoiceSession
 from void.voice.state import VoiceState
+from void.voice.tts import create_tts_provider
 
 
 class VoiceController:
@@ -42,7 +43,9 @@ class VoiceController:
                        on_transcript: Callable[[str], None] | None = None,
                        on_message: Callable[[str], None] | None = None,
                        poll_interval: float = 0.1) -> "VoiceController":
-        """Build the real (mic + faster-whisper + SAPI) controller from config.
+        """Build the real (mic + faster-whisper + local TTS) controller from
+        config. The TTS backend is chosen via the provider-agnostic factory
+        (voice.tts_provider), so the controller never depends on SAPI directly.
 
         Adapters are constructed but NOT activated here: no library import, no
         model download, no mic access happens until start()/first use.
@@ -54,7 +57,7 @@ class VoiceController:
             device=config.get("voice.stt_device", "cpu"),
             language=config.get("voice.stt_language", "en"),
         )
-        tts = SapiTTS()
+        tts = create_tts_provider(config)   # provider-agnostic; null-safe fallback
         session = VoiceSession(
             assistant, assistant.kill_switch,
             capture=capture, stt=stt, tts=tts,

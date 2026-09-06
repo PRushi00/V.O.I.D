@@ -682,3 +682,153 @@ def test_ptt_hold_with_repeats_drives_exactly_one_capture_no_busy_spam():
     assert cap.opens == 1 and cap.closes >= 1
     assert asst.calls == ["hello void"]  # exactly one dispatch
     assert ("msg", "Voice is busy; ignoring activation.") not in ev
+
+
+# --- Phase 9B: provider-agnostic TTS layer ---------------------------------
+#
+# A pluggable TTS interface with a Windows SAPI provider, a null-safe fallback,
+# and a factory - so future backends (Piper/ElevenLabs/WinRT OneCore) slot in
+# without touching the Agent/session. Deterministic: no real speakers.
+
+import void.voice.tts as ttsmod                                   # noqa: E402
+from void.voice.tts import (                                      # noqa: E402
+    NullTTS, TTSProvider, _ResilientTTS, available_providers,
+    create_tts_provider, register_tts_provider,
+)
+from void.voice.adapters import SapiTTS                           # noqa: E402
+
+
+class RaisingTTS(TTS):
+    @property
+    def is_speaking(self):
+        raise RuntimeError("status blew up")
+
+    def speak(self, text):
+        raise RuntimeError("backend on fire")
+
+    def stop(self):
+        raise RuntimeError("stop blew up")
+
+
+def test_tts_interface_is_the_shared_base():
+    # One hierarchy: the provider interface IS the adapters TTS base.
+    assert TTSProvider is TTS
+    assert issubclass(NullTTS, TTS) and issubclass(SapiTTS, TTS)
+
+
+def test_null_tts_is_safe_noop():
+    t = NullTTS()
+    assert t.is_speaking is False
+    t.speak("nothing comes out")         # must not raise, no speakers needed
+    t.stop()
+    assert t.spoke == ["nothing comes out"] and t.stops == 1
+
+
+def test_factory_defaults_to_sapi_on_windows(monkeypatch):
+    monkeypatch.setattr(ttsmod.sys, "platform", "win32")
+    t = create_tts_provider()            # no config, no explicit provider
+    assert isinstance(t, _ResilientTTS) and t.name == "sapi"
+    assert isinstance(t.delegate, SapiTTS)   # Windows provider behind interface
+
+
+def test_factory_defaults_to_null_off_windows(monkeypatch):
+    monkeypatch.setattr(ttsmod.sys, "platform", "linux")
+    t = create_tts_provider()
+    assert t.name == "null" and isinstance(t.delegate, NullTTS)
+
+
+def test_factory_reads_provider_from_config():
+    cfg = _StubConfig({"voice.tts_provider": "null"})
+    t = create_tts_provider(cfg)
+    assert t.name == "null" and isinstance(t.delegate, NullTTS)
+
+
+def test_factory_unknown_provider_falls_back_to_null():
+    t = create_tts_provider(provider="does-not-exist")
+    assert t.name == "null" and isinstance(t.delegate, NullTTS)
+
+
+def test_factory_construction_failure_falls_back_to_null():
+    def boom():
+        raise RuntimeError("cannot construct")
+    register_tts_provider("boom", boom)
+    try:
+        t = create_tts_provider(provider="boom")
+        assert t.name == "null" and isinstance(t.delegate, NullTTS)
+    finally:
+        ttsmod._PROVIDERS.pop("boom", None)
+
+
+def test_resilient_wrapper_normalizes_speak_errors_to_ttserror():
+    t = _ResilientTTS(RaisingTTS(), "raising")
+    with pytest.raises(TTSError):
+        t.speak("hello")                 # RuntimeError -> TTSError (uniform)
+
+
+def test_resilient_wrapper_is_speaking_and_stop_never_raise():
+    t = _ResilientTTS(RaisingTTS(), "raising")
+    assert t.is_speaking is False        # status error swallowed
+    t.stop()                             # stop is on the kill-switch path: safe
+
+
+def test_resilient_wrapper_delegates_success():
+    fake = FakeTTS()
+    t = _ResilientTTS(fake, "fake")
+    t.speak("hi there")
+    assert fake.spoke == ["hi there"] and t.is_speaking is True
+    t.stop()
+    assert fake.stops == 1
+
+
+def test_register_tts_provider_is_replaceable():
+    # A future backend can be added by name with no Agent/session change.
+    made = []
+
+    class PretendPiper(TTS):
+        def __init__(self):
+            made.append(1)
+        @property
+        def is_speaking(self):
+            return False
+        def speak(self, text):
+            pass
+        def stop(self):
+            pass
+
+    register_tts_provider("pretend-piper", PretendPiper)
+    try:
+        assert "pretend-piper" in available_providers()
+        t = create_tts_provider(provider="pretend-piper")
+        assert t.name == "pretend-piper" and isinstance(t.delegate, PretendPiper)
+        assert made == [1]
+    finally:
+        ttsmod._PROVIDERS.pop("pretend-piper", None)
+
+
+def test_controller_builds_tts_via_factory_null_backend():
+    # from_assistant must go through the factory, not hard-code SAPI. With a
+    # 'null' provider configured, the session's TTS is the null-backed provider.
+    class _Stub(_StubAssistant):
+        def __init__(self):
+            super().__init__()
+            self.config = _StubConfig({
+                "voice.stt_model": "small", "voice.stt_device": "cpu",
+                "voice.stt_language": "en", "voice.speak_responses": True,
+                "voice.ptt_hotkey": "ctrl+space", "voice.tts_provider": "null",
+            })
+
+    ctrl = VoiceController.from_assistant(_Stub())
+    session_tts = ctrl.session._tts
+    assert isinstance(session_tts, _ResilientTTS) and session_tts.name == "null"
+
+
+def test_tts_failure_is_non_fatal_through_session():
+    # A provider that always fails must not corrupt the agent result or crash the
+    # session: the result stands and the session returns to IDLE.
+    asst = FakeAssistant(FakeResult(Status.COMPLETED, "the answer is 42"))
+    failing = _ResilientTTS(RaisingTTS(), "raising")
+    s, cap, stt, tts, a, ks, ev = _session(assistant=asst, tts=failing)
+    s.on_ptt_press(); s.on_ptt_release()
+    assert a.calls == ["hello void"]
+    assert s._last_result.result == "the answer is 42"
+    assert s.state == VoiceState.IDLE

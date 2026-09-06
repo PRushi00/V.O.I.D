@@ -77,4 +77,5 @@ voice:
   stt_model: "small"             # faster-whisper model (tiny|base|small|medium)
   stt_device: "cpu"              # "cpu" (int8) or "cuda"
   stt_language: "en"
-  speak_responses: true          # local Windows SAPI TTS of the reply
+  speak_responses: true          # speak the reply through local TTS
+  tts_provider: "sapi"           # local TTS backend: "sapi" (Windows) or "null"

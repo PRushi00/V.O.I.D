@@ -13,16 +13,21 @@ from void.voice.state import (
 __all__ = [
     "VoiceState", "VoiceStateMachine", "IllegalVoiceTransition",
     "VoiceSession", "VoiceController",
+    "TTSProvider", "NullTTS", "create_tts_provider", "register_tts_provider",
 ]
 
 
 def __getattr__(name):
-    # Lazily expose the session/controller so importing the package stays cheap
-    # and never pulls the (lazy) adapters unless voice is actually used.
+    # Lazily expose the session/controller/TTS layer so importing the package
+    # stays cheap and never pulls the (lazy) adapters unless voice is used.
     if name == "VoiceSession":
         from void.voice.session import VoiceSession
         return VoiceSession
     if name == "VoiceController":
         from void.voice.runtime import VoiceController
         return VoiceController
+    if name in ("TTSProvider", "NullTTS", "create_tts_provider",
+                "register_tts_provider"):
+        import void.voice.tts as _tts
+        return getattr(_tts, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
