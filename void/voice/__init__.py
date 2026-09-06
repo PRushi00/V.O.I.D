@@ -14,12 +14,21 @@ __all__ = [
     "VoiceState", "VoiceEvent", "VoiceCommand", "reduce_voice",
     "VoiceSession", "VoiceController",
     "TTSProvider", "NullTTS", "create_tts_provider", "register_tts_provider",
+    "WakeWordDetector", "NullWakeDetector", "create_wake_detector",
+    "register_wake_provider", "WAKE_DETECTED",
 ]
+
+_WAKE_NAMES = frozenset({
+    "WakeWordDetector", "NullWakeDetector", "OpenWakeWordDetector",
+    "create_wake_detector", "register_wake_provider", "WAKE_DETECTED",
+    "WakeWordError", "WakeWordConfigError", "WakeWordBackendError",
+})
 
 
 def __getattr__(name):
-    # Lazily expose the session/controller/TTS layer so importing the package
-    # stays cheap and never pulls the (lazy) adapters unless voice is used.
+    # Lazily expose the session/controller/TTS/wake layer so importing the
+    # package stays cheap and never pulls the (lazy) adapters unless voice is
+    # used.
     if name == "VoiceSession":
         from void.voice.session import VoiceSession
         return VoiceSession
@@ -30,4 +39,7 @@ def __getattr__(name):
                 "register_tts_provider"):
         import void.voice.tts as _tts
         return getattr(_tts, name)
+    if name in _WAKE_NAMES:
+        import void.voice.wake as _wake
+        return getattr(_wake, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -79,3 +79,10 @@ voice:
   stt_language: "en"
   speak_responses: true          # speak the reply through local TTS
   tts_provider: "sapi"           # local TTS backend: "sapi" (Windows) or "null"
+  # Wake word (Phase 9C-1: detector boundary only - NOT wired to the session
+  # yet, and no microphone is opened). "Hey V.O.I.D." has no pretrained
+  # openWakeWord model, so wake_model_path MUST point at a custom model file or
+  # the detector fails clearly at start(). Nothing is downloaded.
+  wake_provider: "openwakeword"  # wake backend: "openwakeword" or "null"
+  wake_model_path: ""            # path to a custom "Hey V.O.I.D." model (required)
+  wake_threshold: 0.6            # conservative: prefer a miss over a false wake
