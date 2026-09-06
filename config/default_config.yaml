@@ -67,3 +67,14 @@ kill_switch:
   # Fail-safe: if require_pin is true but no PIN has been set yet, a stop is
   # still allowed (you must never be unable to stop). Set a PIN to enforce auth.
   require_pin: true
+
+# Voice interface (Phase 9A). OPTIONAL - core V.O.I.D works without the voice
+# stack. Enable only after installing requirements-voice.txt and choosing to
+# download the Whisper model (models are NOT downloaded during normal startup).
+voice:
+  enabled: false                 # off by default; the orb/CLI opt in explicitly
+  ptt_hotkey: "ctrl+space"       # push-to-talk: hold to talk, release to send
+  stt_model: "small"             # faster-whisper model (tiny|base|small|medium)
+  stt_device: "cpu"              # "cpu" (int8) or "cuda"
+  stt_language: "en"
+  speak_responses: true          # local Windows SAPI TTS of the reply

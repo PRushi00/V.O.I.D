@@ -9,6 +9,7 @@ Examples:
     python -m void stop            # engage emergency stop (any terminal)
     python -m void clear-stop
     python -m void ui              # launch the circular widget
+    python -m void voice          # launch the push-to-talk voice interface
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import getpass
 import json
 import re
 import sys
+import time
 
 from void.app import Assistant
 from void.core.task import Status
@@ -332,6 +334,59 @@ def cmd_ui() -> int:
     return launch()
 
 
+def cmd_voice() -> int:
+    """Launch the push-to-talk voice interface.
+
+    Voice is a thin I/O adapter over the SAME Assistant.run() path the text CLI
+    uses: transcripts are ordinary untrusted input, and RiskGate / KillSwitch /
+    the durable confirmation mechanism stay authoritative. HIGH-risk actions are
+    NOT approved by voice - they defer to AWAITING_CONFIRMATION (no confirm_fn),
+    handled out-of-band; a spoken 'yes' is just another goal, never an approval.
+    """
+    assistant = Assistant(on_event=_event)  # no confirm_fn -> HIGH-risk deferred
+    if not assistant.config.get("voice.enabled", False):
+        print("Voice is disabled. Set 'voice.enabled: true' in "
+              "config/local_config.yaml, then install the optional voice stack:\n"
+              "  pip install -r requirements-voice.txt")
+        return 1
+    if assistant.kill_switch.engaged:
+        print("A stop is currently engaged. Run 'python -m void clear-stop' "
+              "first.")
+        return 1
+
+    from void.voice.adapters import VoiceDependencyError
+    from void.voice.runtime import VoiceController
+
+    controller = VoiceController.from_assistant(
+        assistant,
+        on_state=lambda s: print(f"  [voice] {s}", flush=True),
+        on_transcript=lambda t: print(f"  [heard] {t}", flush=True),
+        on_message=lambda m: print(f"  {m}", flush=True),
+    )
+    hotkey = assistant.config.get("voice.ptt_hotkey", "ctrl+space")
+    try:
+        controller.start()
+    except VoiceDependencyError as exc:
+        print(f"Voice dependencies missing: {exc}\n"
+              f"  pip install -r requirements-voice.txt")
+        return 1
+
+    print(f"V.O.I.D voice ready. Hold '{hotkey}' to talk, release to send.\n"
+          f"The Whisper model downloads on first use. Ctrl+C to exit.\n"
+          f"(To stop everything: run 'python -m void stop' in another terminal.)")
+    try:
+        while not controller.stopped:
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        print("\nExiting voice.")
+    finally:
+        controller.shutdown("voice CLI exit")
+    if controller.stopped:
+        print("Voice stopped (kill switch). Run 'clear-stop' and restart voice "
+              "to talk again.")
+    return 0
+
+
 # --- argument parsing --------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -364,6 +419,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("clear-stop", help="Clear an engaged stop")
     sub.add_parser("ui", help="Launch the circular widget")
+    sub.add_parser("voice", help="Launch the push-to-talk voice interface")
 
     p_roots = sub.add_parser(
         "roots", help="Manage trusted filesystem roots (owner-only)")
@@ -386,7 +442,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Convenience: `python -m void "goal text"` with no subcommand -> run.
     known = {"run", "resume", "set-key", "list-keys", "remove-key", "set-pin",
-             "tasks", "stop", "clear-stop", "ui", "roots", "protect",
+             "tasks", "stop", "clear-stop", "ui", "voice", "roots", "protect",
              "-h", "--help"}
     if argv and argv[0] not in known:
         return cmd_run(" ".join(argv))
@@ -414,6 +470,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_clear_stop()
     if args.command == "ui":
         return cmd_ui()
+    if args.command == "voice":
+        return cmd_voice()
     if args.command == "roots":
         return cmd_roots(args.action, args.path)
     if args.command == "protect":

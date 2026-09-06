@@ -1,0 +1,14 @@
+# V.O.I.D OPTIONAL voice dependencies (Phase 9A).
+#
+# Core V.O.I.D does NOT require these. Install only to use the voice interface:
+#     .venv\Scripts\python.exe -m pip install -r requirements-voice.txt
+#
+# Windows SAPI TTS uses pywin32, which is already in requirements.txt.
+# The Whisper model itself is downloaded on first use / explicit init - NOT
+# during normal V.O.I.D startup (default model "small", ~460 MB, cached under
+# %USERPROFILE%\.cache\huggingface). CPU int8 needs no GPU.
+
+faster-whisper>=1.0     # local speech-to-text (bundles CTranslate2)
+sounddevice>=0.4        # microphone capture
+numpy>=1.24             # audio buffers
+keyboard>=0.13          # global push-to-talk hotkey
