@@ -45,6 +45,10 @@ partial name. Use only exact paths returned by these tools.
 USING find_directory:
 - It matches a folder NAME exactly (case-insensitive), or as a glob if you pass \
 * ? or []. "Project" will not match "Projects".
+- If the owner named a parent location (e.g. "Projects on my OneDrive Desktop", \
+"Projects inside StudioVerse"), pass that hint as the 'context' argument so the \
+engine can narrow the candidates. Do not turn the hint into an absolute path \
+yourself; let find_directory resolve it.
 - If it returns exactly ONE directory, you may use that exact path for the next \
 step (e.g. open_path or write_file).
 - If it returns MULTIPLE directories, they are ambiguous: do NOT pick one and \

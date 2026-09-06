@@ -345,3 +345,104 @@ def test_find_directory_registered_as_low_risk_tool(fs):
     assert tool is not None
     assert tool.risk is RiskLevel.LOW
     assert tool.parameters["required"] == ["query"]
+    assert "context" in tool.parameters["properties"]   # contextual resolution
+
+
+# --- contextual directory resolution -----------------------------------
+
+@pytest.fixture
+def ptree(tmp_path):
+    """Three 'Projects' folders in distinct parent contexts."""
+    ws = tmp_path / "V.O.I.D" / "workspace" / "Projects"
+    od = tmp_path / "Users" / "nanda" / "OneDrive" / "Desktop" / "Projects"
+    sv = tmp_path / "StudioVerse" / "code" / "Projects"
+    for d in (ws, od, sv):
+        d.mkdir(parents=True)
+    return FileActions(allowed_roots=[tmp_path]), {"ws": ws, "od": od, "sv": sv}
+
+
+def _paths(res):
+    return {Path(m["path"]) for m in res.data}
+
+
+def test_ctx_unique_name_resolves(tmp_path):
+    only = tmp_path / "a" / "Downloads"
+    only.mkdir(parents=True)
+    fa = FileActions(allowed_roots=[tmp_path])
+    res = fa.find_dir("Downloads")
+    assert len(res.data) == 1 and Path(res.data[0]["path"]) == only.resolve()
+
+
+def test_ctx_multiple_is_ambiguous(ptree):
+    fa, d = ptree
+    res = fa.find_dir("Projects")
+    assert len(res.data) == 3                         # AMBIGUOUS
+    assert _paths(res) == {d["ws"].resolve(), d["od"].resolve(), d["sv"].resolve()}
+    assert "ambiguous" in res.summary.lower()
+
+
+def test_ctx_context_resolves_ambiguity_onedrive(ptree):
+    fa, d = ptree
+    res = fa.find_dir("Projects", context="OneDrive Desktop")
+    assert len(res.data) == 1                         # RESOLVED via context
+    assert Path(res.data[0]["path"]) == d["od"].resolve()
+
+
+def test_ctx_parent_context_studioverse(ptree):
+    fa, d = ptree
+    res = fa.find_dir("Projects", context="StudioVerse")
+    assert len(res.data) == 1
+    assert Path(res.data[0]["path"]) == d["sv"].resolve()
+
+
+def test_ctx_context_still_ambiguous_stays_ambiguous(tmp_path):
+    # Two 'Projects' both under a 'work' context -> context does not force a pick.
+    a = tmp_path / "work" / "alpha" / "Projects"
+    b = tmp_path / "work" / "beta" / "Projects"
+    a.mkdir(parents=True)
+    b.mkdir(parents=True)
+    fa = FileActions(allowed_roots=[tmp_path])
+    res = fa.find_dir("Projects", context="work")
+    assert len(res.data) == 2 and "ambiguous" in res.summary.lower()
+
+
+def test_ctx_context_no_match_is_not_found(ptree):
+    fa, d = ptree
+    res = fa.find_dir("Projects", context="Nonexistent")
+    assert res.data == []
+    assert "did not" not in res.summary  # not a crash
+    assert "context 'Nonexistent'" in res.summary
+
+
+def test_ctx_no_name_match_is_not_found(ptree):
+    fa, d = ptree
+    res = fa.find_dir("NonexistentFolder")
+    assert res.data == [] and "No directories matched" in res.summary
+
+
+def test_ctx_enumeration_order_independence(ptree, monkeypatch):
+    # Reversing os.walk's directory order must not change the outcome.
+    fa, d = ptree
+    import void.actions.files as filesmod
+    real_walk = filesmod.os.walk
+
+    def reversed_walk(*a, **k):
+        for dirpath, dirnames, filenames in real_walk(*a, **k):
+            dirnames.sort(reverse=True)   # flip traversal order in place
+            yield dirpath, dirnames, filenames
+
+    monkeypatch.setattr(filesmod.os, "walk", reversed_walk)
+    res = fa.find_dir("Projects")
+    assert _paths(res) == {d["ws"].resolve(), d["od"].resolve(), d["sv"].resolve()}
+    # Context still deterministically resolves the same one regardless of order.
+    r2 = fa.find_dir("Projects", context="OneDrive Desktop")
+    assert len(r2.data) == 1 and Path(r2.data[0]["path"]) == d["od"].resolve()
+
+
+def test_ctx_explicit_absolute_path_still_writes(ptree):
+    # An explicit absolute path resolved via context is usable for write_file.
+    fa, d = ptree
+    res = fa.find_dir("Projects", context="StudioVerse")
+    target = Path(res.data[0]["path"]) / "testing.txt"
+    w = fa.write(str(target), "hi")
+    assert w.ok and target.exists() and target.read_text() == "hi"

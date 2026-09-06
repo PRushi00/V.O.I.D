@@ -415,3 +415,46 @@ def test_tool_result_prose_cannot_manipulate_task_status(tmp_path):
     assert result.status != Status.BLOCKED
     task = agent.store.load(result.task.id)
     assert task.plan[0]["status"] == "succeeded"
+
+
+# --- contextual directory resolution (agent-level) ---------------------
+
+def test_context_still_ambiguous_blocks_and_agent_cannot_override(tmp_path):
+    # Two 'Projects' both under 'work': context narrows but does not uniquely
+    # resolve -> BLOCKED, and the agent's attempt to write must NOT execute.
+    (tmp_path / "work" / "alpha" / "Projects").mkdir(parents=True)
+    (tmp_path / "work" / "beta" / "Projects").mkdir(parents=True)
+    target = tmp_path / "work" / "alpha" / "Projects" / "testing.txt"
+    agent, _ = _agent(tmp_path, [
+        LLMResponse(tool_calls=[tool_call("find_directory", query="Projects",
+                                          context="work")]),
+        LLMResponse(tool_calls=[tool_call("write_file", path=str(target),
+                                          content="x")]),   # override attempt
+    ])
+    result = agent.run("create testing.txt in Projects in work")
+    assert result.status == Status.BLOCKED
+    assert not target.exists()                       # write never executed
+    task = agent.store.load(result.task.id)
+    assert len(task.plan) == 1                        # only the find step ran
+    assert task.plan[0]["calls"][0]["tool"] == "find_directory"
+
+
+def test_context_resolves_then_agent_proceeds(tmp_path):
+    # Two 'Projects'; context uniquely resolves one -> not blocked; the agent
+    # then creates the file at the resolved path.
+    (tmp_path / "Users" / "n" / "OneDrive" / "Desktop" / "Projects").mkdir(parents=True)
+    (tmp_path / "V.O.I.D" / "workspace" / "Projects").mkdir(parents=True)
+    target = tmp_path / "Users" / "n" / "OneDrive" / "Desktop" / "Projects" / "testing.txt"
+    agent, _ = _agent(tmp_path, [
+        LLMResponse(tool_calls=[tool_call("find_directory", query="Projects",
+                                          context="OneDrive Desktop")]),
+        LLMResponse(tool_calls=[tool_call("write_file", path=str(target),
+                                          content="hi")]),
+        LLMResponse(text="Created testing.txt in your OneDrive Desktop Projects."),
+    ])
+    result = agent.run("create testing.txt in Projects on my OneDrive Desktop")
+    assert result.status == Status.COMPLETED
+    assert target.exists() and target.read_text() == "hi"
+    task = agent.store.load(result.task.id)
+    assert [e["calls"][0]["tool"] for e in task.plan] == \
+        ["find_directory", "write_file"]

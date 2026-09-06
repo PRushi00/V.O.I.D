@@ -163,7 +163,8 @@ class FileActions:
         )
 
     def find_dir(self, query: str, root: str | None = None,
-                 max_results: int = _FIND_DEFAULT_RESULTS) -> ToolResult:
+                 max_results: int = _FIND_DEFAULT_RESULTS,
+                 context: str | None = None) -> ToolResult:
         """Locate DIRECTORIES by name under the authorized roots.
 
         Exact case-insensitive name match (glob if the query has * ? [ ]); never
@@ -171,6 +172,13 @@ class FileActions:
         that never descends into protected subtrees, symlinks/junctions, noise,
         or system directories. Every emitted match is re-confined (allowed and
         NOT protected). The tool never picks a winner among multiple matches.
+
+        ``context`` is an optional parent-location hint from the owner's request
+        (e.g. "OneDrive Desktop" or "StudioVerse"). When given, candidates are
+        DETERMINISTICALLY filtered to those whose real path contains every
+        context token (case-insensitive) - used only to NARROW, never to rank or
+        pick. Cardinality of the filtered set decides the outcome, so a context
+        that leaves several candidates is still reported as ambiguous.
         """
         query = (query or "").strip()
         if not query:
@@ -241,7 +249,25 @@ class FileActions:
                 break
 
         incomplete = capped or visited_truncated
+
+        # Deterministic contextual narrowing (never ranking/order). Every token
+        # of the owner-supplied context must appear in the candidate's real path.
+        ctx = (context or "").strip()
+        pre_filter_count = len(matches)
+        if ctx:
+            tokens = [t for t in ctx.lower().replace("/", " ").replace("\\", " ").split()
+                      if t]
+            if tokens:
+                matches = [m for m in matches
+                           if all(tok in m["path"].lower() for tok in tokens)]
+
+        note = " (results may be incomplete)" if incomplete else ""
         if not matches:
+            if ctx and pre_filter_count:
+                # Candidates existed by name but none matched the context.
+                return ToolResult.success(
+                    f"No '{query}' directory matched the context '{ctx}'. "
+                    f"Ask the owner for the exact location.", data=[])
             if visited_truncated:
                 return ToolResult.success(
                     f"Search was INCOMPLETE (reached the directory-visit limit) "
@@ -249,14 +275,14 @@ class FileActions:
                     f"may still exist. Narrow the search with a 'root'.", data=[])
             return ToolResult.success(f"No directories matched '{query}'.", data=[])
         if len(matches) == 1:
-            note = " (results may be incomplete)" if incomplete else ""
+            ctx_note = f" (context '{ctx}')" if ctx else ""
             return ToolResult.success(
-                f"Found 1 directory matching '{query}'{note}: "
+                f"Found 1 directory matching '{query}'{ctx_note}{note}: "
                 f"{matches[0]['path']}", data=matches)
         listing = "\n".join(m["path"] for m in matches)
-        note = " (results may be incomplete)" if incomplete else ""
+        ctx_note = f" for context '{ctx}'" if ctx else ""
         return ToolResult.success(
-            f"Found {len(matches)} directories matching '{query}' "
+            f"Found {len(matches)} directories matching '{query}'{ctx_note} "
             f"(ambiguous - do NOT pick one; ask the owner which){note}:\n{listing}",
             data=matches,
         )
@@ -461,7 +487,11 @@ class FileActions:
                     "name exactly (case-insensitive), or as a glob if the query "
                     "contains * ? or []. It never returns files and never picks "
                     "a winner: if several folders match, ALL are returned and "
-                    "you must ask the owner which one."
+                    "you must ask the owner which one. When the owner names a "
+                    "parent location (e.g. 'Projects on my OneDrive Desktop' or "
+                    "'Projects inside StudioVerse'), pass that hint as 'context' "
+                    "to narrow the search - the engine filters candidates by it; "
+                    "it will still be ambiguous if several remain."
                 ),
                 parameters={
                     "type": "object",
@@ -471,6 +501,10 @@ class FileActions:
                         "root": {"type": "string",
                                  "description": ("Optional directory to search "
                                                  "under (must be allowed).")},
+                        "context": {"type": "string",
+                                    "description": ("Optional parent-location hint "
+                                                    "from the request, e.g. "
+                                                    "'OneDrive Desktop'.")},
                         "max_results": {"type": "integer",
                                         "description": "Max matches (default 25)."},
                     },
