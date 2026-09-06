@@ -15,7 +15,7 @@ from void.voice.adapters import (
 )
 from void.voice.session import VoiceSession
 from void.voice.state import (
-    IllegalVoiceTransition, VoiceState, VoiceStateMachine,
+    VoiceCommand, VoiceEvent, VoiceState, reduce_voice,
 )
 
 
@@ -214,15 +214,18 @@ def test_voice_dispatches_only_via_assistant_run():
     assert asst.calls == ["hello void"]     # sole execution path
 
 
-def test_high_risk_enters_awaiting_and_voice_cannot_approve():
+def test_high_risk_is_opaque_and_voice_cannot_approve():
+    # A HIGH-risk result (AWAITING_CONFIRMATION, no speakable text) is treated as
+    # opaque output: the voice SM never inspects task status, never enters an
+    # approval state, and never approves. It just dispatches and returns to IDLE.
     asst = FakeAssistant(FakeResult(Status.AWAITING_CONFIRMATION))
     states = []
     s, cap, stt, tts, a, ks, ev = _session(assistant=asst,
                                            on_state=lambda st: states.append(st))
     s.on_ptt_press(); s.on_ptt_release()
-    assert VoiceState.AWAITING_CONFIRMATION in states
-    # The assistant was asked to RUN, never to approve/deny (no such call made).
-    assert asst.calls == ["hello void"]
+    assert VoiceState.DISPATCHED in states  # handed to Assistant.run()...
+    assert s.state == VoiceState.IDLE       # ...then released; no approval state
+    assert asst.calls == ["hello void"]     # RUN only, never approve/deny
     assert not hasattr(asst, "approved")    # voice never approves
     # A spoken "yes" afterwards is a NEW run, not an approval of the pending one.
     asst2 = FakeAssistant(FakeResult(Status.COMPLETED, "ok"))
@@ -342,20 +345,29 @@ def test_ptt_during_tts_interrupts_and_starts_capture():
     assert s.state == VoiceState.LISTENING and cap.is_open
 
 
-# --- state machine (29) ------------------------------------------------
+# --- reducer determinism (29) ------------------------------------------
 
-def test_illegal_transition_rejected():
-    sm = VoiceStateMachine()
-    with pytest.raises(IllegalVoiceTransition):
-        sm.to(VoiceState.SPEAKING)          # IDLE -> SPEAKING is illegal
-    assert sm.state == VoiceState.IDLE
+def test_reducer_ignores_invalid_events():
+    # Unlisted (state, event) pairs deterministically stay put, no commands.
+    assert reduce_voice(VoiceState.IDLE, VoiceEvent.PTT_UP) == (VoiceState.IDLE, ())
+    assert reduce_voice(VoiceState.IDLE, VoiceEvent.TTS_DONE) == (VoiceState.IDLE, ())
+    assert reduce_voice(VoiceState.DISPATCHED, VoiceEvent.PTT_DOWN) == (
+        VoiceState.DISPATCHED, ())          # single-flight ignore
 
 
-def test_stopped_is_terminal():
-    sm = VoiceStateMachine()
-    sm.force_stopped()
-    with pytest.raises(IllegalVoiceTransition):
-        sm.to(VoiceState.LISTENING)
+def test_reducer_stopped_is_latched():
+    for ev in (VoiceEvent.PTT_DOWN, VoiceEvent.TTS_DONE, VoiceEvent.STT_OK,
+               VoiceEvent.KILLSWITCH):
+        assert reduce_voice(VoiceState.STOPPED, ev) == (VoiceState.STOPPED, ())
+    # Only an explicit non-voice re-arm leaves STOPPED.
+    assert reduce_voice(VoiceState.STOPPED, VoiceEvent.REARM) == (
+        VoiceState.IDLE, (VoiceCommand.NEW_GENERATION,))
+
+
+def test_reducer_closed_is_terminal():
+    for ev in (VoiceEvent.PTT_DOWN, VoiceEvent.REARM, VoiceEvent.KILLSWITCH,
+               VoiceEvent.SHUTDOWN, VoiceEvent.TTS_DONE):
+        assert reduce_voice(VoiceState.CLOSED, ev) == (VoiceState.CLOSED, ())
 
 
 # --- optional dependencies (30) ----------------------------------------
@@ -540,7 +552,7 @@ def test_controller_shutdown_stops_activation_and_session():
     ctrl.start(monitor=False)
     ctrl.shutdown()
     assert act.stopped == 1
-    assert s.state == VoiceState.STOPPED and ctrl.stopped
+    assert s.state == VoiceState.CLOSED and ctrl.closed
 
 
 def test_controller_start_propagates_dependency_error():
@@ -1119,3 +1131,187 @@ def test_null_tts_close_is_safe():
     t = NullTTS()
     t.speak("hi"); t.stop(); t.close(); t.close()     # no raise, idempotent
     assert t.is_speaking is False
+
+
+# --- Phase 9B step 3: thin deterministic voice state machine ----------------
+
+_ACTIVE_STATES = (
+    VoiceState.IDLE, VoiceState.LISTENING, VoiceState.CAPTURED,
+    VoiceState.TRANSCRIBING, VoiceState.DISPATCHED, VoiceState.SPEAKING,
+    VoiceState.ERROR,
+)
+
+
+def test_reducer_happy_path():
+    st = VoiceState.IDLE
+    st, cmds = reduce_voice(st, VoiceEvent.PTT_DOWN)
+    assert st == VoiceState.LISTENING
+    assert VoiceCommand.NEW_GENERATION in cmds and VoiceCommand.MIC_OPEN in cmds
+    st, cmds = reduce_voice(st, VoiceEvent.PTT_UP)
+    assert st == VoiceState.CAPTURED and VoiceCommand.CAPTURE_FINALIZE in cmds
+    st, cmds = reduce_voice(st, VoiceEvent.BEGIN_STT)
+    assert st == VoiceState.TRANSCRIBING and VoiceCommand.RUN_STT in cmds
+    st, cmds = reduce_voice(st, VoiceEvent.STT_OK)
+    assert st == VoiceState.DISPATCHED and VoiceCommand.RUN_DISPATCH in cmds
+    st, cmds = reduce_voice(st, VoiceEvent.DISPATCH_OK_SPEAK)
+    assert st == VoiceState.SPEAKING and VoiceCommand.SPEAK in cmds
+    st, cmds = reduce_voice(st, VoiceEvent.TTS_DONE)
+    assert st == VoiceState.IDLE
+
+
+def test_reducer_killswitch_and_shutdown_from_every_active_state():
+    for st in _ACTIVE_STATES:
+        ns, cmds = reduce_voice(st, VoiceEvent.KILLSWITCH)
+        assert ns == VoiceState.STOPPED and VoiceCommand.NEW_GENERATION in cmds
+        ns, cmds = reduce_voice(st, VoiceEvent.SHUTDOWN)
+        assert ns == VoiceState.CLOSED and VoiceCommand.NEW_GENERATION in cmds
+
+
+def test_session_full_lifecycle_state_sequence():
+    states = []
+    s, cap, stt, tts, asst, ks, ev = _session(
+        on_state=lambda st: states.append(st))
+    s.on_ptt_press(); s.on_ptt_release()
+    assert s.state == VoiceState.SPEAKING
+    s.poll()                                  # observe speaking
+    tts._speaking = False                      # backend finished
+    s.poll()                                   # retire -> IDLE
+    assert states == [
+        VoiceState.LISTENING, VoiceState.CAPTURED, VoiceState.TRANSCRIBING,
+        VoiceState.DISPATCHED, VoiceState.SPEAKING, VoiceState.IDLE,
+    ]
+
+
+def test_generation_bumps_on_each_new_session():
+    s, cap, stt, tts, asst, ks, ev = _session()
+    g0 = s.generation
+    s.on_ptt_press()                           # new session
+    g1 = s.generation
+    assert g1 > g0
+    s.on_ptt_release()                         # complete cycle -> SPEAKING
+    s.notify_speech_finished()                 # -> IDLE
+    s.on_ptt_press()                           # another new session
+    assert s.generation > g1
+
+
+# --- STOPPED is latched; CLOSED is terminal --------------------------------
+
+def test_shutdown_from_representative_states_reaches_closed():
+    # IDLE
+    s, *_ = _session()
+    s.close(); assert s.state == VoiceState.CLOSED
+    # LISTENING
+    s, cap, *_ = _session()
+    s.on_ptt_press(); assert s.state == VoiceState.LISTENING
+    s.close(); assert s.state == VoiceState.CLOSED and not cap.is_open
+    # SPEAKING
+    s, cap, stt, tts, *_ = _session()
+    s.on_ptt_press(); s.on_ptt_release(); assert s.state == VoiceState.SPEAKING
+    s.close(); assert s.state == VoiceState.CLOSED and tts.stops >= 1
+    # STOPPED -> CLOSED
+    s, *_ = _session()
+    s.stop(); assert s.state == VoiceState.STOPPED
+    s.close(); assert s.state == VoiceState.CLOSED
+
+
+def test_closed_prevents_resurrection():
+    s, cap, stt, tts, asst, ks, ev = _session()
+    s.close()
+    assert s.state == VoiceState.CLOSED
+    gen = s.generation
+    s.on_ptt_press()                           # no new session
+    s.on_ptt_release()
+    s.notify_speech_finished()
+    s.poll()
+    s.reset()                                  # cannot leave CLOSED
+    assert s.state == VoiceState.CLOSED
+    assert not cap.is_open and asst.calls == [] and s.generation == gen
+
+
+def test_stopped_does_not_auto_return_to_idle():
+    s, cap, stt, tts, asst, ks, ev = _session()
+    s.stop()
+    for _ in range(3):
+        s.poll()                               # monitor ticks must not un-stop it
+    assert s.state == VoiceState.STOPPED
+
+
+def test_rearm_leaves_stopped_only_when_killswitch_clear():
+    ks = KillSwitch()
+    s, cap, stt, tts, asst, k, ev = _session(kill_switch=ks)
+    ks.engage(reason="stop")
+    s.poll()                                    # coordinator -> STOPPED
+    assert s.state == VoiceState.STOPPED
+    s.reset()                                   # ks still engaged -> stays stopped
+    assert s.state == VoiceState.STOPPED
+    ks.reset()                                  # explicit non-voice clear
+    s.reset()                                   # explicit re-arm
+    assert s.state == VoiceState.IDLE
+
+
+# --- KillSwitch during each state: STOPPED, generation invalidated ----------
+
+def test_killswitch_during_speaking_invalidates_and_no_late_resurrection():
+    s, cap, stt, tts, asst, ks, ev = _session(
+        assistant=FakeAssistant(FakeResult(Status.COMPLETED, "answer")))
+    s.on_ptt_press(); s.on_ptt_release()
+    assert s.state == VoiceState.SPEAKING
+    gen_before = s.generation
+    s.stop()                                    # KillSwitch
+    assert s.state == VoiceState.STOPPED
+    assert s.generation != gen_before           # generation invalidated
+    assert tts.stops >= 1 and not cap.is_open
+    # A stale async event from the old generation cannot resurrect the session.
+    s._apply(VoiceEvent.TTS_DONE, gen=gen_before)
+    s._apply(VoiceEvent.DISPATCH_OK_SPEAK, gen=gen_before)
+    assert s.state == VoiceState.STOPPED
+
+
+def test_stale_dispatch_after_killswitch_is_not_spoken():
+    # KillSwitch engaged while Assistant.run() is in flight: the response must
+    # not be spoken and must not leave STOPPED.
+    ks = KillSwitch()
+
+    def engage_during_run():
+        ks.engage(reason="stop during dispatch")
+
+    asst = FakeAssistant(FakeResult(Status.COMPLETED, "too late"),
+                         on_run=engage_during_run)
+    s, cap, stt, tts, a, k, ev = _session(assistant=asst, kill_switch=ks)
+    s.on_ptt_press(); s.on_ptt_release()
+    assert a.calls == ["hello void"]            # dispatch happened...
+    assert tts.spoke == []                       # ...but nothing was spoken
+    assert s.state == VoiceState.STOPPED
+
+
+def test_barge_in_during_transcribing_cancels_old_stt():
+    # PTT arriving during TRANSCRIBING starts a fresh capture and the old STT
+    # result is discarded (stale generation) - it never dispatches.
+    holder = {}
+
+    def press_during_stt():
+        holder["s"].on_ptt_press()
+
+    s, cap, stt, tts, asst, ks, ev = _session(
+        stt=FakeSTT(text="old transcript", hook=press_during_stt))
+    holder["s"] = s
+    s.on_ptt_press(); s.on_ptt_release()
+    assert s.state == VoiceState.LISTENING       # new capture underway
+    assert cap.is_open
+    assert asst.calls == []                       # old STT result never dispatched
+
+
+def test_ptt_during_dispatched_is_ignored_single_flight():
+    seen = {}
+
+    def during_run():
+        s.on_ptt_press()
+        seen["state"] = s.state
+        seen["opens"] = cap.opens
+
+    asst = FakeAssistant(on_run=during_run)
+    s, cap, stt, tts, a, ks, ev = _session(assistant=asst)
+    s.on_ptt_press(); s.on_ptt_release()
+    assert seen["state"] == VoiceState.DISPATCHED   # ignored, still dispatched
+    assert seen["opens"] == 1                        # no second capture
+    assert a.calls == ["hello void"]                 # exactly one Assistant.run

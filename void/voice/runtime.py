@@ -110,20 +110,25 @@ class VoiceController:
                 pass
 
     def shutdown(self, reason: str = "voice shutdown") -> None:
-        """Stop activation, stop the session (authoritative), join the monitor."""
+        """Stop activation, join the monitor, and drive the session to the
+        terminal CLOSED state (which also releases the TTS worker/COM and mic)."""
         self._stop_evt.set()
         try:
             self._activation.stop()
         except Exception:  # pragma: no cover - defensive
             pass
-        self._session.stop(reason)
         if self._monitor is not None:
             self._monitor.join(timeout=1.0)
             self._monitor = None
-        # Release provider resources (TTS worker/COM, mic) after halting.
+        # SHUTDOWN: halt mic/STT/TTS, invalidate generation, release resources.
         self._session.close()
 
     @property
     def stopped(self) -> bool:
-        """True once the session has reached the terminal STOPPED state."""
+        """True once the session has reached the KillSwitch-latched STOPPED."""
         return self._session.state == VoiceState.STOPPED
+
+    @property
+    def closed(self) -> bool:
+        """True once the session has reached the terminal CLOSED state."""
+        return self._session.state == VoiceState.CLOSED

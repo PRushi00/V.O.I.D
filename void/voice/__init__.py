@@ -7,11 +7,11 @@ are imported lazily inside the adapters, so importing this package (and core
 V.O.I.D) never requires the optional voice stack.
 """
 from void.voice.state import (
-    IllegalVoiceTransition, VoiceState, VoiceStateMachine,
+    VoiceCommand, VoiceEvent, VoiceState, reduce_voice,
 )
 
 __all__ = [
-    "VoiceState", "VoiceStateMachine", "IllegalVoiceTransition",
+    "VoiceState", "VoiceEvent", "VoiceCommand", "reduce_voice",
     "VoiceSession", "VoiceController",
     "TTSProvider", "NullTTS", "create_tts_provider", "register_tts_provider",
 ]
