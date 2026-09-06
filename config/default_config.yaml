@@ -52,6 +52,10 @@ security:
   # authorizing a broad root. Machine-specific paths go in local_config.yaml
   # (never here, never in Git). Empty by default = nothing excluded.
   protected_roots: []
+  # Extra process image names close_app must NEVER close, on top of the engine
+  # defaults (explorer.exe, the V.O.I.D/host processes, system-critical procs).
+  # Add machine-specific ones (e.g. "vmware.exe") in local_config.yaml.
+  protected_processes: []
   # Deletes go to the Recycle Bin, never a hard unlink, in V1.
   delete_to_recycle_bin: true
 

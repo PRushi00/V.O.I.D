@@ -8,6 +8,10 @@ send2trash>=1.8        # safe delete -> Recycle Bin (recoverable)
 google-genai>=2.0              # Gemini (cloud brain; google.genai Client)
 requests>=2.31                 # local provider talks to Ollama over HTTP
 
+# Windows application / window control (Phase 8A)
+psutil>=5.9                              # running-process / window-owner identity
+pywin32>=306; sys_platform == "win32"   # window enumeration/activation/WM_CLOSE
+
 # UI (optional at runtime; CLI works without it)
 PySide6>=6.6
 

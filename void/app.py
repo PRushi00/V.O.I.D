@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Callable
 
 from void.actions.apps import AppActions
+from void.actions.computer import AppCatalog, ComputerActions, make_backend
 from void.actions.files import FileActions
 from void.actions.registry import ToolRegistry
 from void.config import Config
@@ -55,10 +56,18 @@ class Assistant:
                 "security.delete_to_recycle_bin", True),
             protected_roots=self.config.protected_roots(),
         )
-        app_actions = AppActions(file_actions)
+        # Windows application/window control (Phase 8A). The backend is lazy:
+        # nothing Windows-specific is imported until a computer tool is used.
+        backend = make_backend()
+        catalog = AppCatalog(backend)
+        app_actions = AppActions(file_actions, catalog=catalog)
+        computer_actions = ComputerActions(
+            backend, catalog,
+            protected_processes=self.config.protected_processes())
         self.tools = ToolRegistry()
         self.tools.register_all(file_actions.tools())
         self.tools.register_all(app_actions.tools())
+        self.tools.register_all(computer_actions.tools())
 
         # Providers
         self.providers = ProviderRegistry.from_config(self.config)

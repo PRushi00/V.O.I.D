@@ -15,10 +15,12 @@ import webbrowser
 from pathlib import Path
 
 from void.actions.base import Tool, ToolResult
+from void.actions.computer import AppCatalog, ComputerBackendError
 from void.actions.files import FileActions, PathNotAllowed
 from void.security.risk import RiskLevel
 
-# Friendly name -> candidate executables (first that resolves wins).
+# Engine-defined alias set (friendly name -> candidate executables resolved on
+# PATH). This is fixed code, NOT model input: the model may only pick a key.
 _APP_ALIASES: dict[str, list[str]] = {
     "cursor": ["cursor", "Cursor"],
     "vscode": ["code", "code.cmd"],
@@ -27,15 +29,21 @@ _APP_ALIASES: dict[str, list[str]] = {
     "explorer": ["explorer"],
     "chrome": ["chrome", "google-chrome"],
     "edge": ["msedge"],
-    "terminal": ["wt", "cmd"],
     "calc": ["calc"],
 }
 
 
 class AppActions:
-    def __init__(self, file_actions: FileActions):
+    def __init__(self, file_actions: FileActions, catalog: "AppCatalog | None" = None,
+                 launcher=None):
         # Reuse the file layer's confinement for open_path on local files.
         self._files = file_actions
+        # Engine-owned application catalog (from find_app discovery). launch_app
+        # resolves an app_id against it; the LLM never supplies a path/command.
+        self._catalog = catalog
+        # Injectable launcher (entry) for testability; defaults to a no-shell
+        # OS launch of a validated catalog target.
+        self._launch = launcher or self._default_launch
 
     def _is_windows(self) -> bool:
         return sys.platform.startswith("win")
@@ -70,32 +78,63 @@ class AppActions:
             return ToolResult.failure(f"Could not open {p}: {exc}", error=str(exc))
         return ToolResult.success(f"Opened {p}.")
 
+    def _default_launch(self, kind: str, target: str) -> None:
+        """No-shell OS launch of a validated target: a resolved .exe via Popen,
+        or a Start-Menu .lnk via os.startfile. Never a shell/command string."""
+        if kind == "lnk":
+            os.startfile(target)  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen([target])
+
     def launch_app(self, name: str) -> ToolResult:
-        """Launch an application by friendly name or executable."""
+        """Launch a VALIDATED application.
+
+        Accepts an engine-owned ``app_id`` (from find_app) or a fixed alias key
+        (cursor/vscode/notepad/...). It does NOT accept arbitrary commands, raw
+        executable paths, or shell strings: unknown input is refused, never
+        handed to a shell.
+        """
         name = (name or "").strip()
         if not name:
-            return ToolResult.failure("No application name given.")
+            return ToolResult.failure("No application given.")
 
-        candidates = _APP_ALIASES.get(name.lower(), [name])
-        exe = next((c for c in candidates if shutil.which(c)), None)
+        # 1) Engine-owned app_id from the discovery catalog (preferred path).
+        if self._catalog is not None:
+            try:
+                entry = self._catalog.resolve(name)
+            except ComputerBackendError:
+                entry = None
+            if entry is not None:
+                if not AppCatalog.revalidate(entry):
+                    return ToolResult.failure(
+                        f"'{entry.name}' is no longer available at its known "
+                        f"location; re-run find_app.")
+                try:
+                    self._launch(entry.kind, entry.target)
+                except OSError as exc:
+                    return ToolResult.failure(
+                        f"Could not launch {entry.name}: {exc}", error=str(exc))
+                return ToolResult.success(f"Launched {entry.name}.")
 
-        try:
+        # 2) Fixed engine-defined alias -> resolve a real exe on PATH (no shell).
+        if name.lower() in _APP_ALIASES:
+            exe = next((shutil.which(c) for c in _APP_ALIASES[name.lower()]
+                        if shutil.which(c)), None)
             if exe:
-                subprocess.Popen([exe])
-                return ToolResult.success(f"Launched {name} ({exe}).")
-            # Last resort on Windows: let the shell resolve it (Start menu apps).
-            if self._is_windows():
-                subprocess.Popen(["cmd", "/c", "start", "", name], shell=False)
-                return ToolResult.success(
-                    f"Asked Windows to start '{name}'. If nothing opened, "
-                    f"the app may not be installed or on PATH."
-                )
-        except OSError as exc:
-            return ToolResult.failure(f"Could not launch {name}: {exc}", error=str(exc))
+                try:
+                    subprocess.Popen([exe])
+                except OSError as exc:
+                    return ToolResult.failure(
+                        f"Could not launch {name}: {exc}", error=str(exc))
+                return ToolResult.success(f"Launched {name} ({os.path.basename(exe)}).")
+            return ToolResult.failure(
+                f"'{name}' is a known alias but no executable for it was found "
+                f"on PATH.")
+
+        # 3) Refuse arbitrary input - no shell, no arbitrary path/command.
         return ToolResult.failure(
-            f"Could not find an executable for '{name}'. "
-            f"Try the full program name or add it to PATH."
-        )
+            f"Unknown application '{name}'. Use find_app to discover installed "
+            f"applications, then launch_app with the returned app_id.")
 
     def tools(self) -> list[Tool]:
         return [
@@ -119,14 +158,18 @@ class AppActions:
             Tool(
                 name="launch_app",
                 description=(
-                    "Launch an application by name, e.g. 'cursor', 'vscode', "
-                    "'notepad', 'chrome'."
+                    "Launch a validated application by its app_id (from "
+                    "find_app), or by a known alias like 'notepad', 'cursor', "
+                    "'vscode', 'chrome'. Does NOT accept arbitrary commands or "
+                    "executable paths - discover unknown apps with find_app "
+                    "first."
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
                         "name": {"type": "string",
-                                 "description": "Application name or executable."},
+                                 "description": ("An app_id from find_app, or a "
+                                                 "known alias.")},
                     },
                     "required": ["name"],
                 },

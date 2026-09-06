@@ -109,3 +109,10 @@ class Config:
         """
         roots = self.get("security.protected_roots", []) or []
         return [Path(os.path.expanduser(r)).resolve() for r in roots]
+
+    def protected_processes(self) -> list[str]:
+        """Extra process image names (e.g. "vmware.exe") that Phase 8A's
+        close_app must never close, on top of the engine defaults. Owner-only
+        config; the LLM cannot change it."""
+        names = self.get("security.protected_processes", []) or []
+        return [str(n).strip().lower() for n in names if str(n).strip()]
