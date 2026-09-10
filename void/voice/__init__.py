@@ -16,12 +16,19 @@ __all__ = [
     "TTSProvider", "NullTTS", "create_tts_provider", "register_tts_provider",
     "WakeWordDetector", "NullWakeDetector", "create_wake_detector",
     "register_wake_provider", "WAKE_DETECTED",
+    "AudioCaptureBroker", "create_audio_broker",
 ]
 
 _WAKE_NAMES = frozenset({
     "WakeWordDetector", "NullWakeDetector", "OpenWakeWordDetector",
     "create_wake_detector", "register_wake_provider", "WAKE_DETECTED",
     "WakeWordError", "WakeWordConfigError", "WakeWordBackendError",
+})
+
+_BROKER_NAMES = frozenset({
+    "AudioCaptureBroker", "CaptureBackend", "NullCaptureBackend",
+    "SoundDeviceCaptureBackend", "create_audio_broker",
+    "register_capture_backend", "AudioBrokerError",
 })
 
 
@@ -42,4 +49,7 @@ def __getattr__(name):
     if name in _WAKE_NAMES:
         import void.voice.wake as _wake
         return getattr(_wake, name)
+    if name in _BROKER_NAMES:
+        import void.voice.capture_broker as _broker
+        return getattr(_broker, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

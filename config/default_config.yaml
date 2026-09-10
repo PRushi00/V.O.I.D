@@ -86,3 +86,11 @@ voice:
   wake_provider: "openwakeword"  # wake backend: "openwakeword" or "null"
   wake_model_path: ""            # path to a custom "Hey V.O.I.D." model (required)
   wake_threshold: 0.6            # conservative: prefer a miss over a false wake
+  # Audio-capture broker (Phase 9C-2: the shared single-microphone transport
+  # only - NOT wired to STT/wake/session yet, and nothing opens the mic until a
+  # broker is explicitly started). One physical owner; many consumers receive
+  # the same 16 kHz mono int16 PCM frame stream. Buffers are bounded
+  # (drop-oldest); no audio is persisted.
+  mic_frame_ms: 30               # broker frame size in ms (16 kHz mono int16)
+  mic_intake_frames: 64          # bounded broker intake buffer (drop-oldest)
+  mic_consumer_frames: 32        # bounded per-consumer buffer (drop-oldest)
