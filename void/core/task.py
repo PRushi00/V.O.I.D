@@ -40,11 +40,18 @@ class Task:
     steps: int = 0
     result: str | None = None
     error: str | None = None
-    # A proposed-but-not-yet-executed step held for owner confirmation. Shape:
-    # {"assistant_text": str|None,
-    #  "tool_calls": [{"name","arguments","id","signature",
-    #                  "risk","requires_confirmation"}]}.
-    # Contains only tool names/arguments/risk metadata - never secrets/keys.
+    # A proposed-but-not-yet-executed operation held for owner input. Two shapes,
+    # distinguished by an optional "kind":
+    #  - confirmation (kind absent): {"assistant_text": str|None,
+    #      "tool_calls": [{"name","arguments","id","signature",
+    #                      "risk","requires_confirmation"}]}
+    #      -> resolved by Agent.resume_pending(approve/deny).
+    #  - directory disambiguation: {"kind": "directory_disambiguation",
+    #      "candidates": [{"index": 1-based int, "name": str, "path": str}, ...],
+    #      "prompt": str, "created_at": float}
+    #      -> status is BLOCKED; resolved by Agent.resume_clarification(number).
+    # Contains only tool names/arguments/risk metadata and already-confined
+    # directory paths - never secrets/keys.
     pending: dict | None = None
     # Engine-owned execution ledger: one entry per COMMITTED logical step,
     # built by the Agent from ACTUAL tool execution (never written by the LLM).

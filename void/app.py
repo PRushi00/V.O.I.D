@@ -105,6 +105,13 @@ class Assistant:
         task = self._load_awaiting(task_id)
         return self._agent().resume_pending(task, decision=False)
 
+    def clarify(self, task_id: str, selection) -> AgentResult:
+        """Owner resolves a BLOCKED directory-disambiguation by number; the
+        original task then continues through the normal risk pipeline. A plain
+        ``resume`` never consumes the pending choice."""
+        task = self._load_blocked_disambiguation(task_id)
+        return self._agent().resume_clarification(task, selection)
+
     def cancel(self, task_id: str) -> Task:
         """Owner cancels a task (terminal). No pending action executes."""
         task = self.store.load(task_id)
@@ -121,6 +128,17 @@ class Assistant:
             raise ValueError(f"No such task: {task_id}")
         if task.status != Status.AWAITING_CONFIRMATION or not task.pending:
             raise ValueError(f"Task {task_id} has no pending confirmation.")
+        return task
+
+    def _load_blocked_disambiguation(self, task_id: str) -> Task:
+        task = self.store.load(task_id)
+        if task is None:
+            raise ValueError(f"No such task: {task_id}")
+        pending = task.pending or {}
+        if (task.status != Status.BLOCKED
+                or pending.get("kind") != "directory_disambiguation"):
+            raise ValueError(
+                f"Task {task_id} has no pending directory choice.")
         return task
 
     def stop(self, reason: str = "manual stop", pin: str | None = None) -> bool:

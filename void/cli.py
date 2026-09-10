@@ -50,6 +50,12 @@ def _print_result(result) -> None:
     if result.task.error:
         print("-" * 60)
         print(f"Note: {result.task.error}")
+    pending = result.task.pending or {}
+    if (result.status == Status.BLOCKED
+            and pending.get("kind") == "directory_disambiguation"):
+        print("-" * 60)
+        print(pending.get("prompt", ""))
+        print(f"\nTo choose: python -m void clarify {result.task.id} <number>")
     print("=" * 60)
 
 
@@ -78,6 +84,21 @@ def cmd_resume(task_id: str) -> int:
     assistant.clear_stop()  # resuming implies the owner has cleared the stop
     try:
         result = assistant.resume(task_id)
+    except ProviderUnavailable as exc:
+        print(f"\nNo AI brain available: {exc}")
+        return 1
+    _print_result(result)
+    return 0 if result.status == Status.COMPLETED else 2
+
+
+def cmd_clarify(task_id: str, selection: str) -> int:
+    """Resolve a BLOCKED directory-disambiguation by number; continue the task."""
+    assistant = Assistant(confirm_fn=_confirm, on_event=_event)
+    try:
+        result = assistant.clarify(task_id, selection)
+    except ValueError as exc:
+        print(str(exc))
+        return 1
     except ProviderUnavailable as exc:
         print(f"\nNo AI brain available: {exc}")
         return 1
@@ -399,6 +420,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_resume = sub.add_parser("resume", help="Resume a paused/interrupted task")
     p_resume.add_argument("task_id")
 
+    p_clarify = sub.add_parser(
+        "clarify",
+        help="Answer a blocked directory-choice prompt by number, then continue")
+    p_clarify.add_argument("task_id")
+    p_clarify.add_argument("selection",
+                           help="The candidate number to use (e.g. 2).")
+
     p_key = sub.add_parser("set-key", help="Store an API key securely")
     p_key.add_argument("name", choices=["gemini"])
     p_key.add_argument("--name", dest="alias", default=None,
@@ -441,9 +469,9 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
 
     # Convenience: `python -m void "goal text"` with no subcommand -> run.
-    known = {"run", "resume", "set-key", "list-keys", "remove-key", "set-pin",
-             "tasks", "stop", "clear-stop", "ui", "voice", "roots", "protect",
-             "-h", "--help"}
+    known = {"run", "resume", "clarify", "set-key", "list-keys", "remove-key",
+             "set-pin", "tasks", "stop", "clear-stop", "ui", "voice", "roots",
+             "protect", "-h", "--help"}
     if argv and argv[0] not in known:
         return cmd_run(" ".join(argv))
 
@@ -454,6 +482,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_run(" ".join(args.goal))
     if args.command == "resume":
         return cmd_resume(args.task_id)
+    if args.command == "clarify":
+        return cmd_clarify(args.task_id, args.selection)
     if args.command == "set-key":
         return cmd_set_key(args.name, alias=args.alias)
     if args.command == "list-keys":

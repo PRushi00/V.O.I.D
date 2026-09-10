@@ -150,27 +150,31 @@ class Agent:
         raise last_exc  # type: ignore[misc]
 
     @staticmethod
-    def _find_directory_match_count(name: str, result) -> int | None:
-        """Structured find_directory cardinality, or None if not applicable.
+    def _find_directory_candidates(name: str, result) -> list[dict] | None:
+        """Structured find_directory candidate list, or None if not applicable.
 
         Uses ToolResult.data only (the Phase 6 contract). Never parses summary
         prose. None means 'this call is not a structured find_directory hit'.
+        The engine reads only the cardinality and, on ambiguity, the exact
+        ``{name, path}`` entries - it never ranks, filters, or selects one.
         """
         if name != "find_directory" or not result.ok:
             return None
         data = result.data
         if not isinstance(data, list):
             return None
-        return len(data)
+        return data
 
     def _run_call(self, name: str, arguments: dict,
-                  owner_decision: bool | None = None) -> tuple[dict, bool, str, str, int | None]:
+                  owner_decision: bool | None = None) -> tuple[dict, bool, str, str, list[dict] | None]:
         """Run one tool call through the risk gate.
 
-        Returns (tool_message, ok, first_line, kind, find_dir_matches).
+        Returns (tool_message, ok, first_line, kind, find_dir_data).
         ``kind`` is engine-owned: 'ok', 'unauthorized', 'unknown', or
-        'tool_failure'. ``find_dir_matches`` is the structured match count for
-        find_directory, else None. ALL tool execution funnels through here, so
+        'tool_failure'. ``find_dir_data`` is the structured candidate list for
+        a successful find_directory call (each ``{name, path}``), else None -
+        the engine only counts it and, on ambiguity, binds the exact entries.
+        ALL tool execution funnels through here, so
         every call passes through ``RiskGate.authorize`` once. ``ok`` is the
         DETERMINISTIC success signal (``ToolResult.ok`` / False for
         unknown/unauthorized) - the LLM never decides it. ``owner_decision``
@@ -205,7 +209,7 @@ class Agent:
         first = result.summary.splitlines()[0] if result.summary else ""
         self.on_event(f"   {first}")
         kind = "ok" if result.ok else "tool_failure"
-        n = self._find_directory_match_count(name, result)
+        n = self._find_directory_candidates(name, result)
         # Tool output (which may include file contents) is untrusted DATA.
         return ({"role": "tool", "name": name,
                  "content": _untrusted(result.summary)}, bool(result.ok), first,
@@ -304,6 +308,10 @@ class Agent:
         then continue the task. Executes the pending step exactly once."""
         if not task.pending:
             return self.resume(task)
+        if task.pending.get("kind") == "directory_disambiguation":
+            # An ambiguity block is resolved by resume_clarification (a numeric
+            # directory choice), never by approve/deny - execute nothing here.
+            return self.resume(task)
         pending = task.pending
         assistant_msg = {
             "role": "assistant",
@@ -336,7 +344,7 @@ class Agent:
                 task.plan.append(entry)
                 task.current_step = len(task.plan) - 1
 
-        tool_msgs, oks, kinds, find_ns = [], [], [], []
+        tool_msgs, oks, kinds, find_data = [], [], [], []
         try:
             for c in pending["tool_calls"]:
                 # owner_decision only applies to confirmation-required calls;
@@ -347,7 +355,7 @@ class Agent:
                 tool_msgs.append(msg)
                 oks.append(ok)
                 kinds.append(kind)
-                find_ns.append(n)
+                find_data.append(n)
         except StopRequested:
             # Kill switch during approved execution: commit consistently.
             for c in pending["tool_calls"][len(tool_msgs):]:
@@ -370,7 +378,7 @@ class Agent:
         task.messages.extend(tool_msgs)
         task.steps += 1
         task.pending = None
-        if self._apply_find_directory_block(task, find_ns):
+        if self._apply_find_directory_block(task, find_data):
             return AgentResult(task, task.status, task.result, task.steps)
         task.status = Status.RUNNING
         self.store.save(task)
@@ -425,7 +433,7 @@ class Agent:
                 for tc in tool_calls
             ],
         }
-        tool_msgs, oks, kinds, find_ns, stopped = [], [], [], [], False
+        tool_msgs, oks, kinds, find_data, stopped = [], [], [], [], False
         for tc in tool_calls:
             # Kill switch is checked before every tool call. Once stopped, the
             # remaining calls get honest 'cancelled' responses (never executed,
@@ -440,7 +448,7 @@ class Agent:
                 tool_msgs.append(msg)
                 oks.append(ok)
                 kinds.append(kind)
-                find_ns.append(n)
+                find_data.append(n)
             except StopRequested:
                 stopped = True
                 tool_msgs.append(self._cancelled_msg(tc.name))
@@ -475,7 +483,7 @@ class Agent:
             self.store.save(task)
             self.on_event(f"Task {task.id} paused by kill switch. Resumable.")
             return "paused"
-        if self._apply_find_directory_block(task, find_ns):
+        if self._apply_find_directory_block(task, find_data):
             return "blocked"
         self.store.save(task)
         return "continue"
@@ -485,12 +493,46 @@ class Agent:
         """True when a tool actually failed (not an owner authorization skip)."""
         return any(k in ("tool_failure", "unknown") for k in kinds)
 
-    def _apply_find_directory_block(self, task: Task,
-                                    match_counts: list[int | None]) -> bool:
-        """BLOCKED when structured find_directory data has multiple matches."""
-        n = max((c for c in match_counts if c is not None), default=None)
-        if n is None or n <= 1:
+    def _apply_find_directory_block(
+            self, task: Task,
+            candidate_lists: list[list[dict] | None]) -> bool:
+        """AMBIGUOUS (>1 structured find_directory matches) -> BLOCKED, with a
+        durable disambiguation payload the owner resolves BY NUMBER.
+
+        0 or 1 matches change nothing: NOT_FOUND / RESOLVED are untouched. On
+        >1, the EXACT candidate set is bound to deterministic 1-based indices
+        and persisted in ``task.pending`` (kind='directory_disambiguation').
+        The engine still never picks one - ``resume_clarification`` applies the
+        owner's explicit numeric choice, and a plain resume stays BLOCKED.
+        """
+        best: list[dict] | None = None
+        for data in candidate_lists:
+            if isinstance(data, list) and len(data) > 1:
+                if best is None or len(data) > len(best):
+                    best = data
+        if best is None:
             return False
+
+        candidates = [
+            {"index": i + 1,
+             "name": str(c.get("name", "")),
+             "path": str(c.get("path", ""))}
+            for i, c in enumerate(best)
+        ]
+        n = len(candidates)
+        distinct_names = {c["name"] for c in candidates}
+        common = candidates[0]["name"] if len(distinct_names) == 1 else None
+        prompt = self._format_directory_disambiguation(common, candidates)
+        # Reuses the existing pending-operation field (JSON-persisted, reload
+        # safe). 'kind' keeps it distinct from a confirmation pending so the
+        # approve/deny path never touches it. Paths here are already _confine()d
+        # by find_directory and are not secrets (they were in the tool output).
+        task.pending = {
+            "kind": "directory_disambiguation",
+            "candidates": candidates,
+            "prompt": prompt,
+            "created_at": time.time(),
+        }
         task.status = Status.BLOCKED
         task.error = (
             f"find_directory returned {n} matches (ambiguous); "
@@ -498,7 +540,96 @@ class Agent:
         )
         self.store.save(task)
         self.on_event(task.error)
+        self.on_event(prompt)
         return True
+
+    @staticmethod
+    def _format_directory_disambiguation(name: str | None,
+                                         candidates: list[dict]) -> str:
+        """The owner-facing numbered prompt. States that a choice is needed;
+        never implies a preferred candidate."""
+        n = len(candidates)
+        head = (f'I found multiple directories named "{name}":' if name
+                else "I found multiple matching directories:")
+        lines = [head, ""]
+        lines += [f"[{c['index']}] {c['path']}" for c in candidates]
+        lines += ["", "Which directory should I use?"]
+        if n == 2:
+            how = "1 or 2"
+        elif n <= 5:
+            how = ", ".join(str(i) for i in range(1, n)) + f", or {n}"
+        else:
+            how = f"a number from 1 to {n}"
+        lines.append(f"Reply with {how}.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_directory_selection(raw, count: int) -> int | None:
+        """Deterministic, numeric-only selection parser (NEVER an LLM, never
+        fuzzy). Accepts a bare 1-based integer, optionally led by '#' or a
+        single selector word (option/choice/number/choose/select/item/
+        candidate/'no.'). Anything else - words, ranges, several numbers,
+        out-of-range, empty - returns None, leaving the task unresolved."""
+        if count <= 0:
+            return None
+        s = str(raw if raw is not None else "").strip().lower()
+        if s.startswith("#"):
+            s = s[1:].strip()
+        else:
+            for p in ("options", "option", "choices", "choice", "numbers",
+                      "number", "choose", "select", "candidate", "item", "no."):
+                if s.startswith(p):
+                    s = s[len(p):].lstrip(" :.-)").strip()
+                    break
+        if not s.isdigit():
+            return None
+        idx = int(s)
+        return idx if 1 <= idx <= count else None
+
+    def resume_clarification(self, task: Task, selection) -> AgentResult:
+        """Apply the owner's numeric directory choice to a BLOCKED
+        disambiguation task and CONTINUE THE ORIGINAL GOAL.
+
+        ``selection`` maps 1-based to the EXACT candidate captured at search
+        time - no re-search, no LLM path choice. An invalid / out-of-range /
+        non-numeric selection leaves the task BLOCKED and unresolved (it never
+        silently picks another candidate). The resolved directory is injected
+        as an owner (trusted) clarification message; the original operation
+        then proceeds through the UNCHANGED confinement / RiskGate pipeline.
+        """
+        pending = task.pending
+        if not pending or pending.get("kind") != "directory_disambiguation":
+            # Not an ambiguity-clarification task: do not consume anything.
+            return self.resume(task)
+
+        candidates = pending.get("candidates") or []
+        idx = self._parse_directory_selection(selection, len(candidates))
+        if idx is None:
+            task.error = (
+                f"'{selection}' is not a valid choice. Reply with a number "
+                f"between 1 and {len(candidates)} to pick the directory."
+            )
+            self.store.save(task)
+            self.on_event(task.error)
+            return AgentResult(task, task.status, task.result, task.steps)
+
+        chosen = candidates[idx - 1]
+        path = chosen["path"]
+        self.on_event(f"Owner selected [{idx}] {path}. Continuing the request.")
+        task.messages.append({
+            "role": "user",
+            "content": (
+                f'[owner clarification] For the ambiguous folder '
+                f'"{chosen["name"]}", use this exact directory and no other:\n'
+                f'{path}\n'
+                f'Continue my original request using that directory.'
+            ),
+        })
+        task.pending = None
+        task.error = None
+        task.status = Status.RUNNING
+        self.store.save(task)
+        return self._loop(task)
 
     def _cannot_complete_reason(self, task: Task) -> str | None:
         """Engine-owned completion guard. No semantic goal verification.
@@ -506,10 +637,10 @@ class Agent:
         Inspects deterministic engine state only. Returns a reason string if
         COMPLETED is not valid, else None.
         """
-        if task.pending or task.status == Status.AWAITING_CONFIRMATION:
-            return "pending confirmation"
         if task.status == Status.BLOCKED:
             return "blocked pending clarification"
+        if task.pending or task.status == Status.AWAITING_CONFIRMATION:
+            return "pending confirmation"
         if not task.plan:
             return None
         idx = task.current_step
@@ -547,9 +678,12 @@ class Agent:
                 final = response.text or "(no output)"
                 task.messages.append({"role": "assistant", "content": final})
                 if reason:
-                    if task.pending or task.status == Status.AWAITING_CONFIRMATION:
+                    if task.status == Status.BLOCKED:
+                        pass  # ambiguity stands until the owner clarifies by
+                        # number; never auto-resolve, never flip to AWAITING.
+                    elif task.pending or task.status == Status.AWAITING_CONFIRMATION:
                         task.status = Status.AWAITING_CONFIRMATION
-                    elif task.status != Status.BLOCKED:
+                    else:
                         task.status = Status.FAILED
                         task.error = f"Completion refused: {reason}"
                     self.store.save(task)
