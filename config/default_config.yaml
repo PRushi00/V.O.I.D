@@ -86,6 +86,15 @@ voice:
   wake_provider: "openwakeword"  # wake backend: "openwakeword" or "null"
   wake_model_path: ""            # path to a custom "Hey V.O.I.D." model (required)
   wake_threshold: 0.6            # conservative: prefer a miss over a false wake
+  # Wake-initiated capture endpointing (Phase 9C-3). Wake has no physical PTT
+  # release, so a wake capture always ends on one of these bounded conditions -
+  # never "listen forever". A simple int16 RMS energy gate marks "speech"; it is
+  # not a full VAD. Values are validated (clamped to safe minimums) on load.
+  wake_no_speech_timeout: 4.0    # seconds to wait for any speech after wake
+  wake_silence_timeout: 1.2      # seconds of trailing silence that ends an utterance
+  wake_max_capture_seconds: 15.0 # hard cap on one wake-initiated capture
+  wake_rearm_delay_ms: 500       # settle time (post TTS/command) before re-arming wake
+  wake_energy_threshold: 500     # int16 RMS at/above which a frame counts as speech
   # Audio-capture broker (Phase 9C-2: the shared single-microphone transport
   # only - NOT wired to STT/wake/session yet, and nothing opens the mic until a
   # broker is explicitly started). One physical owner; many consumers receive

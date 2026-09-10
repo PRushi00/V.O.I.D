@@ -214,6 +214,80 @@ class MicAudioCapture(AudioCapture):
             self._open = False
 
 
+class BrokerCapture(AudioCapture):
+    """AudioCapture backed by the shared AudioCaptureBroker - no device of its own.
+
+    The broker (:mod:`void.voice.capture_broker`) is the SINGLE physical
+    microphone owner for the integrated voice runtime (Phase 9C-3). This adapter
+    lets the unchanged VoiceSession drive command capture through that one
+    broker: ``open()`` subscribes a frame collector, ``stop()`` detaches it and
+    returns the buffered command audio, ``close()`` detaches with nothing
+    returned. It NEVER opens a ``sounddevice`` stream.
+
+    Capture begins at ``open()``: a short, bounded ``broker.drain()`` first
+    flushes any already-queued frames to the current subscribers (there are none
+    at that instant), so the collector only ever receives frames produced AFTER
+    ``open()`` - no pre-wake / pre-press audio can enter the command buffer, and
+    the broker's own bounded drop-oldest intake means nothing older survives
+    anyway. Frames are the broker contract (16 kHz mono int16 LE PCM ``bytes``);
+    ``stop()`` converts them to the float32 mono array faster-whisper expects AT
+    THIS STT-INPUT BOUNDARY (the broker format itself is unchanged). Nothing is
+    persisted or logged.
+    """
+
+    _OPEN_DRAIN_TIMEOUT = 0.1     # bounded; only ever runs off the broker pump thread
+
+    def __init__(self, broker):
+        self._broker = broker
+        self._frames: list[bytes] = []
+        self._open = False
+        # One stable consumer identity for the broker's identity-keyed (un)subscribe.
+        self._consumer = self._collect
+
+    @property
+    def is_open(self) -> bool:
+        return self._open
+
+    def _collect(self, frame: bytes) -> None:
+        if self._open:
+            self._frames.append(frame)
+
+    def open(self) -> None:
+        try:
+            import numpy  # noqa: F401  (int16 bytes -> float32 for STT, in stop())
+        except ImportError as exc:
+            raise VoiceDependencyError(
+                "voice capture needs 'numpy' "
+                "(pip install -r requirements-voice.txt)") from exc
+        self._frames = []
+        try:
+            self._broker.drain(timeout=self._OPEN_DRAIN_TIMEOUT)
+        except Exception:
+            pass                      # best-effort flush; open() must not block
+        self._broker.subscribe(self._consumer)
+        self._open = True
+
+    def stop(self):
+        import numpy as np
+        frames, self._frames = self._frames, []
+        self._open = False
+        try:
+            self._broker.unsubscribe(self._consumer)
+        except Exception:
+            pass
+        if not frames:
+            return np.zeros(0, dtype="float32")
+        pcm = np.frombuffer(b"".join(frames), dtype="<i2")
+        return pcm.astype(np.float32) / 32768.0
+
+    def close(self) -> None:
+        try:
+            self._broker.unsubscribe(self._consumer)
+        finally:
+            self._open = False
+            self._frames = []
+
+
 # --- speech to text -----------------------------------------------------
 
 class STT:

@@ -392,7 +392,10 @@ def cmd_voice() -> int:
               f"  pip install -r requirements-voice.txt")
         return 1
 
-    print(f"V.O.I.D voice ready. Hold '{hotkey}' to talk, release to send.\n"
+    wake_on = getattr(controller, "_wake", None) is not None
+    wake_line = ('Say "Hey V.O.I.D." to start, or hold'
+                 if wake_on else "Hold")
+    print(f"V.O.I.D voice ready. {wake_line} '{hotkey}' to talk, release to send.\n"
           f"The Whisper model downloads on first use. Ctrl+C to exit.\n"
           f"(To stop everything: run 'python -m void stop' in another terminal.)")
     try:
