@@ -3,9 +3,10 @@ import base64
 import json
 
 import pytest
+import requests
 
 from void.providers.base import (
-    LLMProvider, LLMResponse, ProviderUnavailable, ToolSpec,
+    LLMProvider, LLMResponse, ProviderUnavailable, ToolCall, ToolSpec,
 )
 from void.providers.registry import ProviderRegistry
 from void.providers.gemini_provider import GeminiProvider
@@ -354,6 +355,297 @@ def test_local_to_messages_roles():
     ])
     assert msgs[0]["role"] == "system"
     assert msgs[2] == {"role": "tool", "content": "r", "name": "read_file"}
+
+
+# --- LocalProvider HTTP behavior (mocked; no real Ollama, no network) ---
+#
+# LocalProvider._requests() does a live `import requests` and returns the
+# real module, so monkeypatching requests.get/requests.post intercepts every
+# call LocalProvider makes without touching LocalProvider itself. Fake
+# response objects expose ONLY .status_code / .raise_for_status() / .json() -
+# exactly what the production code actually calls, nothing invented.
+
+class _FakeHTTPResponse:
+    def __init__(self, status_code=200, json_data=None, json_exc=None,
+                 raise_exc=None):
+        self.status_code = status_code
+        self._json_data = json_data
+        self._json_exc = json_exc
+        self._raise_exc = raise_exc
+
+    def raise_for_status(self):
+        if self._raise_exc is not None:
+            raise self._raise_exc
+
+    def json(self):
+        if self._json_exc is not None:
+            raise self._json_exc
+        return self._json_data
+
+
+# --- available(): A) server reachable -----------------------------------
+
+def test_local_available_true_when_tags_returns_200(monkeypatch):
+    lp = LocalProvider()
+    calls = []
+
+    def fake_get(url, timeout=None):
+        calls.append((url, timeout))
+        return _FakeHTTPResponse(status_code=200)
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    assert lp.available() is True
+    assert calls == [(f"{lp.base_url}/api/tags", 2.0)]
+
+
+# --- available(): B) connection failure ----------------------------------
+
+def test_local_available_false_on_connection_error(monkeypatch):
+    lp = LocalProvider()
+
+    def fake_get(url, timeout=None):
+        raise requests.exceptions.ConnectionError("connection refused")
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    assert lp.available() is False
+
+
+# --- available(): C) non-200 response -------------------------------------
+
+def test_local_available_false_on_non_200(monkeypatch):
+    lp = LocalProvider()
+    monkeypatch.setattr(
+        requests, "get", lambda url, timeout=None: _FakeHTTPResponse(status_code=500))
+    assert lp.available() is False
+
+
+# --- available(): D) response body is never inspected ---------------------
+
+def test_local_available_ignores_response_body_entirely(monkeypatch):
+    # available() never calls resp.json() - only resp.status_code. A response
+    # whose body would fail to parse (or means anything at all) must not
+    # affect the result. json() is wired to raise if it is ever called, which
+    # proves the body is never read rather than merely asserting the outcome.
+    lp = LocalProvider()
+
+    def _boom():
+        raise AssertionError("available() must never call resp.json()")
+
+    resp = _FakeHTTPResponse(status_code=200)
+    resp.json = _boom
+    monkeypatch.setattr(requests, "get", lambda url, timeout=None: resp)
+    assert lp.available() is True
+
+
+# --- configured-model presence: KNOWN, ACCEPTED non-blocking gap --------
+
+def test_local_available_does_not_verify_configured_model_is_present(monkeypatch):
+    """Documents a known, non-blocking robustness gap identified in the
+    provider audit: available() checks only server reachability (HTTP 200 on
+    /api/tags) and never whether the CONFIGURED model (self.model) actually
+    appears in the returned model list - it never reads the list at all. This
+    test shows the CURRENT behavior (True, even with the model absent/
+    unverifiable), not an assumed or ideal one. Not a security defect:
+    generate() still fails safely (raises ProviderUnavailable, see the
+    model-not-found case below) if the model turns out to be missing; this is
+    an inaccurate-but-fail-safe availability signal, never a bypass.
+    """
+    lp = LocalProvider(model="qwen3:8b")
+
+    def _boom():
+        raise AssertionError(
+            "available() would need to read the model list to answer this "
+            "question - if this executes, the known gap has been fixed "
+            "without updating this test.")
+
+    resp = _FakeHTTPResponse(status_code=200)
+    resp.json = _boom
+    monkeypatch.setattr(requests, "get", lambda url, timeout=None: resp)
+
+    assert lp.available() is True   # <-- current, inaccurate-but-safe behavior
+
+
+# --- generate(): A) successful text response ------------------------------
+
+def test_local_generate_success_parses_text(monkeypatch):
+    lp = LocalProvider(base_url="http://localhost:11434", model="qwen3:8b")
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["timeout"] = timeout
+        return _FakeHTTPResponse(status_code=200, json_data={
+            "message": {"role": "assistant", "content": "The answer is 4."}})
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    resp = lp.generate([{"role": "user", "content": "What is 2+2?"}])
+
+    assert resp.text == "The answer is 4."
+    assert resp.tool_calls == []
+    assert captured["url"] == "http://localhost:11434/api/chat"
+    assert captured["json"]["model"] == "qwen3:8b"
+    assert captured["json"]["stream"] is False
+
+
+# --- generate(): B) tool-call response ------------------------------------
+
+def test_local_generate_parses_tool_call_through_http(monkeypatch):
+    lp = LocalProvider()
+    monkeypatch.setattr(
+        requests, "post",
+        lambda url, json=None, timeout=None: _FakeHTTPResponse(
+            status_code=200, json_data={
+                "message": {"role": "assistant", "content": "",
+                           "tool_calls": [{"function": {
+                               "name": "read_file",
+                               "arguments": {"path": "a.txt"}}}]}}))
+
+    resp = lp.generate([{"role": "user", "content": "read a.txt"}])
+
+    assert resp.has_tool_calls
+    assert len(resp.tool_calls) == 1
+    tc = resp.tool_calls[0]
+    assert tc.name == "read_file"
+    assert tc.arguments == {"path": "a.txt"}
+
+
+# --- generate(): C) malformed JSON response body --------------------------
+
+def test_local_generate_malformed_json_body_is_not_wrapped(monkeypatch):
+    # resp.json() is called OUTSIDE generate()'s try/except (only the POST
+    # call and raise_for_status() are guarded), so a body that fails to parse
+    # propagates as the RAW underlying exception, NOT ProviderUnavailable.
+    # This asserts the actual current behavior, not an invented expectation.
+    lp = LocalProvider()
+    broken = json.JSONDecodeError("Expecting value", "not json", 0)
+    monkeypatch.setattr(
+        requests, "post",
+        lambda url, json=None, timeout=None: _FakeHTTPResponse(
+            status_code=200, json_exc=broken))
+
+    with pytest.raises(json.JSONDecodeError):
+        lp.generate([{"role": "user", "content": "hi"}])
+
+
+# --- generate(): D) HTTP non-200 ------------------------------------------
+
+def test_local_generate_http_error_raises_provider_unavailable(monkeypatch):
+    lp = LocalProvider()
+    monkeypatch.setattr(
+        requests, "post",
+        lambda url, json=None, timeout=None: _FakeHTTPResponse(
+            status_code=500,
+            raise_exc=requests.exceptions.HTTPError("500 Server Error")))
+
+    with pytest.raises(ProviderUnavailable) as exc_info:
+        lp.generate([{"role": "user", "content": "hi"}])
+    assert "Local model request failed" in str(exc_info.value)
+
+
+# --- generate(): E) connection failure -------------------------------------
+
+def test_local_generate_connection_error_raises_provider_unavailable(monkeypatch):
+    lp = LocalProvider()
+
+    def fake_post(url, json=None, timeout=None):
+        raise requests.exceptions.ConnectionError("connection refused")
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    with pytest.raises(ProviderUnavailable) as exc_info:
+        lp.generate([{"role": "user", "content": "hi"}])
+    assert "Local model request failed" in str(exc_info.value)
+
+
+# --- generate(): F) model-not-found / 404 ----------------------------------
+
+def test_local_generate_model_not_found_raises_provider_unavailable(monkeypatch):
+    # Same code path as D (raise_for_status), exercised with the realistic
+    # "model not pulled" status Ollama returns for an unknown model name.
+    lp = LocalProvider(model="qwen3:8b")
+    monkeypatch.setattr(
+        requests, "post",
+        lambda url, json=None, timeout=None: _FakeHTTPResponse(
+            status_code=404,
+            raise_exc=requests.exceptions.HTTPError("404 model not found")))
+
+    with pytest.raises(ProviderUnavailable) as exc_info:
+        lp.generate([{"role": "user", "content": "hi"}])
+    assert "Local model request failed" in str(exc_info.value)
+
+
+# --- security boundary: generate() is a pure provider layer --------------
+
+def test_local_generate_returns_data_only_never_executes_a_tool(monkeypatch):
+    """generate() must return an LLMResponse (data) and never itself invoke a
+    tool. LocalProvider holds no reference to a ToolRegistry/Agent/RiskGate/
+    KillSwitch, so there is structurally nothing for it to execute; a "tool
+    call" in the response is nothing more than an inert ToolCall dataclass
+    the CALLER (Agent) later decides whether to authorize and run."""
+    lp = LocalProvider()
+    assert not any(hasattr(lp, attr) for attr in
+                   ("tools", "_tools", "registry", "_registry",
+                    "risk_gate", "_risk_gate", "kill_switch", "_kill_switch",
+                    "agent", "_agent", "execute"))
+
+    monkeypatch.setattr(
+        requests, "post",
+        lambda url, json=None, timeout=None: _FakeHTTPResponse(
+            status_code=200, json_data={
+                "message": {"content": "", "tool_calls": [{"function": {
+                    "name": "delete_file",
+                    "arguments": {"path": "C:\\danger.txt"}}}]}}))
+
+    resp = lp.generate([{"role": "user", "content": "delete danger.txt"}])
+
+    assert isinstance(resp, LLMResponse)
+    assert isinstance(resp.tool_calls[0], ToolCall)
+    assert resp.tool_calls[0].name == "delete_file"
+    # The proposal is inert data only: generate() never touches a filesystem,
+    # a ToolRegistry, RiskGate, or KillSwitch - nothing was, or could be, run.
+
+
+# --- Qwen3 thinking output: current parser behavior (robustness only) ----
+
+def test_local_generate_ignores_a_separate_thinking_field(monkeypatch):
+    """Ollama MAY return a separate message.thinking field alongside a clean
+    message.content for thinking models. _parse() reads only content/
+    tool_calls, so a separate thinking field is correctly ignored - it never
+    leaks into LLMResponse.text."""
+    lp = LocalProvider(model="qwen3:8b")
+    monkeypatch.setattr(
+        requests, "post",
+        lambda url, json=None, timeout=None: _FakeHTTPResponse(
+            status_code=200, json_data={
+                "message": {"content": "The answer is 4.",
+                           "thinking": "Let me reason step by step..."}}))
+
+    resp = lp.generate([{"role": "user", "content": "What is 2+2?"}])
+
+    assert resp.text == "The answer is 4."
+    assert "reason step by step" not in (resp.text or "")
+
+
+def test_local_generate_does_not_strip_inline_think_tags(monkeypatch):
+    """Documents a KNOWN, NON-SECURITY robustness/presentation gap: if a
+    template inlines reasoning into message.content as <think>...</think>
+    instead of using a separate field, _parse() does not strip it - the raw
+    tags flow through verbatim into LLMResponse.text. This can never become a
+    tool call: tool_calls is a structurally separate field Ollama populates
+    itself, never derived by scanning content text, so this is
+    presentation-only, never a security issue (see the isolated assertion
+    below)."""
+    lp = LocalProvider(model="qwen3:8b")
+    raw_content = "<think>reasoning about 2+2</think>The answer is 4."
+    monkeypatch.setattr(
+        requests, "post",
+        lambda url, json=None, timeout=None: _FakeHTTPResponse(
+            status_code=200, json_data={"message": {"content": raw_content}}))
+
+    resp = lp.generate([{"role": "user", "content": "What is 2+2?"}])
+
+    assert resp.text == raw_content        # unstripped - current behavior
+    assert resp.tool_calls == []           # never misinterpreted as a tool call
 
 
 # --- Gemini credential rotation (no network, no real keys) -------------
