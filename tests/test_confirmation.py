@@ -26,6 +26,24 @@ def _trip_tool(ks):
                 handler=handler, risk=RiskLevel.LOW)
 
 
+def _write_then_trip_tool(ks, target, content):
+    """A HIGH-risk tool whose handler performs a REAL, verifiable side effect
+    (writes a file) and then engages the kill switch as its very last action.
+
+    resume_pending's execution loop is strictly sequential (no threads, no
+    sleep): by the time this handler returns, the kill switch is guaranteed
+    engaged before the NEXT pending call is even attempted - a deterministic
+    hook, not a timing race, exactly like _trip_tool above."""
+    def handler():
+        target.write_text(content)
+        ks.engage(reason="test: engaged immediately after first approved call")
+        return ToolResult.success(f"wrote {target}")
+    return Tool(name="write_then_trip",
+                description="write a file then engage stop (test)",
+                parameters={"type": "object", "properties": {}},
+                handler=handler, risk=RiskLevel.HIGH)
+
+
 class _CountingRiskGate(RiskGate):
     """RiskGate that records every authorize() call (to prove no bypass)."""
     def __init__(self, *a, **k):
@@ -254,6 +272,64 @@ def test_interactive_high_risk_synchronous_deny_still_works(tmp_path):
     agent, ks = _build(tmp_path, provider, confirm_fn=lambda d: False, defer=False)
     r = agent.run("delete keep.txt")
     assert r.status == Status.COMPLETED and target.exists()
+
+
+# --- KillSwitch mid-batch: engaged between two APPROVED pending calls --
+
+def test_killswitch_after_first_of_two_approved_calls_blocks_the_second(tmp_path):
+    # Regression for the highest-priority KillSwitch coverage gap identified
+    # in the V1 audit: a pending step holds TWO approved (confirmation-
+    # required) tool calls. The kill switch engages - deterministically, as a
+    # side effect of the FIRST call's own execution, never via sleep/threads -
+    # strictly between the two calls' execution. The second call must never
+    # run, even though the owner approved the whole batch.
+    ks = KillSwitch()
+    created = tmp_path / "created_by_first.txt"       # call 1's expected side effect
+    keep = tmp_path / "keep.txt"                       # call 2's target - must survive
+    keep.write_text("original")
+
+    trip = _write_then_trip_tool(ks, created, "created-by-call-1")
+    provider = FakeProvider([
+        LLMResponse(tool_calls=[
+            tool_call("write_then_trip"),
+            tool_call("delete_file", path=str(keep)),
+        ]),
+        LLMResponse(text="should never be reached"),
+    ])
+    agent, ks = _build(tmp_path, provider, ks=ks, defer=True, extra=[trip])
+
+    result = agent.run("do two approved things")
+    assert result.status == Status.AWAITING_CONFIRMATION
+    task = agent.store.load(result.task.id)
+    # Both calls in the batch genuinely require confirmation ("approved").
+    reqs = {c["name"]: c["requires_confirmation"] for c in task.pending["tool_calls"]}
+    assert reqs == {"write_then_trip": True, "delete_file": True}
+    assert not created.exists() and keep.read_text() == "original"  # nothing ran yet
+
+    r2 = agent.resume_pending(task, decision=True)     # owner approves BOTH
+
+    # 1 & 7: the first call executed and produced its real side effect.
+    assert created.exists() and created.read_text() == "created-by-call-1"
+    # 3 & 8: the second call never executed - its side effect never happened.
+    assert keep.exists() and keep.read_text() == "original"
+    # 9: no further tool/LLM activity occurred after the engagement - the
+    # provider was never re-entered (resume_pending returns immediately on
+    # StopRequested; it does not fall through into _loop()).
+    assert agent.provider.calls == 1
+    # 4: the task is left safely paused, not completed/awaiting/re-armed.
+    assert r2.status == Status.PAUSED
+    final = agent.store.load(result.task.id)
+    assert final.status == Status.PAUSED
+    # 5: the pending step is cleared, not left dangling or re-offered.
+    assert final.pending is None
+    # 6: an honest ledger + tool message records exactly what happened.
+    assert final.error and "kill switch" in final.error.lower()
+    entry = final.plan[-1]
+    assert entry["status"] == "cancelled"
+    assert "1/2" in entry["outcome_summary"]           # only the first call ran
+    tool_msgs = _tool_msgs(final.messages)
+    assert any("did not run" in m["content"] for m in tool_msgs)
+    assert _no_dangling(final)                          # matched exchange, no gaps
 
 
 # --- J: every execution passes through RiskGate ------------------------
