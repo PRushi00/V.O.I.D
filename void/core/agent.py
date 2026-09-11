@@ -287,6 +287,13 @@ class Agent:
         return self._loop(task)
 
     def resume(self, task: Task) -> AgentResult:
+        # Terminal tasks (COMPLETED/FAILED/CANCELLED) are done - a resume must
+        # NEVER re-enter the loop, generate a new LLM turn, or mutate the
+        # task's status. Checked first, ahead of every other resume path.
+        if task.status in Status.TERMINAL:
+            self.on_event(
+                f"Task {task.id} is already {task.status}; nothing to resume.")
+            return AgentResult(task, task.status, task.result, task.steps)
         # A task waiting for confirmation must NOT execute anything on a plain
         # resume - it stays awaiting until an explicit approve/deny.
         if task.status == Status.AWAITING_CONFIRMATION and task.pending:
@@ -306,6 +313,14 @@ class Agent:
     def resume_pending(self, task: Task, decision: bool) -> AgentResult:
         """Apply the owner's approve (True) / deny (False) to a pending step,
         then continue the task. Executes the pending step exactly once."""
+        # Terminal tasks can never execute a pending action, even a stale one
+        # left over from before cancellation/completion - checked before the
+        # pending payload itself is even inspected.
+        if task.status in Status.TERMINAL:
+            self.on_event(
+                f"Task {task.id} is already {task.status}; its pending action "
+                f"cannot be executed.")
+            return AgentResult(task, task.status, task.result, task.steps)
         if not task.pending:
             return self.resume(task)
         if task.pending.get("kind") == "directory_disambiguation":
@@ -597,6 +612,15 @@ class Agent:
         as an owner (trusted) clarification message; the original operation
         then proceeds through the UNCHANGED confinement / RiskGate pipeline.
         """
+        # Terminal tasks (COMPLETED/FAILED/CANCELLED) are done - a clarification
+        # must NEVER re-enter the loop, generate a new LLM turn, or mutate the
+        # task's status, even if a stale disambiguation pending is still
+        # attached. Checked first, before pending is even read.
+        if task.status in Status.TERMINAL:
+            self.on_event(
+                f"Task {task.id} is already {task.status}; nothing to resume.")
+            return AgentResult(task, task.status, task.result, task.steps)
+
         pending = task.pending
         if not pending or pending.get("kind") != "directory_disambiguation":
             # Not an ambiguity-clarification task: do not consume anything.

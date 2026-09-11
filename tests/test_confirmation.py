@@ -9,7 +9,7 @@ from void.actions.files import FileActions
 from void.actions.registry import ToolRegistry
 from void.core.agent import Agent
 from void.core.kill_switch import KillSwitch
-from void.core.task import Status, TaskStore
+from void.core.task import Status, Task, TaskStore
 from void.providers.base import LLMProvider, LLMResponse
 from void.security.risk import RiskGate, RiskLevel
 
@@ -330,6 +330,116 @@ def test_killswitch_after_first_of_two_approved_calls_blocks_the_second(tmp_path
     tool_msgs = _tool_msgs(final.messages)
     assert any("did not run" in m["content"] for m in tool_msgs)
     assert _no_dangling(final)                          # matched exchange, no gaps
+
+
+# --- Terminal tasks (COMPLETED/FAILED/CANCELLED) must never resume -----
+#
+# Regression for the confirmed CRITICAL defect: Agent.resume()/resume_pending()
+# previously did not consult Status.TERMINAL at all, so a task the engine (or
+# the owner) had already finished could be silently re-entered - a new LLM
+# turn generated, and in the resume_pending case a stale pending HIGH-risk
+# action executed - even though the persisted status said otherwise.
+
+def test_completed_task_cannot_resume(tmp_path):
+    provider1 = FakeProvider([LLMResponse(text="all done")])
+    agent1, ks = _build(tmp_path, provider1)
+    r1 = agent1.run("say hi")
+    assert r1.status == Status.COMPLETED
+
+    # A DIFFERENT provider that WOULD propose a real tool call, to prove the
+    # engine never even asks it.
+    target = tmp_path / "should_not_be_created.txt"
+    provider2 = FakeProvider([LLMResponse(tool_calls=[
+        tool_call("write_file", path=str(target), content="x")])])
+    agent2, _ = _build(tmp_path, provider2, ks=ks)
+
+    task = agent1.store.load(r1.task.id)
+    r2 = agent2.resume(task)
+
+    assert r2.status == Status.COMPLETED            # unchanged, still terminal
+    assert provider2.calls == 0                      # no new LLM turn
+    assert not target.exists()                        # no tool side effect
+    assert agent1.store.load(r1.task.id).status == Status.COMPLETED
+
+
+def test_cancelled_task_cannot_resume(tmp_path):
+    provider1 = FakeProvider([LLMResponse(text="n/a")])
+    agent1, ks = _build(tmp_path, provider1)
+    r1 = agent1.run("write a report")
+    # Simulate the owner cancelling it (mirrors Assistant.cancel() exactly).
+    task = agent1.store.load(r1.task.id)
+    task.pending = None
+    task.status = Status.CANCELLED
+    agent1.store.save(task)
+
+    target = tmp_path / "should_not_be_created.txt"
+    provider2 = FakeProvider([LLMResponse(tool_calls=[
+        tool_call("write_file", path=str(target), content="x")])])
+    agent2, _ = _build(tmp_path, provider2, ks=ks)
+
+    reloaded = agent1.store.load(task.id)
+    r2 = agent2.resume(reloaded)
+
+    assert r2.status == Status.CANCELLED             # unchanged, still terminal
+    assert provider2.calls == 0
+    assert not target.exists()
+    assert agent1.store.load(task.id).status == Status.CANCELLED
+
+
+def test_failed_task_cannot_resume(tmp_path):
+    class Boom(LLMProvider):
+        name = "fake"
+        def available(self): return True
+        def generate(self, messages, tools=None):
+            raise RuntimeError("transient boom")
+
+    agent1, ks = _build(tmp_path, Boom(), max_retries=0)
+    r1 = agent1.run("go")
+    assert r1.status == Status.FAILED
+
+    target = tmp_path / "should_not_be_created.txt"
+    provider2 = FakeProvider([LLMResponse(tool_calls=[
+        tool_call("write_file", path=str(target), content="x")])])
+    agent2, _ = _build(tmp_path, provider2, ks=ks)
+
+    task = agent1.store.load(r1.task.id)
+    r2 = agent2.resume(task)
+
+    assert r2.status == Status.FAILED                 # unchanged, still terminal
+    assert provider2.calls == 0
+    assert not target.exists()
+    assert agent1.store.load(r1.task.id).status == Status.FAILED
+
+
+def test_cancelled_task_with_stale_pending_cannot_execute_via_resume_pending(tmp_path):
+    # Reproduces the audit's most severe probe: a task explicitly CANCELLED
+    # that still carries a leftover HIGH-risk pending payload. resume_pending
+    # must refuse it outright - before even inspecting task.pending - so a
+    # durable owner "approval" arriving late can never execute it.
+    target = tmp_path / "keep.txt"
+    target.write_text("precious")
+    provider = FakeProvider([LLMResponse(text="n/a")])
+    agent, ks = _build(tmp_path, provider, defer=True)
+
+    task = Task(goal="delete keep.txt", status=Status.CANCELLED)
+    task.pending = {
+        "assistant_text": None,
+        "tool_calls": [{"name": "delete_file", "arguments": {"path": str(target)},
+                        "id": None, "signature": None,
+                        "risk": "HIGH", "requires_confirmation": True}],
+    }
+    agent.store.save(task)
+
+    reloaded = agent.store.load(task.id)
+    r2 = agent.resume_pending(reloaded, decision=True)     # owner "approves" too late
+
+    assert r2.status == Status.CANCELLED              # unchanged, still terminal
+    assert provider.calls == 0                         # no LLM turn either
+    assert target.exists() and target.read_text() == "precious"  # NOT deleted
+    final = agent.store.load(task.id)
+    assert final.status == Status.CANCELLED
+    assert final.pending is not None                   # not consumed/cleared
+    assert final.pending["tool_calls"][0]["name"] == "delete_file"
 
 
 # --- J: every execution passes through RiskGate ------------------------

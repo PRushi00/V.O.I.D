@@ -18,7 +18,7 @@ from void.actions.files import FileActions
 from void.actions.registry import ToolRegistry
 from void.core.agent import Agent
 from void.core.kill_switch import KillSwitch
-from void.core.task import Status, TaskStore
+from void.core.task import Status, Task, TaskStore
 from void.providers.base import LLMResponse
 from void.security.risk import RiskGate
 
@@ -441,3 +441,85 @@ def test_realistic_multiple_projects_directories(tmp_path):
     assert not (d1 / "test.txt").exists() and not (d3 / "test.txt").exists()
     task = _load(agent, blocked.task.id)
     assert task.pending is None and task.error is None
+
+
+# --- Terminal tasks with a STALE disambiguation pending must never clarify --
+#
+# Regression for the same class of defect just fixed in resume()/resume_pending():
+# a task whose status is already COMPLETED/FAILED/CANCELLED, but which still
+# carries a leftover pending{"kind": "directory_disambiguation"} payload, must
+# never be clarified - clarify() must never re-enter the loop, generate a new
+# LLM turn, execute a tool, or mutate the task's persisted state.
+
+def _stale_disambiguation_task(goal, status, candidate_dir):
+    task = Task(goal=goal, status=status)
+    task.pending = {
+        "kind": "directory_disambiguation",
+        "candidates": [{"index": 1, "name": "Projects",
+                        "path": str(candidate_dir)}],
+        "prompt": "which?", "created_at": 0.0,
+    }
+    return task
+
+
+def test_completed_task_with_stale_disambiguation_cannot_clarify(tmp_path):
+    projects = tmp_path / "aa" / "Projects"
+    _mk(projects)
+    # If the guard failed, this scripted call WOULD run.
+    agent = _agent(tmp_path, [LLMResponse(tool_calls=[tool_call(
+        "write_file", path=str(projects / "wrong.txt"), content="no")])])
+
+    task = _stale_disambiguation_task(
+        "create note.txt in Projects", Status.COMPLETED, projects)
+    agent.store.save(task)
+
+    result = agent.resume_clarification(_load(agent, task.id), "1")
+
+    assert result.status == Status.COMPLETED           # unchanged, still terminal
+    assert agent.provider.calls == 0                    # no new LLM turn
+    assert not (projects / "wrong.txt").exists()         # no tool side effect
+    final = _load(agent, task.id)
+    assert final.status == Status.COMPLETED
+    assert final.pending is not None                     # not consumed/cleared
+    assert final.pending["kind"] == "directory_disambiguation"
+
+
+def test_cancelled_task_with_stale_disambiguation_cannot_clarify_or_execute(tmp_path):
+    projects = tmp_path / "aa" / "Projects"
+    _mk(projects)
+    agent = _agent(tmp_path, [LLMResponse(tool_calls=[tool_call(
+        "write_file", path=str(projects / "wrong.txt"), content="no")])])
+
+    task = _stale_disambiguation_task(
+        "create note.txt in Projects", Status.CANCELLED, projects)
+    agent.store.save(task)
+
+    result = agent.resume_clarification(_load(agent, task.id), "1")
+
+    assert result.status == Status.CANCELLED            # unchanged, still terminal
+    assert agent.provider.calls == 0
+    assert not (projects / "wrong.txt").exists()
+    final = _load(agent, task.id)
+    assert final.status == Status.CANCELLED
+    assert final.pending is not None
+    assert final.pending["candidates"][0]["path"] == str(projects)  # untouched
+
+
+def test_failed_task_with_stale_disambiguation_cannot_clarify_or_execute(tmp_path):
+    projects = tmp_path / "aa" / "Projects"
+    _mk(projects)
+    agent = _agent(tmp_path, [LLMResponse(tool_calls=[tool_call(
+        "write_file", path=str(projects / "wrong.txt"), content="no")])])
+
+    task = _stale_disambiguation_task(
+        "create note.txt in Projects", Status.FAILED, projects)
+    agent.store.save(task)
+
+    result = agent.resume_clarification(_load(agent, task.id), "1")
+
+    assert result.status == Status.FAILED               # unchanged, still terminal
+    assert agent.provider.calls == 0
+    assert not (projects / "wrong.txt").exists()
+    final = _load(agent, task.id)
+    assert final.status == Status.FAILED
+    assert final.pending is not None
