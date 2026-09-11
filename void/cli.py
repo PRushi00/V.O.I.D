@@ -6,6 +6,8 @@ Examples:
     python -m void set-key gemini
     python -m void tasks
     python -m void resume 1a2b3c4d5e6f
+    python -m void approve 1a2b3c4d5e6f   # authorize a pending HIGH-risk step
+    python -m void deny 1a2b3c4d5e6f      # refuse a pending HIGH-risk step
     python -m void stop            # engage emergency stop (any terminal)
     python -m void clear-stop
     python -m void ui              # launch the circular widget
@@ -96,6 +98,36 @@ def cmd_clarify(task_id: str, selection: str) -> int:
     assistant = Assistant(confirm_fn=_confirm, on_event=_event)
     try:
         result = assistant.clarify(task_id, selection)
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+    except ProviderUnavailable as exc:
+        print(f"\nNo AI brain available: {exc}")
+        return 1
+    _print_result(result)
+    return 0 if result.status == Status.COMPLETED else 2
+
+
+def cmd_approve(task_id: str) -> int:
+    """Owner approves a task's pending HIGH-risk step; it executes exactly once."""
+    assistant = Assistant(confirm_fn=_confirm, on_event=_event)
+    try:
+        result = assistant.approve(task_id)
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+    except ProviderUnavailable as exc:
+        print(f"\nNo AI brain available: {exc}")
+        return 1
+    _print_result(result)
+    return 0 if result.status == Status.COMPLETED else 2
+
+
+def cmd_deny(task_id: str) -> int:
+    """Owner denies a task's pending HIGH-risk step; it will not execute."""
+    assistant = Assistant(confirm_fn=_confirm, on_event=_event)
+    try:
+        result = assistant.deny(task_id)
     except ValueError as exc:
         print(str(exc))
         return 1
@@ -430,6 +462,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_clarify.add_argument("selection",
                            help="The candidate number to use (e.g. 2).")
 
+    p_approve = sub.add_parser(
+        "approve", help="Approve a task awaiting HIGH-risk confirmation")
+    p_approve.add_argument("task_id")
+
+    p_deny = sub.add_parser(
+        "deny", help="Deny a task awaiting HIGH-risk confirmation")
+    p_deny.add_argument("task_id")
+
     p_key = sub.add_parser("set-key", help="Store an API key securely")
     p_key.add_argument("name", choices=["gemini"])
     p_key.add_argument("--name", dest="alias", default=None,
@@ -472,9 +512,9 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
 
     # Convenience: `python -m void "goal text"` with no subcommand -> run.
-    known = {"run", "resume", "clarify", "set-key", "list-keys", "remove-key",
-             "set-pin", "tasks", "stop", "clear-stop", "ui", "voice", "roots",
-             "protect", "-h", "--help"}
+    known = {"run", "resume", "clarify", "approve", "deny", "set-key",
+             "list-keys", "remove-key", "set-pin", "tasks", "stop",
+             "clear-stop", "ui", "voice", "roots", "protect", "-h", "--help"}
     if argv and argv[0] not in known:
         return cmd_run(" ".join(argv))
 
@@ -487,6 +527,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_resume(args.task_id)
     if args.command == "clarify":
         return cmd_clarify(args.task_id, args.selection)
+    if args.command == "approve":
+        return cmd_approve(args.task_id)
+    if args.command == "deny":
+        return cmd_deny(args.task_id)
     if args.command == "set-key":
         return cmd_set_key(args.name, alias=args.alias)
     if args.command == "list-keys":

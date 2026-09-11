@@ -240,3 +240,238 @@ def test_set_key_success_output_has_no_value(store, enter_key, capsys):
     out = capsys.readouterr().out
     assert FAKE_02 not in out
     assert "gemini_02" in out  # the alias name is fine to show
+
+
+# --- approve / deny CLI wiring (+ clarify regression) -------------------
+#
+# void.cli.Assistant is monkeypatched to a factory that returns REAL
+# Assistant instances (Assistant.__new__, so approve/deny/resume/clarify/
+# _load_awaiting/_load_blocked_disambiguation/_agent are the actual,
+# unmodified production methods) wired to a shared KillSwitch/TaskStore/
+# ToolRegistry over tmp_path. Only Config.load(), the network ProviderRegistry,
+# and the Windows app/computer-control tool construction are skipped - none
+# of those are relevant to CLI wiring, RiskGate, or KillSwitch behavior.
+
+from pathlib import Path as _Path
+
+from void.actions.files import FileActions as _FileActions
+from void.actions.registry import ToolRegistry as _ToolRegistry
+from void.app import Assistant as _RealAssistant
+from void.core.agent import Agent as _Agent
+from void.core.kill_switch import KillSwitch as _KillSwitch
+from void.core.task import Status as _Status
+from void.core.task import Task as _Task
+from void.core.task import TaskStore as _TaskStore
+from void.providers.base import LLMResponse as _LLMResponse
+from void.security.risk import RiskGate as _RiskGate
+
+from tests.helpers import FakeProvider as _FakeProvider
+from tests.helpers import tool_call as _tool_call
+
+
+class _StubConfig:
+    """Just enough of Config for Assistant._agent(): agent.max_steps/retries."""
+    def get(self, key, default=None):
+        return default
+
+
+class _OneShotProviders:
+    """Swappable single-provider registry: select() returns whatever provider
+    is CURRENTLY assigned, mirroring a fresh CLI process picking up the
+    provider live each invocation."""
+    def __init__(self, provider):
+        self.provider = provider
+
+    def select(self):
+        return self.provider
+
+
+@pytest.fixture
+def cli_rig(tmp_path, monkeypatch):
+    files = _FileActions(allowed_roots=[tmp_path])
+    tools = _ToolRegistry()
+    tools.register_all(files.tools())
+    ks = _KillSwitch()
+    task_store = _TaskStore(tmp_path / "t.sqlite")
+    providers = _OneShotProviders(_FakeProvider([]))
+
+    def _factory(confirm_fn=None, on_event=None):
+        a = _RealAssistant.__new__(_RealAssistant)
+        a.config = _StubConfig()
+        a.on_event = on_event or (lambda _m: None)
+        a._confirm_fn = confirm_fn
+        a.kill_switch = ks
+        a.risk_gate = _RiskGate(confirm_at_or_above="high", confirm_fn=confirm_fn)
+        a.store = task_store
+        a.tools = tools
+        a.providers = providers
+        return a
+
+    monkeypatch.setattr(cli, "Assistant", _factory)
+    return {"tmp_path": tmp_path, "ks": ks, "store": task_store,
+            "tools": tools, "providers": providers}
+
+
+def _headless_agent(rig, script):
+    """A headless (defer_confirmation=True) Agent sharing the rig's store,
+    tools, and killswitch - seeds AWAITING_CONFIRMATION/BLOCKED tasks exactly
+    as a real headless (e.g. voice) Assistant would, independent of the
+    interactive provider slot the CLI factory itself uses."""
+    gate = _RiskGate(confirm_at_or_above="high")
+    return _Agent(_FakeProvider(script), rig["tools"], gate, rig["ks"],
+                 rig["store"], max_retries=0, defer_confirmation=True)
+
+
+def _set_next_cli_response(rig, script):
+    rig["providers"].provider = _FakeProvider(script)
+
+
+# 1. approve a valid AWAITING_CONFIRMATION task --------------------------
+
+def test_cli_approve_valid_awaiting_task_executes_once(cli_rig):
+    rig = cli_rig
+    target = rig["tmp_path"] / "keep.txt"
+    target.write_text("precious")
+    seed = _headless_agent(rig, [
+        _LLMResponse(tool_calls=[_tool_call("delete_file", path=str(target))]),
+    ])
+    seeded = seed.run("delete keep.txt")
+    assert seeded.status == _Status.AWAITING_CONFIRMATION
+    assert target.exists()
+
+    _set_next_cli_response(rig, [_LLMResponse(text="Deleted it.")])
+    rc = _run("approve", seeded.task.id)
+
+    assert rc == 0
+    assert not target.exists()
+    final = rig["store"].load(seeded.task.id)
+    assert final.status == _Status.COMPLETED
+    assert final.pending is None
+
+
+# 2. deny a valid AWAITING_CONFIRMATION task -----------------------------
+
+def test_cli_deny_valid_awaiting_task_prevents_execution(cli_rig):
+    rig = cli_rig
+    target = rig["tmp_path"] / "keep.txt"
+    target.write_text("precious")
+    seed = _headless_agent(rig, [
+        _LLMResponse(tool_calls=[_tool_call("delete_file", path=str(target))]),
+    ])
+    seeded = seed.run("delete keep.txt")
+    assert seeded.status == _Status.AWAITING_CONFIRMATION
+
+    _set_next_cli_response(rig, [_LLMResponse(text="Did not delete it.")])
+    rc = _run("deny", seeded.task.id)
+
+    assert rc == 0
+    assert target.exists() and target.read_text() == "precious"
+    final = rig["store"].load(seeded.task.id)
+    assert final.pending is None
+
+
+# 3 / 4. invalid / nonexistent task id -----------------------------------
+
+def test_cli_approve_nonexistent_task_id_fails_safely(cli_rig, capsys):
+    rc = _run("approve", "no-such-task")
+    assert rc == 1
+    assert "no such task" in capsys.readouterr().out.lower()
+
+
+def test_cli_deny_nonexistent_task_id_fails_safely(cli_rig, capsys):
+    rc = _run("deny", "no-such-task")
+    assert rc == 1
+    assert "no such task" in capsys.readouterr().out.lower()
+
+
+# 5. approve a terminal task (with a stale pending) does not execute ----
+
+def test_cli_approve_terminal_task_does_not_execute(cli_rig, capsys):
+    rig = cli_rig
+    target = rig["tmp_path"] / "keep.txt"
+    target.write_text("precious")
+    task = _Task(goal="delete keep.txt", status=_Status.CANCELLED)
+    task.pending = {
+        "assistant_text": None,
+        "tool_calls": [{"name": "delete_file", "arguments": {"path": str(target)},
+                        "id": None, "signature": None,
+                        "risk": "HIGH", "requires_confirmation": True}],
+    }
+    rig["store"].save(task)
+
+    rc = _run("approve", task.id)
+
+    assert rc == 1
+    assert target.exists() and target.read_text() == "precious"
+    final = rig["store"].load(task.id)
+    assert final.status == _Status.CANCELLED
+    assert "no pending confirmation" in capsys.readouterr().out.lower()
+
+
+# 6. deny a terminal task does not mutate it -----------------------------
+
+def test_cli_deny_terminal_task_does_not_mutate_it(cli_rig):
+    rig = cli_rig
+    task = _Task(goal="anything", status=_Status.COMPLETED, result="done already")
+    rig["store"].save(task)
+    before = rig["store"].load(task.id)
+
+    rc = _run("deny", task.id)
+
+    assert rc == 1
+    after = rig["store"].load(task.id)
+    assert after.status == before.status == _Status.COMPLETED
+    assert after.result == before.result
+    assert after.updated_at == before.updated_at   # not even re-saved/touched
+
+
+# 7. approval while KillSwitch is engaged does not execute --------------
+
+def test_cli_approve_with_killswitch_engaged_does_not_execute(cli_rig):
+    rig = cli_rig
+    target = rig["tmp_path"] / "keep.txt"
+    target.write_text("precious")
+    seed = _headless_agent(rig, [
+        _LLMResponse(tool_calls=[_tool_call("delete_file", path=str(target))]),
+    ])
+    seeded = seed.run("delete keep.txt")
+    assert seeded.status == _Status.AWAITING_CONFIRMATION
+
+    rig["ks"].engage(reason="test: engaged before approval")
+
+    rc = _run("approve", seeded.task.id)
+
+    assert target.exists() and target.read_text() == "precious"
+    final = rig["store"].load(seeded.task.id)
+    assert final.status == _Status.PAUSED
+    assert rc == 2                                  # not COMPLETED
+
+
+# 8. existing clarify behavior remains intact ----------------------------
+
+def test_cli_clarify_still_works_after_approve_deny_wiring(cli_rig):
+    rig = cli_rig
+    a = rig["tmp_path"] / "aa" / "Projects"
+    b = rig["tmp_path"] / "bb" / "Projects"
+    a.mkdir(parents=True)
+    b.mkdir(parents=True)
+    seed = _Agent(_FakeProvider([
+        _LLMResponse(tool_calls=[_tool_call("find_directory", query="Projects")]),
+    ]), rig["tools"], _RiskGate(confirm_at_or_above="high"), rig["ks"],
+        rig["store"], max_retries=0)
+    blocked = seed.run("create note.txt in Projects")
+    assert blocked.status == _Status.BLOCKED
+
+    pending = rig["store"].load(blocked.task.id).pending
+    chosen = pending["candidates"][0]
+    chosen_dir = _Path(chosen["path"])
+
+    _set_next_cli_response(rig, [
+        _LLMResponse(tool_calls=[_tool_call(
+            "write_file", path=str(chosen_dir / "note.txt"), content="hi")]),
+        _LLMResponse(text="done"),
+    ])
+    rc = _run("clarify", blocked.task.id, str(chosen["index"]))
+
+    assert rc == 0
+    assert (chosen_dir / "note.txt").read_text() == "hi"
