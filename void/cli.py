@@ -387,6 +387,21 @@ def cmd_ui() -> int:
     return launch()
 
 
+def cmd_app() -> int:
+    """Launch the persistent desktop application: one Assistant, one
+    VoiceController (the sole microphone owner), and the orb widget, all
+    composed by void.runtime.app.VoidRuntime. KillSwitch engagement halts
+    execution through the existing mechanisms but does not exit this
+    process; closing the window does."""
+    try:
+        from void.runtime.app import main as run_app
+    except Exception as exc:
+        print(f"Could not load the persistent app: {exc}\n"
+              f"Make sure PySide6 is installed: pip install PySide6")
+        return 1
+    return run_app()
+
+
 def cmd_voice() -> int:
     """Launch the push-to-talk voice interface.
 
@@ -491,6 +506,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("clear-stop", help="Clear an engaged stop")
     sub.add_parser("ui", help="Launch the circular widget")
     sub.add_parser("voice", help="Launch the push-to-talk voice interface")
+    sub.add_parser(
+        "app", help="Launch the persistent desktop application (orb + voice)")
 
     p_roots = sub.add_parser(
         "roots", help="Manage trusted filesystem roots (owner-only)")
@@ -514,7 +531,8 @@ def main(argv: list[str] | None = None) -> int:
     # Convenience: `python -m void "goal text"` with no subcommand -> run.
     known = {"run", "resume", "clarify", "approve", "deny", "set-key",
              "list-keys", "remove-key", "set-pin", "tasks", "stop",
-             "clear-stop", "ui", "voice", "roots", "protect", "-h", "--help"}
+             "clear-stop", "ui", "voice", "app", "roots", "protect",
+             "-h", "--help"}
     if argv and argv[0] not in known:
         return cmd_run(" ".join(argv))
 
@@ -549,6 +567,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_ui()
     if args.command == "voice":
         return cmd_voice()
+    if args.command == "app":
+        return cmd_app()
     if args.command == "roots":
         return cmd_roots(args.action, args.path)
     if args.command == "protect":

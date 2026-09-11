@@ -8,6 +8,14 @@ not a big dashboard (that comes later).
 The agent runs on a worker thread so the UI never freezes. High-risk actions
 raise a confirmation dialog on the UI thread before proceeding.
 
+VoidWidget takes its Assistant (and, for the persistent app, a
+VoiceStateBridge) as constructor arguments - it never constructs an Assistant
+or a VoiceController itself. That composition is owned by whoever builds the
+widget: the standalone ``launch()`` below for ``python -m void ui``, or
+``void.runtime.app`` for the persistent desktop application. This keeps
+exactly one Assistant/VoiceController per process regardless of which entry
+point is used, and keeps the widget a pure observer of backend state.
+
 NOTE: this module requires a display and PySide6, so it is validated by running
 it on the laptop, not in headless CI.
 """
@@ -71,15 +79,31 @@ class Worker(QObject):
 
 
 class VoidWidget(QWidget):
-    def __init__(self):
+    # Emitted when the widget is closing (user closed the window). The
+    # runtime coordinator connects to this to drive the shutdown funnel;
+    # this signal carries no authority of its own - it is purely a lifecycle
+    # notification.
+    closing = Signal()
+
+    def __init__(self, assistant: Assistant, confirm_bridge=None,
+                 voice_bridge=None):
+        """``assistant`` is required and constructed by the caller (never by
+        this widget). ``confirm_bridge`` (a ConfirmBridge, optional) wires a
+        synchronous confirmation dialog if the caller's Assistant was built
+        with one as its confirm_fn. ``voice_bridge`` (a VoiceStateBridge,
+        optional) is accepted so the runtime coordinator can inject it now;
+        this step does not yet render voice state (no black-hole visuals
+        yet) - it's wired for a later visual-design step to subscribe to."""
         super().__init__()
         self._drag_pos: QPoint | None = None
         self._thread: QThread | None = None
         self._worker: Worker | None = None
 
-        self.confirm_bridge = ConfirmBridge()
-        self.confirm_bridge.requested.connect(self._on_confirm_requested)
-        self.assistant = Assistant(confirm_fn=self.confirm_bridge.confirm)
+        self.assistant = assistant
+        self.confirm_bridge = confirm_bridge
+        if self.confirm_bridge is not None:
+            self.confirm_bridge.requested.connect(self._on_confirm_requested)
+        self.voice_bridge = voice_bridge
 
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
@@ -180,10 +204,25 @@ class VoidWidget(QWidget):
         if self._drag_pos is not None and event.buttons() & Qt.LeftButton:
             self.move(event.globalPosition().toPoint() - self._drag_pos)
 
+    # --- lifecycle -------------------------------------------------------
+
+    def closeEvent(self, event):
+        # Notify only; this widget decides nothing about shutdown order -
+        # a runtime coordinator (or, for the standalone `ui` command, no one)
+        # decides what closing means. The window still closes either way.
+        self.closing.emit()
+        super().closeEvent(event)
+
 
 def launch() -> int:
+    """Standalone entry point for `python -m void ui` - unchanged behavior:
+    one Assistant, a synchronous confirmation dialog, no voice. Builds the
+    Assistant/ConfirmBridge here (not inside VoidWidget) and injects them,
+    since the widget no longer constructs its own Assistant."""
     app = QApplication.instance() or QApplication(sys.argv)
-    widget = VoidWidget()
+    confirm_bridge = ConfirmBridge()
+    assistant = Assistant(confirm_fn=confirm_bridge.confirm)
+    widget = VoidWidget(assistant, confirm_bridge=confirm_bridge)
     widget.show()
     return app.exec()
 
