@@ -229,3 +229,52 @@ def test_known_statuses_all_load_without_error(tmp_path):
         t = Task(goal=f"g-{st}", status=st)
         store.save(t)
         assert store.load(t.id).status == st
+
+
+# --- Database-open failure: baseline for the crash/recovery audit's -----
+# CRITICAL test gap ("no test for TaskStore construction against an
+# unusable database file"). This documents CURRENT behavior only - it does
+# NOT assert this is the desired final behavior. TaskStore has no
+# try/except anywhere around sqlite3 operations (confirmed by inspection of
+# _init_db/save/load), so an unusable database file is expected to raise
+# the raw sqlite3 exception, uncaught. Whether that should become a graceful
+# application-level error is a separate, later decision - not made here.
+#
+# A deliberately-corrupted file (not a valid SQLite database at all) is used
+# instead of OS-level file locking: the same bytes fail identically on every
+# run, on every platform, with no timing dependency - a lock-based scenario
+# would depend on OS/filesystem locking semantics and could be flaky.
+
+def test_construction_fails_on_corrupted_database_file(tmp_path):
+    db = tmp_path / "corrupt.sqlite"
+    db.write_bytes(b"this is not a sqlite database, just garbage bytes")
+
+    # A workspace a real tool call could have touched, to prove no
+    # filesystem side effect occurs as a byproduct of the failed
+    # construction (requirement 4).
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with pytest.raises(sqlite3.DatabaseError) as exc_info:
+        TaskStore(str(db))
+    # Record the actual current behavior explicitly (not asserting it is
+    # the desired one) - as of this run, sqlite3 reports the file is not a
+    # valid database.
+    assert "database" in str(exc_info.value).lower()
+
+    # No filesystem side effect: the failed construction touched nothing
+    # outside the corrupted DB file itself.
+    assert list(workspace.iterdir()) == []
+
+    # No task execution and no authorization can occur (requirements 2-3):
+    # Agent.__init__ requires an already-constructed TaskStore instance as
+    # a mandatory positional argument (void/core/agent.py), and RiskGate/
+    # KillSwitch/ToolRegistry only ever get exercised from inside an Agent.
+    # Since TaskStore(...) never returns here, no Agent, RiskGate call, or
+    # tool execution can structurally occur on this path - there is no
+    # store object for any of those to be built from.
+
+    # Deterministic: re-running against the identical bytes fails the same
+    # way every time (no locking, no timing, no OS-specific behavior).
+    with pytest.raises(sqlite3.DatabaseError):
+        TaskStore(str(db))
