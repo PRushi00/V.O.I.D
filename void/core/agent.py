@@ -13,7 +13,7 @@ from typing import Callable
 
 from void.actions.registry import ToolRegistry
 from void.core.kill_switch import KillSwitch, StopRequested
-from void.core.task import Status, Task, TaskStore
+from void.core.task import CorruptedTaskState, Status, Task, TaskStore
 from void.providers.base import LLMProvider, ProviderUnavailable
 from void.security.risk import RiskGate, RiskLevel
 
@@ -287,6 +287,14 @@ class Agent:
         return self._loop(task)
 
     def resume(self, task: Task) -> AgentResult:
+        # A status outside the known Status set (corrupted row, or from an
+        # incompatible future version) must never fall through to the loop
+        # branch below as if it were implicitly resumable. Checked before
+        # every other guard, and before anything about the task is mutated.
+        if task.status not in Status.ALL:
+            raise CorruptedTaskState(
+                f"Task {task.id} has an unrecognized status "
+                f"{task.status!r}; refusing to resume.")
         # Terminal tasks (COMPLETED/FAILED/CANCELLED) are done - a resume must
         # NEVER re-enter the loop, generate a new LLM turn, or mutate the
         # task's status. Checked first, ahead of every other resume path.
@@ -313,6 +321,13 @@ class Agent:
     def resume_pending(self, task: Task, decision: bool) -> AgentResult:
         """Apply the owner's approve (True) / deny (False) to a pending step,
         then continue the task. Executes the pending step exactly once."""
+        # A status outside the known Status set must never be treated as
+        # something with a pending action to execute. Checked first, before
+        # the pending payload is even inspected.
+        if task.status not in Status.ALL:
+            raise CorruptedTaskState(
+                f"Task {task.id} has an unrecognized status "
+                f"{task.status!r}; refusing to execute its pending action.")
         # Terminal tasks can never execute a pending action, even a stale one
         # left over from before cancellation/completion - checked before the
         # pending payload itself is even inspected.
@@ -612,6 +627,13 @@ class Agent:
         as an owner (trusted) clarification message; the original operation
         then proceeds through the UNCHANGED confinement / RiskGate pipeline.
         """
+        # A status outside the known Status set must never be treated as a
+        # valid BLOCKED-disambiguation task. Checked first, before pending is
+        # even read.
+        if task.status not in Status.ALL:
+            raise CorruptedTaskState(
+                f"Task {task.id} has an unrecognized status "
+                f"{task.status!r}; refusing to apply a clarification.")
         # Terminal tasks (COMPLETED/FAILED/CANCELLED) are done - a clarification
         # must NEVER re-enter the loop, generate a new LLM turn, or mutate the
         # task's status, even if a stale disambiguation pending is still

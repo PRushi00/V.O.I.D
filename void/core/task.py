@@ -29,6 +29,20 @@ class Status:
     RESUMABLE = {RUNNING, PAUSED, AWAITING_CONFIRMATION}
     # Terminal = no further execution.
     TERMINAL = {COMPLETED, FAILED, CANCELLED}
+    # Every recognized status. A persisted/in-memory value outside this set is
+    # corrupted or from an incompatible future version, never a value this
+    # code intentionally wrote - it must fail closed, never be treated as
+    # implicitly resumable.
+    ALL = {PENDING, RUNNING, PAUSED, AWAITING_CONFIRMATION, BLOCKED,
+           COMPLETED, FAILED, CANCELLED}
+
+
+class CorruptedTaskState(ValueError):
+    """A task's status is not a recognized Status value.
+
+    Raised instead of silently coercing/defaulting so a corrupted row or an
+    incompatible future status can never be treated as resumable.
+    """
 
 
 @dataclass
@@ -151,6 +165,16 @@ class TaskStore:
 
     def _row_to_task(self, row: sqlite3.Row) -> Task:
         keys = row.keys()
+        status = row["status"]
+        if status not in Status.ALL:
+            # Never coerce/default a corrupted or unrecognized status - fail
+            # closed instead of silently returning a Task that downstream
+            # code (e.g. Agent.resume) could treat as resumable. The row
+            # itself is left untouched.
+            raise CorruptedTaskState(
+                f"Task {row['id']!r} has an unrecognized status {status!r}; "
+                f"refusing to load it."
+            )
         pending_raw = row["pending"] if "pending" in keys else None
         pending = json.loads(pending_raw) if pending_raw else None
         # Malformed stored ledger data must fail safely to an empty ledger,
@@ -170,7 +194,7 @@ class TaskStore:
             except (ValueError, TypeError):
                 current_step = 0
         return Task(
-            id=row["id"], goal=row["goal"], status=row["status"],
+            id=row["id"], goal=row["goal"], status=status,
             messages=json.loads(row["messages"]), steps=row["steps"],
             result=row["result"], error=row["error"],
             pending=pending, plan=plan, current_step=current_step,

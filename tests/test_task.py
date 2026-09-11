@@ -1,5 +1,7 @@
 """Tests for the durable task store and checkpointing."""
-from void.core.task import Status, Task, TaskStore
+import pytest
+
+from void.core.task import CorruptedTaskState, Status, Task, TaskStore
 
 
 def test_save_and_load_roundtrip(tmp_path):
@@ -192,3 +194,38 @@ def test_malformed_plan_fails_safe(tmp_path):
         conn.execute("UPDATE tasks SET plan=? WHERE id=?", ("not json{{", t.id))
     loaded = store.load(t.id)
     assert loaded.plan == []          # malformed ledger -> empty, no crash
+
+
+# --- Corrupted/unknown status must fail closed, never coerce -----------
+#
+# Regression for the audit's HIGH finding: row["status"] was loaded verbatim
+# with no validation, so a corrupted or future/incompatible status value
+# would silently become a "valid-looking" Task that Agent.resume() could
+# then treat as implicitly resumable.
+
+def test_corrupted_status_fails_closed_on_load(tmp_path):
+    db = tmp_path / "c.sqlite"
+    store = TaskStore(str(db))
+    t = Task(goal="g")
+    store.save(t)
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", ("CORRUPTED", t.id))
+
+    with pytest.raises(CorruptedTaskState):
+        store.load(t.id)
+
+    # The row itself is left untouched - never silently coerced/rewritten.
+    with sqlite3.connect(str(db)) as conn:
+        row = conn.execute("SELECT status FROM tasks WHERE id=?",
+                           (t.id,)).fetchone()
+    assert row[0] == "CORRUPTED"
+
+
+def test_known_statuses_all_load_without_error(tmp_path):
+    # Every status this code actually writes must still load cleanly -
+    # the new validation must not reject any valid state.
+    store = TaskStore(tmp_path / "ok.sqlite")
+    for st in Status.ALL:
+        t = Task(goal=f"g-{st}", status=st)
+        store.save(t)
+        assert store.load(t.id).status == st

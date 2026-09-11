@@ -9,7 +9,7 @@ from void.actions.files import FileActions
 from void.actions.registry import ToolRegistry
 from void.core.agent import Agent
 from void.core.kill_switch import KillSwitch
-from void.core.task import Status, Task, TaskStore
+from void.core.task import CorruptedTaskState, Status, Task, TaskStore
 from void.providers.base import LLMProvider, LLMResponse
 from void.security.risk import RiskGate, RiskLevel
 
@@ -440,6 +440,103 @@ def test_cancelled_task_with_stale_pending_cannot_execute_via_resume_pending(tmp
     assert final.status == Status.CANCELLED
     assert final.pending is not None                   # not consumed/cleared
     assert final.pending["tool_calls"][0]["name"] == "delete_file"
+
+
+# --- Corrupted/unknown status must never fall through to execution -----
+#
+# Regression for the audit's HIGH finding: TaskStore._row_to_task loaded
+# row["status"] as a raw string with no validation, and Agent.resume()'s
+# guard chain (TERMINAL -> AWAITING_CONFIRMATION -> BLOCKED -> else:
+# _loop()) treated any unrecognized status as implicitly resumable - setting
+# it RUNNING and generating a new LLM turn / executing a stale pending tool
+# call. These tasks are built directly in memory (never round-tripped
+# through TaskStore.load, which now refuses to load such a row at all - see
+# test_task.py) so each Agent-level guard is exercised in isolation.
+
+_CORRUPTED_STATUS = "CORRUPTED"
+
+
+def test_corrupted_status_cannot_resume(tmp_path):
+    target = tmp_path / "should_not_be_created.txt"
+    provider = FakeProvider([LLMResponse(tool_calls=[
+        tool_call("write_file", path=str(target), content="x")])])
+    agent, ks = _build(tmp_path, provider)
+
+    task = Task(goal="do a thing", status=_CORRUPTED_STATUS)
+
+    with pytest.raises(CorruptedTaskState):
+        agent.resume(task)
+
+    assert provider.calls == 0            # no LLM turn
+    assert not target.exists()            # no tool execution
+    assert task.status == _CORRUPTED_STATUS  # never mutated toward RUNNING
+
+
+def test_corrupted_status_cannot_resume_pending(tmp_path):
+    target = tmp_path / "keep.txt"
+    target.write_text("precious")
+    provider = FakeProvider([LLMResponse(text="n/a")])
+    agent, ks = _build(tmp_path, provider, defer=True)
+
+    task = Task(goal="delete keep.txt", status=_CORRUPTED_STATUS)
+    task.pending = {
+        "assistant_text": None,
+        "tool_calls": [{"name": "delete_file", "arguments": {"path": str(target)},
+                        "id": None, "signature": None,
+                        "risk": "HIGH", "requires_confirmation": True}],
+    }
+
+    with pytest.raises(CorruptedTaskState):
+        agent.resume_pending(task, decision=True)   # a late owner "approval"
+
+    assert provider.calls == 0                        # no LLM turn
+    assert target.exists() and target.read_text() == "precious"  # NOT deleted
+    assert task.status == _CORRUPTED_STATUS            # never mutated
+    assert task.pending is not None                    # not consumed/cleared
+
+
+def test_corrupted_status_cannot_resume_clarification(tmp_path):
+    provider = FakeProvider([LLMResponse(text="n/a")])
+    agent, ks = _build(tmp_path, provider)
+
+    task = Task(goal="find the Hackathon folder", status=_CORRUPTED_STATUS)
+    task.pending = {
+        "kind": "directory_disambiguation",
+        "candidates": [
+            {"index": 1, "name": "Hackathon", "path": str(tmp_path / "a")},
+            {"index": 2, "name": "Hackathon", "path": str(tmp_path / "b")},
+        ],
+        "prompt": "Which directory should I use?",
+        "created_at": 0.0,
+    }
+
+    with pytest.raises(CorruptedTaskState):
+        agent.resume_clarification(task, "1")
+
+    assert provider.calls == 0                # no LLM turn, no _loop() entry
+    assert task.status == _CORRUPTED_STATUS   # never mutated
+    assert task.pending is not None           # selection never applied
+
+
+def test_corrupted_status_persisted_row_is_never_mutated(tmp_path):
+    # TaskStore.save() itself does not validate status (only loading does),
+    # so a corrupted row can exist. Confirms the guard never rewrites/coerces
+    # the row it refuses to load - checked via a raw connection, since
+    # TaskStore.load() now refuses to return it at all (test_task.py).
+    import sqlite3
+
+    provider = FakeProvider([LLMResponse(text="n/a")])
+    agent, ks = _build(tmp_path, provider)
+    task = Task(goal="g", status=_CORRUPTED_STATUS)
+    agent.store.save(task)
+
+    with pytest.raises(CorruptedTaskState):
+        agent.store.load(task.id)
+
+    with sqlite3.connect(agent.store.db_path) as conn:
+        row = conn.execute("SELECT status FROM tasks WHERE id=?",
+                           (task.id,)).fetchone()
+    assert row[0] == _CORRUPTED_STATUS
 
 
 # --- J: every execution passes through RiskGate ------------------------
