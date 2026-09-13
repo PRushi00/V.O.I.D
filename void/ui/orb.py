@@ -120,6 +120,7 @@ class Particle:
     size: float       # normalized stroke size
     vx: float         # tangential (orbit-direction) motion-blur streak vector
     vy: float
+    heat: float       # 0 = cool outer (crimson) .. 1 = hottest inner (white-gold)
 
 
 # Fixed, deterministic per-particle "identity" (seeded once, pure thereafter):
@@ -178,14 +179,18 @@ def particle_field(params: BlackholeParams, elapsed_s: float) -> list[Particle]:
         near = max(0.0, 1.0 - abs(r - disk_r))
         alpha = params.overall_opacity * (0.15 + 0.85 * infall) * (0.4 + 0.6 * near)
         alpha *= (1.0 - disperse)
+        # heat rises toward the inner disk: outer material is cool crimson,
+        # inner material is white-hot (realistic temperature gradient).
+        heat = max(0.0, min(1.0, (1.32 - disk_r) / 0.62))
         # motion-blur streak points ALONG the orbit (tangent, perpendicular to
         # the radius), squashed with the disk - so particles read as swirling
-        # accretion, never as radial spikes from the centre.
-        streak_len = (0.06 + 0.16 * infall) * (0.0 if frozen else 1.0)
+        # accretion, never as radial spikes from the centre. Inner (hot)
+        # material streaks longer (moving faster).
+        streak_len = (0.05 + 0.10 * infall + 0.12 * heat) * (0.0 if frozen else 1.0)
         vx = -math.sin(a) * streak_len
         vy = math.cos(a) * streak_len * _DISK_TILT
         out.append(Particle(x=x, y=y, alpha=max(0.0, min(1.0, alpha)),
-                            size=0.008 + 0.012 * near, vx=vx, vy=vy))
+                            size=0.006 + 0.012 * near, vx=vx, vy=vy, heat=heat))
     return out
 
 
@@ -361,88 +366,135 @@ class BlackholeRenderer:
         def A(a: float) -> int:
             return int(max(0, min(255, round(a * op * 255))))
 
-        # 1) Accretion disk: a tilted, warm, layered glow behind the horizon.
-        # Kept fairly tight so it reads as one disk around the singularity,
-        # not detached side-wings.
         inten = params.event_horizon_intensity
-        disk_r = base_radius * (0.7 + 0.7 * params.formation_progress)
-        disk_h = disk_r * _DISK_TILT * 2.0
+        prog = params.formation_progress
+        # geometry: a genuinely dark shadow, an accretion disk of hot material
+        # around it, all on a slight perspective tilt. Radii are fractions of
+        # base_radius (screen presence) and grow as the hole forms.
+        shadow_r = max(1.0, base_radius * 0.40 * params.core_radius_scale)
+        disk_outer = base_radius * (0.78 + 0.62 * prog)
+        tilt = _DISK_TILT
+        ripple = 1.0 + params.ripple_amp * math.sin(elapsed_s * 6.0)
+
+        # fixed doppler-hot direction (lower-left, as in the reference): one
+        # side of the disk beams brighter than the other -> asymmetry, not a
+        # uniform ring. Screen y grows downward, so +y is "down".
+        import math as _m
+        hd = (-0.42, 0.34)
+        hdlen = _m.hypot(*hd) or 1.0
+        hdx, hdy = hd[0] / hdlen, hd[1] / hdlen
+
+        def warm(h: float):
+            """Temperature ramp: crimson -> burnt orange -> amber -> white-hot."""
+            h = 0.0 if h < 0.0 else 1.0 if h > 1.0 else h
+            stops = [(0.0, (120, 22, 20)), (0.35, (200, 60, 28)),
+                     (0.62, (240, 120, 45)), (0.82, (255, 185, 95)),
+                     (1.0, (255, 242, 220))]
+            for i in range(len(stops) - 1):
+                h0, c0 = stops[i]
+                h1, c1 = stops[i + 1]
+                if h <= h1:
+                    t = (h - h0) / (h1 - h0) if h1 > h0 else 0.0
+                    return tuple(int(c0[k] + (c1[k] - c0[k]) * t) for k in range(3))
+            return stops[-1][1]
+
+        def doppler(nx: float, ny: float) -> float:
+            d = nx * hdx + ny * hdy
+            return 0.55 + 0.55 * max(0.0, d)
+
+        # 1) Gravitational lensing: a soft, broad darkening of the surrounding
+        # desktop that intensifies toward the hole - NOT a coloured halo. The
+        # wallpaper stays visible; space just looks bent and dimmed here.
+        lens_r = disk_outer * 2.1
+        lens = QRadialGradient(cx, cy, lens_r)
+        lens.setColorAt(0.0, QColor(2, 1, 4, 0))
+        lens.setColorAt(max(0.02, shadow_r / lens_r), QColor(2, 1, 4, A(0.42)))
+        lens.setColorAt(0.34, QColor(3, 1, 6, A(0.30)))
+        lens.setColorAt(0.62, QColor(3, 1, 6, A(0.12)))
+        lens.setColorAt(1.0, QColor(0, 0, 0, 0))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(lens)
+        painter.drawEllipse(QPointF(cx, cy), lens_r, lens_r)
+
+        # 2) Accretion underglow: warm-only, asymmetric. A broad dim crimson
+        # base plus a tighter brighter amber pool offset toward the hot side,
+        # both tilted - gives the disk volume without a clean geometric ring.
         painter.save()
         painter.translate(cx, cy)
-        painter.rotate(params.disk_rotation_deg * 0.15)
-        disk_rect = QRectF(-disk_r, -disk_h / 2.0, disk_r * 2.0, disk_h)
-        glow = QRadialGradient(0.0, 0.0, disk_r)
-        # warm inner -> cool outer accretion colours (reference palette)
-        glow.setColorAt(0.0, QColor(255, 190, 110, A(0.30 * inten)))
-        glow.setColorAt(0.55, QColor(255, 150, 70, A(0.40 * inten)))
-        glow.setColorAt(0.82, QColor(120, 150, 255, A(0.22 * inten)))
-        glow.setColorAt(1.0, QColor(80, 110, 220, A(0.0)))
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(glow)
-        painter.drawEllipse(disk_rect)
+        painter.rotate(params.disk_rotation_deg * 0.12)
+        base_glow = QRadialGradient(0.0, 0.0, disk_outer)
+        base_glow.setColorAt(0.0, QColor(255, 150, 70, A(0.20 * inten)))
+        base_glow.setColorAt(0.5, QColor(180, 55, 28, A(0.20 * inten)))
+        base_glow.setColorAt(0.85, QColor(110, 20, 18, A(0.10 * inten)))
+        base_glow.setColorAt(1.0, QColor(50, 8, 10, 0))
+        painter.setBrush(base_glow)
+        painter.drawEllipse(QRectF(-disk_outer, -disk_outer * tilt,
+                                   disk_outer * 2.0, disk_outer * 2.0 * tilt))
+        # hot offset pool (doppler side)
+        ox, oy = hdx * disk_outer * 0.28, hdy * disk_outer * tilt * 0.5
+        hot = QRadialGradient(ox, oy, disk_outer * 0.72)
+        hot.setColorAt(0.0, QColor(255, 210, 140, A(0.42 * inten)))
+        hot.setColorAt(0.6, QColor(255, 140, 60, A(0.22 * inten)))
+        hot.setColorAt(1.0, QColor(200, 70, 30, 0))
+        painter.setBrush(hot)
+        painter.drawEllipse(QRectF(ox - disk_outer * 0.72, oy - disk_outer * 0.72 * tilt,
+                                   disk_outer * 1.44, disk_outer * 1.44 * tilt))
         painter.restore()
 
-        # 2) Particles (accretion streaks) - drawn as short lines toward orbit.
+        # 3) Accretion material: heat-graded, doppler-beamed streaks orbiting in
+        # the tilted plane. This is the primary feature - irregular, layered,
+        # asymmetric flowing matter, never a uniform band.
         if particles:
             for pt in particles:
-                a = A(pt.alpha)
+                nlen = _m.hypot(pt.x, pt.y) or 1.0
+                beam = doppler(pt.x / nlen, pt.y / nlen)
+                a = A(pt.alpha * beam)
                 if a <= 0:
                     continue
                 px = cx + pt.x * base_radius
                 py = cy + pt.y * base_radius
-                col = QColor(255, 200, 140, a)
-                pen = QPen(col)
+                r, g, b = warm(pt.heat)
+                pen = QPen(QColor(r, g, b, a))
                 pen.setWidthF(max(1.0, pt.size * base_radius))
                 pen.setCapStyle(Qt.RoundCap)
                 painter.setPen(pen)
-                # streak trails ALONG the orbit (tangential) -> swirling
-                # accretion, not radial spikes.
                 ex = px - pt.vx * base_radius
                 ey = py - pt.vy * base_radius
                 painter.drawLine(QPointF(px, py), QPointF(ex, ey))
 
-        # 3) Event horizon: a THICK, layered luminous ring (never a thin line).
-        horizon_r = base_radius * (0.55 + 0.35 * params.formation_progress)
-        thickness = max(2.0, params.event_horizon_thickness * base_radius)
-        ripple = 1.0 + params.ripple_amp * math.sin(elapsed_s * 6.0)
-        # draw several concentric strokes of decreasing alpha for depth
-        layers = 5
-        for i in range(layers):
-            frac = i / float(layers - 1)
-            r = horizon_r * ripple * (1.0 + frac * 0.28)
-            layer_alpha = A(inten * (0.9 - 0.7 * frac))
-            if layer_alpha <= 0:
+        # 4) Photon ring: a bright, doppler-asymmetric rim hugging the shadow -
+        # the crisp boundary, drawn as a short warm arc-gradient sweep rather
+        # than a uniform neon circle. Built from many small segments so one
+        # side is markedly hotter/brighter than the other.
+        rim_r = shadow_r * 1.04 * ripple
+        segs = 72
+        for i in range(segs):
+            ang = (i / segs) * 2.0 * math.pi
+            nx, ny = math.cos(ang), math.sin(ang)
+            beam = doppler(nx, ny)
+            a = A(inten * (0.30 + 0.70 * beam) * 0.9)
+            if a <= 0:
                 continue
-            # warm on the inner layers, cool on the outer -> dimensional depth
-            if frac < 0.5:
-                col = QColor(255, 160, 80, layer_alpha)
-            else:
-                col = QColor(150, 170, 255, layer_alpha)
-            pen = QPen(col)
-            pen.setWidthF(thickness * (1.0 - 0.5 * frac))
+            r, g, b = warm(0.7 + 0.3 * beam)
+            pen = QPen(QColor(r, g, b, a))
+            pen.setWidthF(max(1.2, base_radius * 0.018 * (0.6 + 0.8 * beam)))
+            pen.setCapStyle(Qt.RoundCap)
             painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
-            painter.save()
-            painter.translate(cx, cy)
-            painter.rotate(params.disk_rotation_deg)
-            painter.drawEllipse(QPointF(0.0, 0.0), r, r * (0.62 + 0.38 * params.formation_progress))
-            painter.restore()
+            x1 = cx + nx * rim_r
+            y1 = cy + ny * rim_r * (0.60 + 0.40 * prog)
+            ang2 = ((i + 1) / segs) * 2.0 * math.pi
+            x2 = cx + math.cos(ang2) * rim_r
+            y2 = cy + math.sin(ang2) * rim_r * (0.60 + 0.40 * prog)
+            painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
 
-        # 4) Photon ring: a bright thin rim right at the horizon edge.
-        rim_alpha = A(inten * 0.95)
-        if rim_alpha > 0:
-            pen = QPen(QColor(255, 225, 190, rim_alpha))
-            pen.setWidthF(max(1.5, thickness * 0.28))
-            painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
-            painter.drawEllipse(QPointF(cx, cy), horizon_r, horizon_r)
-
-        # 5) Singularity: pure-black core with a soft dense edge (no logo).
-        core_r = max(1.0, base_radius * 0.5 * params.core_radius_scale)
-        core = QRadialGradient(cx, cy, core_r)
+        # 5) Singularity: a deep, volumetric gravitational shadow - black at the
+        # centre, with a soft dense falloff so it reads as depth, not a flat
+        # disc. No text/outline/icon.
+        core = QRadialGradient(cx, cy, shadow_r * 1.18)
         core.setColorAt(0.0, QColor(0, 0, 0, A(1.0)))
-        core.setColorAt(0.82, QColor(0, 0, 0, A(1.0)))
-        core.setColorAt(1.0, QColor(8, 6, 14, 0))
+        core.setColorAt(0.80, QColor(0, 0, 0, A(1.0)))
+        core.setColorAt(0.93, QColor(4, 1, 2, A(0.82)))
+        core.setColorAt(1.0, QColor(10, 3, 4, 0))
         painter.setPen(Qt.NoPen)
         painter.setBrush(core)
-        painter.drawEllipse(QPointF(cx, cy), core_r, core_r)
+        painter.drawEllipse(QPointF(cx, cy), shadow_r * 1.18, shadow_r * 1.18)
