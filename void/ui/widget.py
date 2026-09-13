@@ -1,35 +1,44 @@
-"""Minimal circular V.O.I.D widget (PySide6).
+"""V.O.I.D's desktop presence (PySide6): a full-screen, centered Blackhole
+overlay that materializes only while V.O.I.D is active.
 
-A small, always-on-top, draggable orb sits on the desktop. Click it to open a
-compact panel: type a goal, watch V.O.I.D's steps stream in, and hit STOP at
-any time. The normal Windows desktop stays fully visible - this is deliberately
-not a big dashboard (that comes later).
+"The desktop is the interface. V.O.I.D is a presence within it." At rest
+there is NO UI at all. When the wake word fires (or PTT), a black hole
+forms at the CENTER of the primary display over the user's existing
+wallpaper: distortion -> particles fall inward -> compression -> singularity
+-> a thick, dimensional event horizon. It stays formed through
+LISTENING/PROCESSING/SPEAKING (the event horizon is never replaced by a thin
+line or a waveform), then dissolves back to nothing when the interaction
+ends. The wallpaper is never modified - this is a transparent overlay above
+it.
 
-The agent runs on a worker thread so the UI never freezes. High-risk actions
-raise a confirmation dialog on the UI thread before proceeding.
+VoidWidget takes its Assistant, and for the persistent app a VoiceStateBridge
+and VoiceController, as constructor arguments - it never constructs any of
+them itself. It is a pure OBSERVER of backend state: it authorizes nothing,
+executes nothing, and only mirrors the authoritative VoiceState into pixels
+via void.ui.orb's BlackholePresenter/BlackholeRenderer. RiskGate/KillSwitch
+remain the sole authorities.
 
-VoidWidget takes its Assistant (and, for the persistent app, a
-VoiceStateBridge) as constructor arguments - it never constructs an Assistant
-or a VoiceController itself. That composition is owned by whoever builds the
-widget: the standalone ``launch()`` below for ``python -m void ui``, or
-``void.runtime.app`` for the persistent desktop application. This keeps
-exactly one Assistant/VoiceController per process regardless of which entry
-point is used, and keeps the widget a pure observer of backend state.
+The overlay is click-through (transparent for mouse input) so it never
+obstructs the desktop; user controls (Stop/Rearm/Close) live in a small
+system-tray menu. PTT for development remains the VoiceController's hotkey,
+unchanged.
 
-NOTE: this module requires a display and PySide6, so it is validated by running
-it on the laptop, not in headless CI.
+NOTE: this module requires a display and PySide6, so it is validated by
+running it on the laptop, not in headless CI (the visual logic in
+void.ui.orb IS headless-testable).
 """
 from __future__ import annotations
 
 import sys
 import threading
+import time
 
 try:
-    from PySide6.QtCore import Qt, QObject, Signal, Slot, QThread, QPoint
-    from PySide6.QtGui import QColor, QPainter, QBrush, QFont
+    from PySide6.QtCore import Qt, QObject, Signal, Slot, QPoint, QTimer
+    from PySide6.QtGui import QPainter, QColor, QPen, QPixmap, QIcon
     from PySide6.QtWidgets import (
-        QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
-        QTextEdit, QPushButton, QLabel, QMessageBox,
+        QApplication, QWidget, QVBoxLayout, QLabel, QMessageBox,
+        QSystemTrayIcon, QMenu,
     )
 except ImportError as exc:  # pragma: no cover - UI optional
     raise ImportError(
@@ -37,10 +46,19 @@ except ImportError as exc:  # pragma: no cover - UI optional
     ) from exc
 
 from void.app import Assistant
+from void.ui.orb import (
+    BlackholePresenter, BlackholeRenderer, VisualMode, particle_field,
+)
+from void.voice.state import VoiceState
+
+_ANIM_INTERVAL_MS = 33   # ~30 FPS - smooth but restrained
+_BUBBLE_DURATION_MS = 3500
+_BUBBLE_MAX_WIDTH = 320
 
 
 class ConfirmBridge(QObject):
-    """Bridges a worker-thread confirmation request to a UI-thread dialog."""
+    """Bridges a worker-thread confirmation request to a UI-thread dialog
+    (used only by the standalone `python -m void ui` command)."""
     requested = Signal(str)
 
     def __init__(self):
@@ -49,7 +67,6 @@ class ConfirmBridge(QObject):
         self._event = threading.Event()
 
     def confirm(self, description: str) -> bool:
-        # Called on the worker thread; blocks until the UI answers.
         self._event.clear()
         self.requested.emit(description)
         self._event.wait()
@@ -61,131 +78,183 @@ class ConfirmBridge(QObject):
         self._event.set()
 
 
-class Worker(QObject):
-    event = Signal(str)
-    finished = Signal(str, str)  # status, result-or-error
+class _MessageBubble(QWidget):
+    """A tiny, temporary text bubble near the top-center - never a chat log."""
 
-    def __init__(self, assistant: Assistant, goal: str):
+    def __init__(self):
         super().__init__()
-        self.assistant = assistant
-        self.goal = goal
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+            | Qt.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._label = QLabel(self)
+        self._label.setWordWrap(True)
+        self._label.setMaximumWidth(_BUBBLE_MAX_WIDTH)
+        self._label.setAlignment(Qt.AlignCenter)
+        self._label.setStyleSheet(
+            "color: #f0f0f5; background: rgba(14,14,22,205);"
+            "border-radius: 10px; padding: 9px 13px; font-size: 13px;"
+        )
+        layout.addWidget(self._label)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.hide)
 
-    @Slot()
-    def run(self):
-        self.assistant.on_event = lambda m: self.event.emit(m)
-        result = self.assistant.run(self.goal)
-        self.finished.emit(result.status,
-                           result.result or result.task.error or "")
+    def show_text(self, text: str, center_x: int, top_y: int,
+                  duration_ms: int = _BUBBLE_DURATION_MS) -> None:
+        if not text:
+            return
+        self._label.setText(text)
+        self.adjustSize()
+        self.move(center_x - self.width() // 2, top_y)
+        self.show()
+        self._hide_timer.start(duration_ms)
 
 
 class VoidWidget(QWidget):
-    # Emitted when the widget is closing (user closed the window). The
-    # runtime coordinator connects to this to drive the shutdown funnel;
-    # this signal carries no authority of its own - it is purely a lifecycle
-    # notification.
+    # Emitted when V.O.I.D should shut down (tray "Close"). Carries no
+    # authority - purely a lifecycle notification the runtime funnels.
     closing = Signal()
 
     def __init__(self, assistant: Assistant, confirm_bridge=None,
-                 voice_bridge=None):
-        """``assistant`` is required and constructed by the caller (never by
-        this widget). ``confirm_bridge`` (a ConfirmBridge, optional) wires a
-        synchronous confirmation dialog if the caller's Assistant was built
-        with one as its confirm_fn. ``voice_bridge`` (a VoiceStateBridge,
-        optional) is accepted so the runtime coordinator can inject it now;
-        this step does not yet render voice state (no black-hole visuals
-        yet) - it's wired for a later visual-design step to subscribe to."""
+                 voice_bridge=None, voice_controller=None, *, preview: bool = False):
         super().__init__()
-        self._drag_pos: QPoint | None = None
-        self._thread: QThread | None = None
-        self._worker: Worker | None = None
-
         self.assistant = assistant
         self.confirm_bridge = confirm_bridge
         if self.confirm_bridge is not None:
             self.confirm_bridge.requested.connect(self._on_confirm_requested)
         self.voice_bridge = voice_bridge
+        self.voice_controller = voice_controller
 
+        # Full-screen, frameless, always-on-top, click-through overlay.
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+            | Qt.WindowDoesNotAcceptFocus
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.resize(340, 300)
-        self._build()
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        # never obstruct the desktop (click-through); scoped enum for PySide6 6.x
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._apply_primary_geometry()
 
-    # --- layout --------------------------------------------------------
+        self._renderer = BlackholeRenderer()
+        self._presenter = BlackholePresenter()
+        self._now = time.monotonic
+        self._start_time = self._now()
+        self._bubble = _MessageBubble()
+        self._tray = None
 
-    def _build(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
+        if self.voice_bridge is not None:
+            self.voice_bridge.stateChanged.connect(self._on_voice_state_changed)
+            self.voice_bridge.transcriptReceived.connect(self._on_voice_text)
+            self.voice_bridge.messageReceived.connect(self._on_voice_text)
 
-        self.orb = QLabel("V")
-        self.orb.setAlignment(Qt.AlignCenter)
-        self.orb.setFixedSize(56, 56)
-        self.orb.setFont(QFont("Segoe UI", 20, QFont.Bold))
-        self.orb.setStyleSheet(
-            "color: white; background: rgba(30,30,40,220);"
-            "border-radius: 28px;"
-        )
-        root.addWidget(self.orb, alignment=Qt.AlignHCenter)
+        if preview:
+            # `python -m void ui` (no voice): show a formed blackhole so the
+            # command remains a useful visual preview.
+            self._presenter.observe_voice_state(VoiceState.LISTENING, self._now())
 
-        self.input = QLineEdit()
-        self.input.setPlaceholderText("Tell V.O.I.D what to do...")
-        self.input.returnPressed.connect(self._on_submit)
-        root.addWidget(self.input)
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(_ANIM_INTERVAL_MS)
+        self._anim_timer.timeout.connect(self._on_tick)
+        self._anim_timer.start()
 
-        self.log = QTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setStyleSheet("background: rgba(20,20,28,235); color: #ddd;")
-        root.addWidget(self.log)
+    # --- geometry ---------------------------------------------------------
+    def _apply_primary_geometry(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            self.setGeometry(screen.geometry())
 
-        row = QHBoxLayout()
-        self.stop_btn = QPushButton("STOP")
-        self.stop_btn.setStyleSheet(
-            "background:#a11; color:white; font-weight:bold; padding:6px;")
-        self.stop_btn.clicked.connect(self._on_stop)
-        row.addWidget(self.stop_btn)
-        close_btn = QPushButton("Hide")
-        close_btn.clicked.connect(self.hide)
-        row.addWidget(close_btn)
-        root.addLayout(row)
-
-    # --- interactions --------------------------------------------------
-
-    def _append(self, text: str):
-        self.log.append(text)
-
-    def _on_submit(self):
-        goal = self.input.text().strip()
-        if not goal or self._thread is not None:
+    # --- system tray (controls for a click-through overlay) ---------------
+    def install_tray(self) -> None:
+        """Create the tray icon + menu. Called by the persistent runtime
+        after a QApplication exists. Safe/no-op if tray is unavailable."""
+        if self._tray is not None or not QSystemTrayIcon.isSystemTrayAvailable():
             return
-        if self.assistant.kill_switch.engaged:
-            self.assistant.clear_stop()
-        self.input.clear()
-        self._append(f"> {goal}")
+        self._tray = QSystemTrayIcon(self._make_tray_icon(), self)
+        self._tray.setToolTip("V.O.I.D")
+        menu = QMenu()
+        self._act_stop = menu.addAction("Stop", self._menu_stop)
+        self._act_rearm = menu.addAction("Rearm", self._menu_rearm)
+        menu.addSeparator()
+        menu.addAction("Close V.O.I.D", self._menu_close)
+        menu.aboutToShow.connect(self._sync_tray_menu)
+        self._tray.setContextMenu(menu)
+        self._tray.show()
 
-        self._thread = QThread()
-        self._worker = Worker(self.assistant, goal)
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.event.connect(self._append)
-        self._worker.finished.connect(self._on_finished)
-        self._thread.start()
+    def _sync_tray_menu(self) -> None:
+        engaged = bool(getattr(self.assistant.kill_switch, "engaged", False))
+        self._act_stop.setVisible(not engaged)
+        self._act_rearm.setVisible(engaged)
 
-    @Slot(str, str)
-    def _on_finished(self, status: str, message: str):
-        self._append(f"[{status.upper()}] {message}")
-        if self._thread:
-            self._thread.quit()
-            self._thread.wait()
-        self._thread = None
-        self._worker = None
+    def _make_tray_icon(self) -> QIcon:
+        pm = QPixmap(32, 32)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(QPen(QColor(255, 160, 80, 230), 3))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(6, 6, 20, 20)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 255))
+        p.drawEllipse(11, 11, 10, 10)
+        p.end()
+        return QIcon(pm)
 
-    def _on_stop(self):
-        self.assistant.stop(reason="UI STOP button")
-        self._append("EMERGENCY STOP engaged.")
+    def _menu_stop(self) -> None:
+        self.assistant.stop(reason="tray menu")
+
+    def _menu_rearm(self) -> None:
+        self.assistant.clear_stop()
+
+    def _menu_close(self) -> None:
+        self.closing.emit()
+
+    # --- state observation (read-only mirror of backend truth) ------------
+    @Slot(str)
+    def _on_voice_state_changed(self, state: str) -> None:
+        self._presenter.observe_voice_state(state, self._now())
+
+    def on_killswitch_state(self, engaged: bool) -> None:
+        """Called by the runtime coordinator's killswitch-watch timer. A
+        read-only observer: only mirrors the flag into the presenter; never
+        engages/resets/approves/denies - that authority stays with
+        Assistant/KillSwitch."""
+        self._presenter.observe_killswitch(engaged, self._now())
+
+    # --- temporary message bubble -----------------------------------------
+    def show_message(self, text: str) -> None:
+        geo = self.geometry()
+        self._bubble.show_text(text, geo.center().x(), geo.top() + max(60, geo.height() // 8))
 
     @Slot(str)
-    def _on_confirm_requested(self, description: str):
+    def _on_voice_text(self, text: str) -> None:
+        self.show_message(text)
+
+    # --- animation + painting ---------------------------------------------
+    def _on_tick(self) -> None:
+        self._presenter.tick(self._now())
+        self.update()
+
+    def paintEvent(self, event):
+        if not self._presenter.is_visible():
+            return   # nothing painted -> fully transparent -> desktop normal
+        painter = QPainter(self)
+        try:
+            now = self._now()
+            elapsed = now - self._start_time
+            params = self._presenter.params(now)
+            particles = particle_field(params, elapsed)
+            self._renderer.paint(painter, self.rect(), params, particles, elapsed)
+        finally:
+            painter.end()
+
+    @Slot(str)
+    def _on_confirm_requested(self, description: str) -> None:
         reply = QMessageBox.question(
             self, "V.O.I.D needs authorization",
             f"Allow this action?\n\n{description}",
@@ -193,37 +262,29 @@ class VoidWidget(QWidget):
         )
         self.confirm_bridge.resolve(reply == QMessageBox.Yes)
 
-    # --- dragging (frameless) -----------------------------------------
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._drag_pos = event.globalPosition().toPoint() - \
-                self.frameGeometry().topLeft()
-
-    def mouseMoveEvent(self, event):
-        if self._drag_pos is not None and event.buttons() & Qt.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_pos)
-
-    # --- lifecycle -------------------------------------------------------
+    # --- lifecycle -----------------------------------------------------
+    def showEvent(self, event):
+        # The persistent runtime calls widget.show() once at startup; install
+        # the tray then (a QApplication exists by now). Idempotent.
+        self.install_tray()
+        super().showEvent(event)
 
     def closeEvent(self, event):
-        # Notify only; this widget decides nothing about shutdown order -
-        # a runtime coordinator (or, for the standalone `ui` command, no one)
-        # decides what closing means. The window still closes either way.
         self.closing.emit()
+        if self._tray is not None:
+            self._tray.hide()
         super().closeEvent(event)
 
 
 def launch() -> int:
-    """Standalone entry point for `python -m void ui` - unchanged behavior:
-    one Assistant, a synchronous confirmation dialog, no voice. Builds the
-    Assistant/ConfirmBridge here (not inside VoidWidget) and injects them,
-    since the widget no longer constructs its own Assistant."""
+    """Standalone entry point for `python -m void ui` - one Assistant, a
+    synchronous confirmation dialog, no voice. Shows a formed blackhole
+    preview (there is no wake word here to trigger formation)."""
     app = QApplication.instance() or QApplication(sys.argv)
     confirm_bridge = ConfirmBridge()
     assistant = Assistant(confirm_fn=confirm_bridge.confirm)
-    widget = VoidWidget(assistant, confirm_bridge=confirm_bridge)
-    widget.show()
+    widget = VoidWidget(assistant, confirm_bridge=confirm_bridge, preview=True)
+    widget.show()   # showEvent installs the tray
     return app.exec()
 
 

@@ -458,6 +458,31 @@ def cmd_voice() -> int:
     return 0
 
 
+def cmd_autostart(action: str) -> int:
+    """Manage silent login autostart of the persistent app (HKCU Run key,
+    no admin/service/security change). 'install' makes V.O.I.D start at login
+    with no terminal; 'remove' undoes it; 'status' shows the current entry."""
+    from void.runtime import autostart
+
+    if action == "install":
+        pythonw = autostart.default_pythonw_path()
+        cmd = autostart.install()
+        print(f"Autostart installed. V.O.I.D will launch at login:\n  {cmd}")
+        if "pythonw.exe" not in pythonw.lower():
+            print("  NOTE: pythonw.exe was not found next to this interpreter, "
+                  "so a console window may briefly appear at login.")
+        print('  Say "Hey V.O.I.D." after the next login - no terminal needed.')
+        return 0
+    if action == "remove":
+        removed = autostart.remove()
+        print("Autostart removed." if removed else "Autostart was not installed.")
+        return 0
+    current = autostart.status()
+    print(f"Autostart: INSTALLED\n  {current}" if current
+          else "Autostart: not installed. Run 'python -m void autostart install'.")
+    return 0
+
+
 # --- argument parsing --------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -508,6 +533,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("voice", help="Launch the push-to-talk voice interface")
     sub.add_parser(
         "app", help="Launch the persistent desktop application (orb + voice)")
+    p_autostart = sub.add_parser(
+        "autostart", help="Manage silent login autostart of the persistent app")
+    p_autostart.add_argument("action", choices=["install", "remove", "status"])
 
     p_roots = sub.add_parser(
         "roots", help="Manage trusted filesystem roots (owner-only)")
@@ -531,8 +559,8 @@ def main(argv: list[str] | None = None) -> int:
     # Convenience: `python -m void "goal text"` with no subcommand -> run.
     known = {"run", "resume", "clarify", "approve", "deny", "set-key",
              "list-keys", "remove-key", "set-pin", "tasks", "stop",
-             "clear-stop", "ui", "voice", "app", "roots", "protect",
-             "-h", "--help"}
+             "clear-stop", "ui", "voice", "app", "autostart", "roots",
+             "protect", "-h", "--help"}
     if argv and argv[0] not in known:
         return cmd_run(" ".join(argv))
 
@@ -569,6 +597,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_voice()
     if args.command == "app":
         return cmd_app()
+    if args.command == "autostart":
+        return cmd_autostart(args.action)
     if args.command == "roots":
         return cmd_roots(args.action, args.path)
     if args.command == "protect":
