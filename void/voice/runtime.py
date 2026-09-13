@@ -271,7 +271,7 @@ class VoiceController:
             model = config.get("voice.wake_model_path", "") or ""
         except Exception:
             return None
-        if provider == "null" or (provider == "openwakeword" and model):
+        if provider == "null" or (provider in ("openwakeword", "whisper_gen3") and model):
             try:
                 return create_wake_detector(config)
             except Exception:

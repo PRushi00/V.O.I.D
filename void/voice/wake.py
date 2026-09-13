@@ -219,10 +219,24 @@ class OpenWakeWordDetector(WakeWordDetector):
 
 
 # --- provider registry + factory (mirrors create_tts_provider) ----------
+def _make_whisper_gen3(**kwargs) -> WakeWordDetector:
+    # Lazy import: whisper_gen3_wake imports from this module (avoid a circular
+    # import at load time), and its faster-whisper/onnxruntime deps stay off
+    # the import path until the provider is actually selected.
+    from void.voice.whisper_gen3_wake import WhisperGen3WakeDetector
+    return WhisperGen3WakeDetector(**kwargs)
+
+
 _PROVIDERS: dict[str, Callable[..., WakeWordDetector]] = {
     "openwakeword": OpenWakeWordDetector,
     "null": NullWakeDetector,
+    "whisper_gen3": _make_whisper_gen3,
 }
+
+# Conservative default for the Gen 3 (Whisper-encoder) detector - its score
+# scale differs from openWakeWord's, and 0.34 is the validated Exp02
+# operating point (owner-voice recall 22/23). See wakeword-training/docs/gen3.md.
+_DEFAULT_GEN3_THRESHOLD = 0.34
 
 
 def register_wake_provider(name: str, factory: Callable[..., WakeWordDetector]) -> None:
@@ -260,6 +274,12 @@ def create_wake_detector(config=None, *, provider: str | None = None,
         return factory(
             model_path=_cfg("voice.wake_model_path", "") or None,
             threshold=_cfg("voice.wake_threshold", _DEFAULT_THRESHOLD),
+            on_wake=on_wake,
+        )
+    if name == "whisper_gen3":
+        return factory(
+            classifier_path=_cfg("voice.wake_model_path", "") or None,
+            threshold=_cfg("voice.wake_threshold", _DEFAULT_GEN3_THRESHOLD),
             on_wake=on_wake,
         )
     return factory(on_wake=on_wake)
