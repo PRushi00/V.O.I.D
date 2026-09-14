@@ -196,7 +196,7 @@ class ManualWorker:
 
 def _fast_policy(**kw):
     base = dict(no_speech_s=0.3, silence_s=0.09, max_capture_s=1.0,
-                rearm_delay_ms=0, energy_threshold=1000.0)
+                rearm_delay_ms=0, energy_threshold=1000.0, lead_grace_s=0.0)
     base.update(kw)
     return _WakePolicy(**base)
 
@@ -483,6 +483,34 @@ def test_endpointer_holds_no_audio_buffer():
         assert not isinstance(getattr(ep, name), (bytes, bytearray, list))
 
 
+def test_lead_grace_prevents_premature_endpoint_after_wake():
+    # Regression for "wake fires, Blackhole activates, then nothing": the wake
+    # tail plus the natural pause before the command must NOT be finalized as a
+    # complete-then-silent utterance. During lead_grace_s, silence cannot end
+    # the capture; after it, normal endpointing resumes.
+    fired = []
+    ep = _WakeEndpointer(
+        _fast_policy(lead_grace_s=0.3, silence_s=0.09, no_speech_s=5.0,
+                     max_capture_s=99.0), fired.append)
+    ep(LOUD); ep(LOUD)                       # 0.06 s "speech" (stand-in for wake tail)
+    for _ in range(3):                       # 0.09 s trailing silence >= silence_s
+        ep(SILENCE)
+    assert fired == []                       # ... but inside grace -> suppressed
+    for _ in range(8):                       # cross the 0.3 s grace boundary
+        ep(SILENCE)
+    assert fired == ["silence"]              # after grace, endpointing resumes
+
+
+def test_lead_grace_zero_is_legacy_endpointing():
+    fired = []
+    ep = _WakeEndpointer(_fast_policy(lead_grace_s=0.0, silence_s=0.09),
+                         fired.append)
+    ep(LOUD)
+    for _ in range(4):
+        ep(SILENCE)
+    assert fired == ["silence"]              # no grace -> immediate silence endpoint
+
+
 # --- 18 / 19: PTT still works; PTT + wake never overlap ----------
 
 def test_ptt_path_still_flows_through_the_broker():
@@ -672,6 +700,7 @@ def test_wake_policy_from_config_defaults_and_validation():
     p = _WakePolicy.from_config(_StubConfig({}))
     assert (p.no_speech_s, p.silence_s, p.max_capture_s) == (4.0, 0.8, 15.0)
     assert p.rearm_delay_ms == 500 and p.energy_threshold == 500.0
+    assert p.lead_grace_s == 0.4
     bad = _WakePolicy.from_config(_StubConfig({
         "voice.wake_no_speech_timeout": -3,
         "voice.wake_silence_timeout": "nonsense",
@@ -694,15 +723,28 @@ def test_rms_int16_is_bounded_and_crash_free():
 # --- 28 / 29: no raw audio persisted or logged ---------------
 
 def test_integration_code_never_persists_or_logs_raw_audio():
+    # Persistence of raw audio is forbidden anywhere in the integration code.
     src = (inspect.getsource(runtime_mod)
            + inspect.getsource(adapters_mod.BrokerCapture)
            + inspect.getsource(adapters_mod.BrokerCapture.open)
            + inspect.getsource(adapters_mod.BrokerCapture.stop))
-    for forbidden in ("logging", "getLogger", "wave.", "soundfile", ".tofile(",
+    for forbidden in ("wave.", "soundfile", ".tofile(",
                       "pickle.", "json.dump", "np.save", "np.savez",
                       'open("', "open('", ", 'w')", ', "w")',
                       "write_bytes", "write_text"):
         assert forbidden not in src, f"integration code must not use {forbidden!r}"
+
+    # Lifecycle logging is allowed in the CONTROL code (stage markers, counts,
+    # reasons - never audio), but the units that actually handle raw audio bytes
+    # must never log at all, so no audio payload can ever be logged. This is a
+    # stronger, targeted guarantee than a blanket "no logging" heuristic.
+    audio_handling = (
+        inspect.getsource(adapters_mod.BrokerCapture)
+        + inspect.getsource(runtime_mod._WakeEndpointer)
+        + inspect.getsource(runtime_mod._rms_int16))
+    for forbidden in ("logging", "getLogger", "_log", "print("):
+        assert forbidden not in audio_handling, (
+            f"raw-audio-handling code must not use {forbidden!r}")
 
 
 # --- existing behaviour still intact -------------------------

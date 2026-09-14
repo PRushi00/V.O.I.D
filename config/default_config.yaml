@@ -98,6 +98,9 @@ voice:
   wake_max_capture_seconds: 15.0 # hard cap on one wake-initiated capture
   wake_rearm_delay_ms: 500       # settle time (post TTS/command) before re-arming wake
   wake_energy_threshold: 500     # int16 RMS at/above which a frame counts as speech
+  wake_lead_grace_s: 0.4         # after wake, keep the command window open this long before
+                                 # silence/no-speech can end it (so the wake tail + the pause
+                                 # before the command are never mistaken for a finished utterance)
   # Audio-capture broker (Phase 9C-2: the shared single-microphone transport
   # only - NOT wired to STT/wake/session yet, and nothing opens the mic until a
   # broker is explicitly started). One physical owner; many consumers receive

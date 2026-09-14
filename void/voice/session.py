@@ -23,12 +23,17 @@ Authoritative invariants (Phase 9B step 3):
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from typing import Callable
 
 from void.voice.adapters import STTError, TTSError
 from void.voice.state import VoiceCommand, VoiceEvent, VoiceState, reduce_voice
+
+# Lifecycle diagnostics -> local diagnostic log. Privacy: only stage names and
+# sizes/flags; NEVER the audio, the transcript text, or the response text.
+_log = logging.getLogger("void.voice.session")
 
 
 class VoiceSession:
@@ -228,17 +233,26 @@ class VoiceSession:
     def _run_stt(self, gen: int) -> None:
         audio = self._pending_audio
         try:
+            n = len(audio)
+        except Exception:
+            n = -1
+        _log.info("STT_STARTED (audio_samples=%s)", n)
+        try:
             transcript = self._stt.transcribe(audio)
-        except STTError:
+        except STTError as exc:
+            _log.warning("STT_FAILED: %s", type(exc).__name__)
             self._apply(VoiceEvent.STT_FAILED, gen=gen)
             return
-        except Exception:
+        except Exception as exc:
+            _log.warning("STT_FAILED: %s", type(exc).__name__)
             self._apply(VoiceEvent.STT_FAILED, gen=gen)
             return
         transcript = (transcript or "").strip()
         if not transcript:
+            _log.info("STT_DONE empty=True (no command recognized)")
             self._apply(VoiceEvent.STT_EMPTY, gen=gen)
         else:
+            _log.info("STT_DONE empty=False (len=%d chars)", len(transcript))
             self._apply(VoiceEvent.STT_OK, gen=gen, text=transcript)
 
     def _run_dispatch(self, gen: int) -> None:
@@ -246,9 +260,11 @@ class VoiceSession:
         # One-way handoff to the EXISTING execution pipeline. The response is
         # treated as opaque finalized output; task/RiskGate/confirmation state
         # is NOT inspected here.
+        _log.info("DISPATCH_STARTED (transcript_len=%d)", len(transcript))
         try:
             result = self._assistant.run(transcript)
         except Exception as exc:
+            _log.warning("DISPATCH_FAILED: %s: %s", type(exc).__name__, exc)
             self._msg(f"(voice) dispatch failed: {exc}")
             self._apply(VoiceEvent.DISPATCH_FAILED, gen=gen)
             return
@@ -256,14 +272,19 @@ class VoiceSession:
         text = getattr(result, "result", None) or ""
         self._pending_response = text
         if self._speak_response and text:
+            _log.info("DISPATCH_OK -> SPEAK (response_len=%d)", len(text))
             self._apply(VoiceEvent.DISPATCH_OK_SPEAK, gen=gen)
         else:
+            _log.info("DISPATCH_OK -> silent (has_text=%s speak=%s)",
+                      bool(text), self._speak_response)
             self._apply(VoiceEvent.DISPATCH_OK_SILENT, gen=gen)
 
     def _run_speak(self, gen: int) -> None:
+        _log.info("SPEAK_STARTED")
         try:
             self._tts.speak(self._pending_response)
         except TTSError as exc:
+            _log.warning("SPEAK_FAILED: %s", type(exc).__name__)
             self._msg(f"(voice) could not speak the response: {exc}")
             self._apply(VoiceEvent.SPEAK_FAILED, gen=gen)
 

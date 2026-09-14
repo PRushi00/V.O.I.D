@@ -17,10 +17,17 @@ dependency error surfaces at start()/first use with an actionable message.
 from __future__ import annotations
 
 import array
+import logging
 import queue
 import threading
 from dataclasses import dataclass
 from typing import Callable
+
+# Lifecycle diagnostics: markers land in the local diagnostic log (see
+# void.ui.singularity_overlay._install_background_logging) so a "nothing happens
+# after wake" report can be pinned to an exact stage. Privacy: NEVER logs raw
+# audio or transcript text - only stage, counts, durations, and reasons.
+_log = logging.getLogger("void.voice.runtime")
 
 from void.voice.adapters import (
     BrokerCapture, FasterWhisperSTT, PTTActivation,
@@ -92,6 +99,13 @@ class _WakePolicy:
     max_capture_s: float = 15.0
     rearm_delay_ms: int = 500
     energy_threshold: float = 500.0
+    # Lead-in grace: for this long after a wake-initiated capture opens, an
+    # utterance may NOT be finalized by the silence/no-speech rules (the hard
+    # max_capture cap still applies). This guarantees the command window stays
+    # open across the moment right after the wake word, so the wake phrase's
+    # tail plus the natural pause before the command can never be mistaken for a
+    # complete-then-silent utterance and end capture before the command begins.
+    lead_grace_s: float = 0.4
 
     @classmethod
     def from_config(cls, config) -> "_WakePolicy":
@@ -107,6 +121,7 @@ class _WakePolicy:
             max_capture_s=_num("voice.wake_max_capture_seconds", 15.0, 1.0),
             rearm_delay_ms=int(_num("voice.wake_rearm_delay_ms", 500.0, 0.0)),
             energy_threshold=_num("voice.wake_energy_threshold", 500.0, 0.0),
+            lead_grace_s=_num("voice.wake_lead_grace_s", 0.4, 0.0),
         )
 
 
@@ -161,9 +176,13 @@ class _WakeEndpointer:
         elif self._speech:
             self._trailing_silence += secs
 
-        if not self._speech and self._elapsed >= self._p.no_speech_s:
+        # During the lead-in grace only the hard max cap may end the capture, so
+        # the command window reliably survives the wake tail + the pause before
+        # the user starts the command.
+        grace_ok = self._elapsed >= self._p.lead_grace_s
+        if grace_ok and not self._speech and self._elapsed >= self._p.no_speech_s:
             self._fire("no_speech")
-        elif self._speech and self._trailing_silence >= self._p.silence_s:
+        elif grace_ok and self._speech and self._trailing_silence >= self._p.silence_s:
             self._fire("silence")
         elif self._elapsed >= self._p.max_capture_s:
             self._fire("max_duration")
@@ -465,9 +484,12 @@ class VoiceController:
         with self._wake_lock:
             if (self._wake_capture_active
                     or self._session.state != VoiceState.IDLE):
+                _log.info("WAKE ignored (capture_active=%s state=%s)",
+                          self._wake_capture_active, self._session.state)
                 return                       # stale / overlapping wake -> ignore
             self._wake_capture_active = True
             self._wake_gen = self._session.generation   # provisional; re-bound post-press
+        _log.info("WAKE_DETECTED accepted; beginning command capture")
         job = self._begin_wake_capture
         if self._worker is not None:
             self._worker.submit(job)         # off the pump thread
@@ -487,6 +509,7 @@ class VoiceController:
         if self._session.state != VoiceState.LISTENING:
             with self._wake_lock:            # e.g. KillSwitch coerced the press
                 self._wake_capture_active = False
+            _log.info("COMMAND_CAPTURE aborted (state=%s)", self._session.state)
             return
         endpointer = _WakeEndpointer(self._wake_policy, self._wake_finalize)
         with self._wake_lock:
@@ -494,7 +517,17 @@ class VoiceController:
             # so a later barge-in / killswitch / shutdown marks the finalize stale
             self._wake_gen = self._session.generation
             self._endpointer = endpointer
+        # Flush any residual wake-phrase audio queued during disarm/press so the
+        # endpointer starts on fresh command-window frames (the wake tail must
+        # not seed speech detection). Bounded; off the broker pump thread.
+        try:
+            self._broker.drain(timeout=0.1)
+        except Exception:
+            pass
         self._broker.subscribe(endpointer)
+        _log.info("COMMAND_CAPTURE_STARTED (listening for command; grace=%.2fs "
+                  "no_speech=%.1fs silence=%.2fs)", self._wake_policy.lead_grace_s,
+                  self._wake_policy.no_speech_s, self._wake_policy.silence_s)
 
     def _wake_finalize(self, reason: str) -> None:
         """Endpointer callback (broker pump thread). End the wake capture the
@@ -508,6 +541,7 @@ class VoiceController:
             stale = self._session.generation != self._wake_gen
         if endpointer is not None:
             self._safe_unsub(endpointer)
+        _log.info("COMMAND_ENDPOINT reason=%s stale=%s", reason, stale)
         if stale:
             return                           # a newer session owns the mic now
         self.on_ptt_release()                # -> worker: finalize + STT + dispatch + speak
