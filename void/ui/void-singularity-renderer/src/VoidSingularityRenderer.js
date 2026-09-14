@@ -103,6 +103,9 @@
       // black hole + plasma with real alpha (no environment), so the real
       // wallpaper shows through. 0 keeps the original opaque demo behavior.
       u_transparent:    { value: transparent ? 1 : 0 },
+      // Plasma-removal test knob (transparent overlay only). Defaults to full
+      // emission; host may set cfg.emission = 0 to show the shadow alone.
+      u_emission:       { value: (this.cfg.emission == null ? 1 : this.cfg.emission) },
       u_useTex:         { value: 0 },
       u_tex:            { value: null },
       u_texAspect:      { value: 1 }
@@ -277,6 +280,7 @@
     u.u_plasma.value = cfg.plasma;
     u.u_bhScale.value = cfg.bhScale;
     u.u_interactionOn.value = cfg.interactionOn === false ? 0 : 1;
+    u.u_emission.value = (cfg.emission == null ? 1 : cfg.emission);   // live-tunable via setConfig
     if (this.bloomPass) this.bloomPass.strength = cfg.bloom * (0.10 + 0.95 * this.formation);
 
     if (this.composer) this.composer.render(); else this.renderer.render(this.scene, this.camera);

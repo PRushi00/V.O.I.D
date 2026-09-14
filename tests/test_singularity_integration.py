@@ -268,6 +268,23 @@ def test_approved_baseline_config_is_untouched():
     assert re.search(r"hiddenMode:\s*'wallpaper'", js)
 
 
+def test_emission_gate_exists_and_is_wired():
+    # Reversible plasma-removal knob: the shader gates the whole emissive term
+    # by u_emission, the renderer wires it from cfg.emission (defaulting to full
+    # emission), and the host exposes an EMISSION constant it passes through.
+    # These assertions hold for BOTH the plasma (EMISSION=1.0) and plasma-free
+    # (EMISSION=0.0) versions, so they survive an A/B revert.
+    js = _SHADERS_JS.read_text(encoding="utf-8")
+    assert "uniform float u_emission;" in js
+    assert "emissive *= u_emission;" in js
+    renderer = _RENDERER_JS.read_text(encoding="utf-8")
+    assert "u_emission" in renderer
+    assert "cfg.emission" in renderer
+    host = _HOST_JS.read_text(encoding="utf-8")
+    assert re.search(r"EMISSION\s*=\s*[0-9.]+", host)
+    assert "emission: EMISSION" in host
+
+
 def test_host_page_uses_transparent_mode_with_no_wallpaper():
     js = _HOST_JS.read_text(encoding="utf-8")
     assert "hiddenMode: 'transparent'" in js

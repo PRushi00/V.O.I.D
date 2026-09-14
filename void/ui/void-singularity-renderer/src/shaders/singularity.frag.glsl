@@ -13,6 +13,7 @@ uniform float u_distortStrength, u_distortRadius, u_envInteraction;
 uniform float u_rotation, u_turbulence, u_plasma, u_bhScale;
 uniform float u_interactionOn, u_useTex, u_texAspect;
 uniform float u_transparent;   // 0 = opaque demo (env shown); 1 = transparent overlay (effect only)
+uniform float u_emission;       // 1.0 = full plasma/accretion emission; 0.0 = shadow only (test)
 uniform sampler2D u_tex;
 
 const float PI=3.14159265;
@@ -233,6 +234,10 @@ void main(){
   col += sysC; emissive += sysC;
 
   if(u_transparent > 0.5){
+    // Plasma-removal test knob: 1.0 keeps the full accretion emission; 0.0
+    // zeroes ALL self-emission (disk, photon ring, edge/system glow), leaving
+    // only the black-hole shadow silhouette over the desktop.
+    emissive *= u_emission;
     // Effect-only composite over the transparent desktop: RGB is warm plasma
     // (black inside the horizon); alpha carries the horizon occlusion + plasma
     // luminance so the real wallpaper shows through everywhere the hole is not.

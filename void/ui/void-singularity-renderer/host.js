@@ -24,6 +24,15 @@
   // (src/config.js).
   var PLASMA = 0.35;
 
+  // --- Plasma-removal A/B test -------------------------------------------
+  // 1.0 = the current plasma version (A).
+  // 0.0 = plasma-free version (B): removes ALL self-emission (accretion disk,
+  //       photon ring, edge glow, system glow) so only the black-hole shadow
+  //       silhouette remains over the real wallpaper. To revert to the plasma
+  //       version, set EMISSION back to 1.0 (the renderer also defaults to 1.0
+  //       when this is omitted, so the change is fully reversible).
+  var EMISSION = 0.0;
+
   var canvas = document.getElementById('gl');
   var renderer = null;
   var initError = '';
@@ -60,7 +69,7 @@
       hiddenMode: 'transparent',          // clears to alpha 0 when HIDDEN
       // No environment image is loaded: we never paint a starfield over the
       // real desktop; only the black hole itself is drawn.
-      config: { plasma: PLASMA, bloom: 0.0 }
+      config: { plasma: PLASMA, bloom: 0.0, emission: EMISSION }
     });
     renderer.setState('HIDDEN');
   } catch (e) {
