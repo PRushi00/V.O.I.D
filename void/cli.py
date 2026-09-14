@@ -402,6 +402,23 @@ def cmd_app() -> int:
     return run_app()
 
 
+def cmd_singularity() -> int:
+    """Launch the persistent desktop app with the WebGL Blackhole overlay
+    (void-singularity-renderer in a transparent, click-through QWebEngineView)
+    instead of the default QPainter orb. Same runtime, same single Assistant /
+    VoiceController / mic owner - only the desktop presence surface differs.
+    Opt-in so the WebGL path can be validated on the real display before it
+    ever becomes the default; the QPainter orb (`python -m void app`) remains
+    the rollback."""
+    try:
+        from void.ui.singularity_overlay import launch
+    except Exception as exc:
+        print(f"Could not load the WebGL overlay: {exc}\n"
+              f"Make sure PySide6 with QtWebEngine is installed: pip install PySide6")
+        return 1
+    return launch()
+
+
 def cmd_voice() -> int:
     """Launch the push-to-talk voice interface.
 
@@ -533,6 +550,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("voice", help="Launch the push-to-talk voice interface")
     sub.add_parser(
         "app", help="Launch the persistent desktop application (orb + voice)")
+    sub.add_parser(
+        "singularity",
+        help="Launch the persistent app with the WebGL Blackhole overlay (opt-in)")
     p_autostart = sub.add_parser(
         "autostart", help="Manage silent login autostart of the persistent app")
     p_autostart.add_argument("action", choices=["install", "remove", "status"])
@@ -559,8 +579,8 @@ def main(argv: list[str] | None = None) -> int:
     # Convenience: `python -m void "goal text"` with no subcommand -> run.
     known = {"run", "resume", "clarify", "approve", "deny", "set-key",
              "list-keys", "remove-key", "set-pin", "tasks", "stop",
-             "clear-stop", "ui", "voice", "app", "autostart", "roots",
-             "protect", "-h", "--help"}
+             "clear-stop", "ui", "voice", "app", "singularity", "autostart",
+             "roots", "protect", "-h", "--help"}
     if argv and argv[0] not in known:
         return cmd_run(" ".join(argv))
 
@@ -597,6 +617,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_voice()
     if args.command == "app":
         return cmd_app()
+    if args.command == "singularity":
+        return cmd_singularity()
     if args.command == "autostart":
         return cmd_autostart(args.action)
     if args.command == "roots":

@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>V.O.I.D Singularity — production overlay host</title>
+<!-- Strict offline policy: the only resources this page may load are the
+     same-origin vendored three.min.js and the renderer's own src/ files.
+     No network, no remote scripts, no inline/eval, no connect/img/font from
+     anywhere. -->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<style>
+  html,body{height:100%;margin:0;background:transparent;overflow:hidden}
+  /* The canvas fills the transparent overlay; the real Windows desktop shows
+     through wherever the shader's alpha is 0 (i.e. everywhere the black hole
+     is not). */
+  #gl{position:fixed;inset:0;width:100%;height:100%;display:block;background:transparent}
+</style>
+</head>
+<body>
+  <canvas id="gl"></canvas>
+
+  <!-- ============ vendored dependency (OFFLINE) ============
+       three r128, vendored locally in ./vendor. The production runtime never
+       touches a remote server. Postprocessing/bloom addons are intentionally
+       NOT vendored: bloom is off in the transparent overlay and the renderer
+       degrades gracefully when the composer addons are absent. -->
+  <script src="vendor/three.min.js"></script>
+
+  <!-- ============ the approved renderer package (unchanged appearance) ============ -->
+  <script src="src/config.js"></script>
+  <script src="src/shaders.js"></script>
+  <script src="src/VoidSingularityRenderer.js"></script>
+
+  <!-- ============ host wiring (the V.O.I.D overlay page) ============
+       Loaded as an external file (not inline) so the strict CSP above can
+       forbid inline scripts. host.js exposes exactly four presentation
+       commands on window.__void and installs NO JS-to-Python bridge; the
+       Python overlay drives this page one-way via page().runJavaScript(...). -->
+  <script src="host.js"></script>
+</body>
+</html>

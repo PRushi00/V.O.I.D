@@ -1,0 +1,20 @@
+{
+  "name": "void-singularity-renderer",
+  "version": "1.0.0",
+  "description": "Standalone real-time WebGL renderer for the V.O.I.D desktop black-hole formation effect. Visual prototype only — no business logic.",
+  "private": true,
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "npx --yes serve -l 8080 .",
+    "serve:python": "python -m http.server 8080",
+    "vendor": "npm install"
+  },
+  "dependencies": {
+    "three": "0.128.0"
+  },
+  "notes": {
+    "runtime": "Pure browser + WebGL. No bundler, no backend, no build step required.",
+    "three": "The demo loads three@0.128.0 + its postprocessing addons from a CDN. Run `npm install` to vendor them into node_modules and repoint the <script> tags in index.html for offline use.",
+    "excluded": "No AI, voice, RiskGate, KillSwitch, filesystem, memory, device control, auth, telemetry, analytics, or networking of any kind."
+  }
+}

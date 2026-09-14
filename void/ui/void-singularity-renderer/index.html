@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>V.O.I.D Singularity — Renderer Demo</title>
+<style>
+  html,body{height:100%;margin:0;background:#05070c;overflow:hidden;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  #gl{position:fixed;inset:0;width:100%;height:100%;display:block}
+
+  /* --- review harness (NOT part of the renderer; here only so a reviewer
+         can exercise the public API by hand). --- */
+  #harness{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);
+    z-index:10;display:flex;flex-wrap:wrap;gap:6px;align-items:center;
+    padding:10px 12px;border-radius:12px;
+    background:rgba(12,15,22,0.72);backdrop-filter:blur(14px);
+    border:1px solid rgba(150,170,200,0.14);
+    box-shadow:0 16px 40px rgba(0,0,0,0.5);max-width:94vw}
+  #harness .lbl{color:#5b6478;font-size:10px;letter-spacing:.14em;
+    text-transform:uppercase;margin-right:2px}
+  #harness button{appearance:none;cursor:pointer;color:#8a93a6;
+    background:rgba(255,255,255,0.03);border:1px solid rgba(150,170,200,0.16);
+    border-radius:8px;padding:7px 10px;font:inherit;font-size:10px;
+    letter-spacing:.06em;text-transform:uppercase;transition:all .15s}
+  #harness button:hover{color:#e8ecf3;border-color:rgba(255,138,61,0.5)}
+  #harness button.on{color:#1a1206;font-weight:600;border-color:#ff8a3d;
+    background:linear-gradient(180deg,#ffd27a,#ff8a3d)}
+  #harness .sep{width:1px;height:22px;background:rgba(150,170,200,0.16);margin:0 4px}
+  #harness .audio{display:flex;align-items:center;gap:7px;color:#8a93a6;font-size:10px}
+  #harness input[type=range]{width:96px}
+  #hint{position:fixed;left:16px;top:14px;z-index:10;color:#5b6478;font-size:11px;
+    letter-spacing:.04em}
+  #hint b{color:#8a93a6}
+  #err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;
+    color:#8a93a6;font-size:13px;text-align:center;padding:40px;z-index:50}
+</style>
+</head>
+<body>
+  <canvas id="gl"></canvas>
+
+  <div id="hint"><b>V.O.I.D Singularity</b> · standalone renderer demo · fixed center · keys 0–6 = states</div>
+
+  <div id="harness">
+    <span class="lbl">State</span>
+    <button data-state="HIDDEN" class="on">Hidden</button>
+    <button data-state="FORMING">Forming</button>
+    <button data-state="LISTENING">Listening</button>
+    <button data-state="PROCESSING">Processing</button>
+    <button data-state="SPEAKING">Speaking</button>
+    <button data-state="DISSOLVING">Dissolving</button>
+    <button data-state="STOPPED">Stopped</button>
+    <span class="sep"></span>
+    <label class="audio">Audio&nbsp;<input id="audio" type="range" min="0" max="1" step="0.01" value="0"></label>
+  </div>
+
+  <div id="err"></div>
+
+  <!-- ============ dependencies (three r128 + postprocessing addons) ============ -->
+  <!-- For offline use, vendor these from node_modules/three@0.128.0 (see README). -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/MaskPass.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
+
+  <!-- ============ the renderer package ============ -->
+  <script src="src/config.js"></script>
+  <script src="src/shaders.js"></script>
+  <script src="src/VoidSingularityRenderer.js"></script>
+
+  <!-- ============ demo wiring (this is the "host app" in miniature) ============ -->
+  <script>
+  (function () {
+    'use strict';
+    if (!window.THREE) {
+      var e = document.getElementById('err');
+      e.style.display = 'flex';
+      e.textContent = 'three.js failed to load. Check your connection, or vendor three@0.128.0 locally (see README).';
+      return;
+    }
+
+    var canvas = document.getElementById('gl');
+
+    // ---- instantiate the renderer via its public constructor ----
+    var renderer = new VoidSingularityRenderer({
+      canvas: canvas,
+      wallpaperUrl: 'assets/wallpaper.jpg'
+      // config: {}  // uses the approved baseline from src/config.js by default
+    });
+
+    // ---- drive resize ----
+    function fit() { renderer.resize(window.innerWidth, window.innerHeight); }
+    window.addEventListener('resize', fit);
+    fit();
+
+    // ---- review controls: call the public API only ----
+    var buttons = Array.prototype.slice.call(document.querySelectorAll('#harness button'));
+    function select(state) {
+      renderer.setState(state);
+      buttons.forEach(function (b) { b.classList.toggle('on', b.dataset.state === state); });
+    }
+    buttons.forEach(function (b) { b.addEventListener('click', function () { select(b.dataset.state); }); });
+
+    // audio slider -> setAudioLevel (only visibly affects SPEAKING)
+    document.getElementById('audio').addEventListener('input', function (e) {
+      renderer.setAudioLevel(parseFloat(e.target.value));
+    });
+
+    // keyboard 0..6 for quick state switching
+    window.addEventListener('keydown', function (e) {
+      var k = e.key;
+      if (k >= '0' && k <= '6') select(VoidSingularityRenderer.STATES[+k]);
+    });
+  })();
+  </script>
+</body>
+</html>
