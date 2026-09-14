@@ -25,9 +25,12 @@ feed_audio would stall audio fan-out to every consumer and drop frames.
 """
 from __future__ import annotations
 
+import logging
 import threading
 from pathlib import Path
 from typing import Callable
+
+_log = logging.getLogger(__name__)
 
 from void.voice.wake import (
     WakeWordDetector, WAKE_DETECTED, WakeWordConfigError, WakeWordBackendError,
@@ -83,6 +86,7 @@ class WhisperGen3WakeDetector(WakeWordDetector):
         self._running = False
         self._closed = False
         self._above = False              # rising-edge latch (infer thread only)
+        self._infer_error_logged = False  # observability: log a persistent failure once
 
     @property
     def threshold(self) -> float:
@@ -139,6 +143,7 @@ class WhisperGen3WakeDetector(WakeWordDetector):
         self._load()                     # surfaces config/dep/backend errors here
         self._buf = self._np.zeros(0, dtype=self._np.int16)
         self._above = False
+        self._infer_error_logged = False
         self._stop_evt.clear()
         self._running = True
         self._infer_thread = threading.Thread(
@@ -185,8 +190,19 @@ class WhisperGen3WakeDetector(WakeWordDetector):
             except Exception:
                 # Never let a transient inference error kill wake silently in a
                 # tight spin; back off one hop and retry. Persistent failure
-                # simply means no wakes (PTT still works).
+                # simply means no wakes (PTT still works). Keep normal operation
+                # quiet, but log the FIRST failure once so a runtime break is
+                # DIAGNOSABLE instead of V.O.I.D silently appearing dead forever.
+                # No audio/transcript is ever logged - only the exception.
+                if not self._infer_error_logged:
+                    self._infer_error_logged = True
+                    _log.warning("gen3 wake inference failed; wake temporarily "
+                                 "inactive (push-to-talk still works)",
+                                 exc_info=True)
                 continue
+            if self._infer_error_logged:
+                self._infer_error_logged = False
+                _log.info("gen3 wake inference recovered")
             if score is None:
                 continue
             if score >= self._threshold:

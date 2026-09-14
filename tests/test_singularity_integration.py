@@ -266,6 +266,15 @@ def test_overlay_applies_click_through_on_show_and_load():
     assert _calls("_on_load_finished", "_apply_windows_click_through")
 
 
+def test_launch_has_console_less_startup_diagnostics():
+    # A pythonw (console-less) run must not vanish silently on a startup crash:
+    # launch() installs a local diagnostic log and logs the exception.
+    src = _OVERLAY_SRC.read_text(encoding="utf-8")
+    assert "_install_background_logging" in src
+    assert "void.log" in src                     # local diagnostic file
+    assert "log.exception" in src                # startup failure is recorded
+
+
 # ======================================================================
 # 5. Renderer transparency change  (sanctioned, minimal, reversible)
 # ======================================================================

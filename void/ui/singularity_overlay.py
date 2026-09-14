@@ -34,6 +34,7 @@ covered by headless tests.
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -335,22 +336,61 @@ class SingularityOverlay(QWidget):
         super().closeEvent(event)
 
 
+def _install_background_logging() -> None:
+    """Route V.O.I.D's own WARNING+ (and its own INFO) to a local diagnostic
+    file so a CONSOLE-LESS run (pythonw autostart) is still diagnosable: a
+    startup crash or a wake-inference failure lands in ~/.void/void.log instead
+    of vanishing. Third-party libraries stay at WARNING so the file does not
+    fill with noise. Never records audio, transcripts, secrets or credentials -
+    only lifecycle + exceptions. Idempotent."""
+    root = logging.getLogger()
+    if any(getattr(h, "_void_bg", False) for h in root.handlers):
+        return
+    try:
+        from void.app import Config
+        log_path = Config.load().state_dir() / "void.log"
+    except Exception:
+        import tempfile
+        log_path = Path(tempfile.gettempdir()) / "void.log"
+    try:
+        handler = logging.FileHandler(log_path, encoding="utf-8")
+        handler._void_bg = True
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        root.addHandler(handler)
+        root.setLevel(logging.WARNING)          # quiet by default (third-party)
+        logging.getLogger("void").setLevel(logging.INFO)   # our own lifecycle
+    except Exception:
+        pass
+
+
 def launch() -> int:
     """Standalone entry point for `python -m void singularity` - a persistent
     desktop app identical to `python -m void app` except the desktop presence
     is the WebGL overlay instead of the QPainter orb. Reuses the runtime's
     injectable widget_factory so exactly ONE Assistant / VoiceController /
-    VoiceStateBridge is composed (the sole microphone owner), unchanged."""
-    enable_webengine_gl()   # before any QApplication is created
-    from void.runtime.app import build_runtime
+    VoiceStateBridge is composed (the sole microphone owner), unchanged.
 
-    def widget_factory(assistant, bridge, voice_controller):
-        return SingularityOverlay(assistant, voice_bridge=bridge,
-                                  voice_controller=voice_controller)
+    Wrapped so a fatal startup error under pythonw (no console) is written to
+    the diagnostic log rather than disappearing silently."""
+    _install_background_logging()
+    log = logging.getLogger("void.singularity")
+    try:
+        enable_webengine_gl()   # before any QApplication is created
+        from void.runtime.app import build_runtime
 
-    runtime, app = build_runtime(widget_factory=widget_factory)
-    runtime.start()
-    return app.exec()
+        def widget_factory(assistant, bridge, voice_controller):
+            return SingularityOverlay(assistant, voice_bridge=bridge,
+                                      voice_controller=voice_controller)
+
+        runtime, app = build_runtime(widget_factory=widget_factory)
+        runtime.start()
+        log.info("V.O.I.D singularity started; waiting for wake word")
+        return app.exec()
+    except Exception:
+        # Console-less runs would otherwise show nothing at all.
+        log.exception("V.O.I.D singularity failed to start")
+        return 1
 
 
 if __name__ == "__main__":

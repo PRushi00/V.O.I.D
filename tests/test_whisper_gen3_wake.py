@@ -153,3 +153,34 @@ def test_missing_classifier_path_raises_config_error():
     det = WhisperGen3WakeDetector(classifier_path=None)
     with pytest.raises(WakeWordConfigError):
         det.start()
+
+
+def test_inference_error_is_logged_once_not_silent(caplog):
+    # Observability: a persistent inference failure must NOT leave V.O.I.D
+    # silently dead - it is logged exactly once (not spammed), wake goes
+    # inactive, and no false wake is emitted.
+    import logging
+
+    class _BadEncoder(_FakeEncoder):
+        def feature_extractor(self, waveform):
+            raise RuntimeError("boom")
+
+    events = []
+    det = WhisperGen3WakeDetector(
+        classifier_path="unused", threshold=0.34, hop_seconds=0.01,
+        on_wake=events.append,
+        _encoder_factory=lambda: _BadEncoder(),
+        _session_factory=lambda: _FakeSession(5.0))
+    with caplog.at_level(logging.WARNING, logger="void.voice.whisper_gen3_wake"):
+        det.start()
+        try:
+            for f in _frames():
+                det.feed_audio(f)
+            assert _wait(lambda: any("wake inference failed" in r.message
+                                     for r in caplog.records))
+            time.sleep(0.1)
+        finally:
+            det.close()
+    assert events == []                      # never a false wake on failure
+    n = sum("wake inference failed" in r.message for r in caplog.records)
+    assert n == 1                            # logged once, not on every hop
