@@ -670,7 +670,7 @@ def test_wake_capture_runs_the_release_chain_on_the_worker():
 
 def test_wake_policy_from_config_defaults_and_validation():
     p = _WakePolicy.from_config(_StubConfig({}))
-    assert (p.no_speech_s, p.silence_s, p.max_capture_s) == (4.0, 1.2, 15.0)
+    assert (p.no_speech_s, p.silence_s, p.max_capture_s) == (4.0, 0.8, 15.0)
     assert p.rearm_delay_ms == 500 and p.energy_threshold == 500.0
     bad = _WakePolicy.from_config(_StubConfig({
         "voice.wake_no_speech_timeout": -3,
@@ -679,7 +679,7 @@ def test_wake_policy_from_config_defaults_and_validation():
         "voice.wake_rearm_delay_ms": -10,
         "voice.wake_energy_threshold": -1,
     }))
-    assert bad.no_speech_s == 0.5 and bad.silence_s == 1.2      # clamped / defaulted
+    assert bad.no_speech_s == 0.5 and bad.silence_s == 0.8      # clamped / defaulted
     assert bad.max_capture_s == 1.0 and bad.rearm_delay_ms == 0
     assert bad.energy_threshold == 0.0
 

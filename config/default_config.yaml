@@ -77,8 +77,11 @@ voice:
   stt_model: "small"             # faster-whisper model (tiny|base|small|medium)
   stt_device: "cpu"              # "cpu" (int8) or "cuda"
   stt_language: "en"
+  stt_beam_size: 1               # 1 = greedy (fast, best for short commands); 5 = library default
+  stt_vad_filter: true           # trim non-speech before Whisper (accuracy; auto-falls back if unavailable)
   speak_responses: true          # speak the reply through local TTS
   tts_provider: "sapi"           # local TTS backend: "sapi" (Windows) or "null"
+  tts_rate: 1                    # SAPI speaking rate -10..10 (0 = normal); 1 ~= moderately faster
   # Wake word (Phase 9C-1: detector boundary only - NOT wired to the session
   # yet, and no microphone is opened). "Hey V.O.I.D." has no pretrained
   # openWakeWord model, so wake_model_path MUST point at a custom model file or
@@ -91,7 +94,7 @@ voice:
   # never "listen forever". A simple int16 RMS energy gate marks "speech"; it is
   # not a full VAD. Values are validated (clamped to safe minimums) on load.
   wake_no_speech_timeout: 4.0    # seconds to wait for any speech after wake
-  wake_silence_timeout: 1.2      # seconds of trailing silence that ends an utterance
+  wake_silence_timeout: 0.8      # seconds of trailing silence that ends an utterance (snappier)
   wake_max_capture_seconds: 15.0 # hard cap on one wake-initiated capture
   wake_rearm_delay_ms: 500       # settle time (post TTS/command) before re-arming wake
   wake_energy_threshold: 500     # int16 RMS at/above which a frame counts as speech

@@ -107,6 +107,17 @@ class VoiceSession:
                 return
         self._apply(VoiceEvent.REARM)
 
+    def warmup(self) -> None:
+        """Best-effort, off-thread pre-warm so the FIRST interaction has no
+        cold start: load the STT model (+ one tiny dummy decode). Never raises;
+        touches no lifecycle state, opens no microphone, and speaks nothing."""
+        warm = getattr(self._stt, "warmup", None)
+        if callable(warm):
+            try:
+                warm()
+            except Exception:
+                pass
+
     def poll(self) -> None:
         """Live-loop tick (runtime monitor cadence). Two jobs, both idempotent:
         make the GLOBAL kill switch authoritative from any state, and retire

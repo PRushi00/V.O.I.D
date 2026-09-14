@@ -88,7 +88,7 @@ class _WakePolicy:
     on one of three bounded conditions - never "listen forever".
     """
     no_speech_s: float = 4.0
-    silence_s: float = 1.2
+    silence_s: float = 0.8          # trailing silence that ends an utterance (snappier endpoint)
     max_capture_s: float = 15.0
     rearm_delay_ms: int = 500
     energy_threshold: float = 500.0
@@ -103,7 +103,7 @@ class _WakePolicy:
             return v if v >= low else float(low)
         return cls(
             no_speech_s=_num("voice.wake_no_speech_timeout", 4.0, 0.5),
-            silence_s=_num("voice.wake_silence_timeout", 1.2, 0.2),
+            silence_s=_num("voice.wake_silence_timeout", 0.8, 0.2),
             max_capture_s=_num("voice.wake_max_capture_seconds", 15.0, 1.0),
             rearm_delay_ms=int(_num("voice.wake_rearm_delay_ms", 500.0, 0.0)),
             energy_threshold=_num("voice.wake_energy_threshold", 500.0, 0.0),
@@ -233,6 +233,8 @@ class VoiceController:
             model_name=config.get("voice.stt_model", "small"),
             device=config.get("voice.stt_device", "cpu"),
             language=config.get("voice.stt_language", "en"),
+            beam_size=int(config.get("voice.stt_beam_size", 1)),
+            vad_filter=bool(config.get("voice.stt_vad_filter", True)),
         )
         tts = create_tts_provider(config)   # provider-agnostic; null-safe fallback
         session = VoiceSession(
@@ -318,6 +320,15 @@ class VoiceController:
                 target=self._run_monitor, name="void-voice-monitor",
                 daemon=True)
             self._monitor.start()
+        self._prewarm_stt()
+
+    def _prewarm_stt(self) -> None:
+        """Warm the STT model off-thread at start() so the first command isn't a
+        cold start. Best-effort and daemonized; a failure never blocks start()."""
+        warm = getattr(self._session, "warmup", None)
+        if not callable(warm):
+            return
+        threading.Thread(target=warm, name="void-stt-warmup", daemon=True).start()
 
     def poll_once(self) -> None:
         """One deterministic monitor tick: kill-switch enforcement + speech

@@ -1,10 +1,12 @@
 """Windows login autostart for the persistent V.O.I.D app.
 
-Registers ``pythonw.exe -m void app`` under the per-user HKCU ``Run`` key so
-V.O.I.D starts silently at login - NO console window, NO terminal, NO
+Registers ``pythonw.exe -m void singularity`` under the per-user HKCU ``Run``
+key so V.O.I.D starts silently at login - NO console window, NO terminal, NO
 administrator rights, NO Windows service, and NO change to Smart App Control
 or any security control. Using ``pythonw.exe`` (the windowed Python launcher)
-is what makes it console-less.
+is what makes it console-less. The target is the approved WebGL Blackhole
+overlay (``singularity``); the QPainter orb (``app``) remains available for
+development/debugging from a terminal.
 
 install() / remove() / status() are the whole API. The registry access is
 behind an injectable backend so the logic is unit-testable without touching
@@ -38,10 +40,11 @@ def default_pythonw_path() -> str:
 
 
 def default_launch_command(pythonw: str | None = None) -> str:
-    """The exact command written to the Run key: the windowed interpreter
-    plus ``-m void app`` (the persistent desktop runtime)."""
+    """The exact command written to the Run key: the windowed interpreter plus
+    ``-m void singularity`` (the persistent desktop runtime with the approved
+    WebGL Blackhole overlay, launched console-less)."""
     exe = pythonw or default_pythonw_path()
-    return f'"{exe}" -m void app'
+    return f'"{exe}" -m void singularity'
 
 
 class _WinregBackend:

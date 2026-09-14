@@ -296,14 +296,32 @@ class STT:
 
 
 class FasterWhisperSTT(STT):
-    """Local faster-whisper STT (lazy init, configurable model, default small)."""
+    """Local faster-whisper STT (lazy init, configurable model, default small).
+
+    Latency-tuned for short spoken commands without changing the local/native
+    architecture:
+      * ``beam_size`` defaults to 1 (greedy). Beam search (the library default
+        of 5) is markedly slower and buys little accuracy on short command
+        utterances; greedy decoding is the bigger perceived-latency win.
+      * ``condition_on_previous_text=False`` - each command is independent, so
+        the prior-text context (a hallucination source) is dropped.
+      * optional ``vad_filter`` trims non-speech so Whisper transcribes only the
+        voiced span (a small accuracy win). It uses faster-whisper's bundled
+        Silero VAD; if that asset/runtime is unavailable we transparently retry
+        without it, so enabling it never reduces reliability.
+      * ``warmup()`` loads the model (and runs one tiny dummy decode) ahead of
+        time so the FIRST real command doesn't pay the cold-start cost.
+    """
 
     def __init__(self, model_name: str = "small", device: str = "cpu",
-                 compute_type: str = "int8", language: str = "en"):
+                 compute_type: str = "int8", language: str = "en",
+                 beam_size: int = 1, vad_filter: bool = True):
         self._model_name = model_name
         self._device = device
         self._compute_type = compute_type
         self._language = language
+        self._beam_size = max(1, int(beam_size))
+        self._vad_filter = bool(vad_filter)
         self._model = None
 
     def _load(self):
@@ -324,13 +342,38 @@ class FasterWhisperSTT(STT):
                            f"'{self._model_name}': {exc}") from exc
         return self._model
 
+    def _decode(self, audio, *, vad: bool) -> str:
+        model = self._model
+        kwargs = dict(language=self._language, beam_size=self._beam_size,
+                      condition_on_previous_text=False)
+        if vad:
+            kwargs["vad_filter"] = True
+        segments, _info = model.transcribe(audio, **kwargs)
+        return "".join(seg.text for seg in segments).strip()
+
     def transcribe(self, audio) -> str:
-        model = self._load()
+        self._load()
         try:
-            segments, _info = model.transcribe(audio, language=self._language)
-            return "".join(seg.text for seg in segments).strip()
+            return self._decode(audio, vad=self._vad_filter)
         except Exception as exc:
+            # A VAD asset/runtime problem must not fail the command: retry once
+            # without VAD before surfacing an error.
+            if self._vad_filter:
+                try:
+                    return self._decode(audio, vad=False)
+                except Exception as exc2:
+                    raise STTError(f"transcription failed: {exc2}") from exc2
             raise STTError(f"transcription failed: {exc}") from exc
+
+    def warmup(self) -> None:
+        """Best-effort pre-load so the first real command is not a cold start.
+        Safe to call on a background thread; never raises."""
+        try:
+            import numpy as np
+            self._load()
+            self._decode(np.zeros(1600, dtype="float32"), vad=False)  # ~0.1s @16k
+        except Exception:
+            pass
 
 
 # --- text to speech -----------------------------------------------------
@@ -357,6 +400,10 @@ class TTS:
 
     def close(self) -> None:
         """Release any provider resources. Default: nothing to release."""
+        return None
+
+    def set_rate(self, rate: int) -> None:
+        """Set the speaking rate hint. Provider-defined scale; default no-op."""
         return None
 
 
@@ -392,8 +439,11 @@ class SapiTTS(TTS):
     _SVSF_PURGE = 2
     _POLL_MS = 50            # worker responsiveness to stop/replace/shutdown
 
-    def __init__(self, *, _voice_factory=None, _com_setup=None,
+    def __init__(self, *, rate: int = 0, _voice_factory=None, _com_setup=None,
                  _com_teardown=None, _poll_ms=None, _before_start=None):
+        # SAPI SpVoice.Rate is an integer -10..10 (0 = normal). A small positive
+        # value speaks moderately faster; kept in-range so it never sounds robotic.
+        self._rate = max(-10, min(10, int(rate)))
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._ready = threading.Event()      # worker finished init (ok or error)
@@ -415,6 +465,11 @@ class SapiTTS(TTS):
         self._before_start = _before_start
 
     # --- public, provider-agnostic API --------------------------------
+    def set_rate(self, rate: int) -> None:
+        # Applied to the SpVoice before each utterance (see _loop), so a change
+        # takes effect on the next thing spoken. Thread-safe scalar write.
+        self._rate = max(-10, min(10, int(rate)))
+
     @property
     def is_speaking(self) -> bool:
         with self._lock:
@@ -564,6 +619,10 @@ class SapiTTS(TTS):
             if superseded:
                 continue                      # newer stop/speak wins; no audio
             self._purge(voice)                # replace anything currently playing
+            try:
+                voice.Rate = int(self._rate)  # apply current rate before speaking
+            except Exception:
+                pass
             try:
                 voice.Speak(text, self._SVSF_ASYNC)
             except Exception:

@@ -155,4 +155,17 @@ def create_tts_provider(config=None, *, provider: str | None = None) -> TTS:
         # Construction should be cheap/lazy; if a backend still fails here, stay
         # silent rather than break voice startup.
         name, delegate = "null", NullTTS()
+
+    # Apply the configured speaking rate (provider-agnostic; NullTTS ignores it).
+    # SAPI Rate is -10..10 (0 = normal); a small positive value is moderately
+    # faster without sounding robotic.
+    if config is not None:
+        try:
+            rate = int(config.get("voice.tts_rate", 0))
+        except Exception:
+            rate = 0
+        try:
+            delegate.set_rate(rate)
+        except Exception:
+            pass
     return _ResilientTTS(delegate, name)

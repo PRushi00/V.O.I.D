@@ -71,10 +71,32 @@ def host_html_path() -> Path:
     return _HOST_HTML
 
 
+def _quiet_webengine_logging() -> None:
+    """Silence QtWebEngine's Chromium/GPU console spam BEFORE WebEngine starts.
+
+    Root cause of the "terminal becomes unusable after ~1-2s" report: the
+    embedded Chromium logs a continuous stream of GPU/info lines to the
+    console, which floods a foreground dev terminal (the app also owns that
+    console while its Qt event loop runs). Suppressing that logging keeps the
+    development terminal readable; normal use has no console at all (autostart
+    launches via pythonw). Developers can still override either env var. This
+    changes NO visual behavior. Must run before the QtWebEngine import kicks
+    off Chromium, i.e. before the QApplication is built."""
+    import os
+    os.environ.setdefault(
+        "QT_LOGGING_RULES", "qt.webenginecontext.info=false;qt.webengine.info=false")
+    flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+    if "--log-level" not in flags and "--disable-logging" not in flags:
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
+            (flags + " --disable-logging --log-level=3").strip())
+
+
 def enable_webengine_gl() -> None:
     """Must be called BEFORE the QApplication is constructed. QtWebEngine needs
-    shared OpenGL contexts to composite its WebGL canvas correctly. Safe/no-op
-    if an application already exists."""
+    shared OpenGL contexts to composite its WebGL canvas correctly, and its
+    Chromium logging is silenced here so it never floods a dev console. Safe/
+    no-op if an application already exists."""
+    _quiet_webengine_logging()
     if QApplication.instance() is not None:
         return
     try:

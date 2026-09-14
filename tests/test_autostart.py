@@ -21,10 +21,10 @@ class FakeRegistry:
         return self.values.pop(name, None) is not None
 
 
-def test_default_launch_command_uses_pythonw_and_void_app():
+def test_default_launch_command_uses_pythonw_and_void_singularity():
     cmd = autostart.default_launch_command(pythonw=r"C:\x\pythonw.exe")
-    assert cmd == r'"C:\x\pythonw.exe" -m void app'
-    assert "-m void app" in cmd
+    assert cmd == r'"C:\x\pythonw.exe" -m void singularity'
+    assert "-m void singularity" in cmd
 
 
 def test_default_pythonw_path_is_a_string():
@@ -43,7 +43,7 @@ def test_install_writes_run_key_then_status_reports_it():
 def test_install_defaults_to_generated_command():
     reg = FakeRegistry()
     cmd = autostart.install(backend=reg)
-    assert "-m void app" in cmd
+    assert "-m void singularity" in cmd
     assert autostart.status(backend=reg) == cmd
 
 
