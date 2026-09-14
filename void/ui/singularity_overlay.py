@@ -212,6 +212,9 @@ class SingularityOverlay(QWidget):
         self._page_ready = bool(ok)
         if ok:
             self._push_state(self._pending_state)
+        # Chromium attaches its native surface during load; re-assert the
+        # top-level click-through style so it holds over the WebEngine child.
+        self._apply_windows_click_through()
 
     # --- system tray (controls for a click-through overlay) ---------------
     def install_tray(self) -> None:
@@ -256,10 +259,57 @@ class SingularityOverlay(QWidget):
     def _menu_close(self) -> None:
         self.closing.emit()
 
+    # --- native click-through (Windows) --------------------------------
+    def _apply_windows_click_through(self) -> None:
+        """Make the overlay click-through at the NATIVE Win32 level.
+
+        ROOT CAUSE of the desktop 'freeze': this fullscreen, always-on-top
+        overlay hosts a QWebEngineView (Chromium) child. Qt's
+        WA_TransparentForMouseEvents on the parent QWidget does NOT propagate to
+        the WebEngine render window - it owns its own native HWND and intercepts
+        every mouse event across the whole screen, so the desktop beneath the
+        overlay receives no clicks and Windows feels frozen.
+
+        The reliable fix is to make the TOP-LEVEL overlay window transparent to
+        hit-testing at the OS level with WS_EX_LAYERED | WS_EX_TRANSPARENT (plus
+        WS_EX_NOACTIVATE so it never steals focus, and WS_EX_TOOLWINDOW so it
+        stays out of Alt-Tab). Windows then returns HTTRANSPARENT for the whole
+        window and routes mouse/keyboard to whatever is underneath - child HWNDs
+        (the Chromium surface) included. This changes hit-testing ONLY; it does
+        not touch rendering, so the approved plasma-free visual is unaffected.
+        No-op off Windows; never raises."""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            GWL_EXSTYLE = -20
+            WS_EX_LAYERED = 0x00080000
+            WS_EX_TRANSPARENT = 0x00000020
+            WS_EX_NOACTIVATE = 0x08000000
+            WS_EX_TOOLWINDOW = 0x00000080
+            hwnd = int(self.winId())
+            user32 = ctypes.windll.user32
+            get_long = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+            set_long = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+            get_long.restype = ctypes.c_void_p
+            get_long.argtypes = [wintypes.HWND, ctypes.c_int]
+            set_long.restype = ctypes.c_void_p
+            set_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            ex = get_long(hwnd, GWL_EXSTYLE) or 0
+            ex |= (WS_EX_LAYERED | WS_EX_TRANSPARENT
+                   | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
+            set_long(hwnd, GWL_EXSTYLE, ex)
+        except Exception:
+            pass
+
     # --- lifecycle -----------------------------------------------------
     def showEvent(self, event):
         self.install_tray()
         super().showEvent(event)
+        # HWND exists now: enforce OS-level click-through (Qt's parent-level
+        # WA_TransparentForMouseEvents does not cover the WebEngine child).
+        self._apply_windows_click_through()
 
     def closeEvent(self, event):
         # Release the WebGL/Chromium resources deterministically: dispose the

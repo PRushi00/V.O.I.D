@@ -239,6 +239,33 @@ def test_overlay_matches_voidwidget_runtime_contract():
     assert "def install_tray" in src    # tray installed from showEvent
 
 
+def test_overlay_forces_native_windows_click_through():
+    # The WebEngine child intercepts mouse events across the whole screen unless
+    # the top-level window is made transparent to hit-testing at the Win32 level.
+    src = _OVERLAY_SRC.read_text(encoding="utf-8")
+    assert "_apply_windows_click_through" in src
+    assert "WS_EX_TRANSPARENT" in src
+    assert "WS_EX_LAYERED" in src
+    assert 'sys.platform != "win32"' in src   # guarded: no-op off Windows
+
+
+def test_overlay_applies_click_through_on_show_and_load():
+    tree = ast.parse(_OVERLAY_SRC.read_text(encoding="utf-8"))
+    cls = next(n for n in ast.walk(tree)
+               if isinstance(n, ast.ClassDef) and n.name == "SingularityOverlay")
+
+    def _calls(fnname, target):
+        fn = next((n for n in cls.body
+                   if isinstance(n, ast.FunctionDef) and n.name == fnname), None)
+        assert fn is not None, fnname
+        return any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                   and c.func.attr == target for c in ast.walk(fn))
+
+    # Applied once the HWND exists (show) and again after Chromium attaches (load).
+    assert _calls("showEvent", "_apply_windows_click_through")
+    assert _calls("_on_load_finished", "_apply_windows_click_through")
+
+
 # ======================================================================
 # 5. Renderer transparency change  (sanctioned, minimal, reversible)
 # ======================================================================
