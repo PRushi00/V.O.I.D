@@ -17,16 +17,44 @@ called at all by the plain ``void voice`` command - so a developer testing
 voice manually from a terminal got no ~/.void/void.log output whatsoever for
 any of the mic/wake lifecycle markers, even though the log file's format
 promised it. This module is the one implementation all three now share.
+
+Test isolation: an automated test that calls a real entry point (e.g.
+``cli.cmd_voice()``) WITHOUT redirecting ``void.config.Config`` - as a prior
+regression did - must never attach a handler to the user's actual
+``~/.void/void.log``. Once attached, a logging handler stays on the root
+logger for the rest of that process, so every later test's ordinary
+synthetic log calls (including deliberately-raised test exceptions) would
+otherwise land in the SAME file as real runtime evidence, making it useless
+for real-hardware validation. ``install_background_logging`` therefore
+refuses to open the real production path while running under pytest,
+falling back to a session-scoped temp file instead. A test that wants to
+exercise the REAL file-writing behavior does so exactly as
+``tests/test_diagnostics.py`` already did before this change: redirect
+``void.config`` to a fake pointed at ``tmp_path`` - that path is never equal
+to the real production path, so the guard never applies to it.
 """
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import tempfile
 from pathlib import Path
 
 _FILE_MARKER = "_void_bg"
 _CONSOLE_MARKER = "_void_console"
+
+
+def _real_production_log_path() -> Path:
+    """The actual, non-redirected production path: ``~/.void/void.log``."""
+    return Path(os.path.expanduser("~")) / ".void" / "void.log"
+
+
+def _running_under_pytest() -> bool:
+    """Reliable, dependency-free "are we a test process" signal - true for
+    the WHOLE pytest process (collection included), not just inside a test
+    function, so it also catches module-level/fixture-time calls."""
+    return "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ
 
 
 def install_background_logging() -> Path | None:
@@ -41,6 +69,10 @@ def install_background_logging() -> Path | None:
         log_path = Config.load().state_dir() / "void.log"
     except Exception:
         log_path = Path(tempfile.gettempdir()) / "void.log"
+    if _running_under_pytest() and log_path == _real_production_log_path():
+        # Config was NOT redirected by the caller (see module docstring) -
+        # never contaminate the real production log from a test process.
+        log_path = Path(tempfile.gettempdir()) / "void-test-session.log"
     try:
         handler = logging.FileHandler(log_path, encoding="utf-8")
         setattr(handler, _FILE_MARKER, True)
