@@ -483,7 +483,7 @@ class Agent:
                 for tc in tool_calls
             ],
         }
-        tool_msgs, oks, kinds, find_data, stopped = [], [], [], [], False
+        tool_msgs, oks, kinds, find_data, firsts, stopped = [], [], [], [], [], False
         for tc in tool_calls:
             # Kill switch is checked before every tool call. Once stopped, the
             # remaining calls get honest 'cancelled' responses (never executed,
@@ -494,11 +494,12 @@ class Agent:
                 oks.append(None)   # not run
                 continue
             try:
-                msg, ok, _first, kind, n = self._run_call(tc.name, tc.arguments)
+                msg, ok, first, kind, n = self._run_call(tc.name, tc.arguments)
                 tool_msgs.append(msg)
                 oks.append(ok)
                 kinds.append(kind)
                 find_data.append(n)
+                firsts.append(first)
             except StopRequested:
                 stopped = True
                 tool_msgs.append(self._cancelled_msg(tc.name))
@@ -535,8 +536,51 @@ class Agent:
             return "paused"
         if self._apply_find_directory_block(task, find_data):
             return "blocked"
+        ack = self._deterministic_completion(task, tool_calls, oks, kinds, firsts)
+        if ack is not None:
+            task.result = ack
+            task.status = Status.COMPLETED
+            self.store.save(task)
+            _log.info("AUTO_COMPLETE tool=%s (skipped final LLM call)",
+                      tool_calls[0].name)
+            return "completed"
         self.store.save(task)
         return "continue"
+
+    # Goal phrasing that suggests more than one sub-goal - conservative and
+    # deliberately cheap (no LLM call): a false negative here only costs one
+    # skipped optimization, never a correctness problem, because it just
+    # falls through to the existing final-LLM-call path.
+    _COMPOUND_GOAL_MARKERS = (" and ", " then ", " also ", ";", " after that")
+
+    def _deterministic_completion(self, task: Task, tool_calls, oks: list,
+                                  kinds: list, firsts: list[str]) -> str | None:
+        """A same-step local acknowledgement in place of the final LLM call -
+        ONLY for a task's very first step, a SINGLE tool call, that tool
+        marked terminal_on_success, and a genuine success. Returns the exact
+        ToolResult.summary first line (already fed to the LLM in the tool
+        message; not new/generated wording) as the whole response, or None
+        to fall through to the normal (unchanged) LLM final-answer call.
+
+        This never affects whether/how the tool ran: RiskGate authorization
+        and execution already happened in _run_call before this is reached.
+        It only decides whether ANOTHER Gemini call is needed to phrase a
+        summary of something that already has an unambiguous, complete,
+        human-readable outcome.
+        """
+        if task.steps != 1:                      # not this task's first step
+            return None
+        if len(tool_calls) != 1 or len(oks) != 1 or len(firsts) != 1:
+            return None                            # multiple calls -> may need synthesis
+        if kinds[0] != "ok" or not oks[0]:
+            return None                            # only a genuine success
+        tool = self.tools.get(tool_calls[0].name)
+        if tool is None or not tool.terminal_on_success:
+            return None
+        goal = f" {(task.goal or '').lower()} "
+        if any(marker in goal for marker in self._COMPOUND_GOAL_MARKERS):
+            return None                            # goal reads as multi-part
+        return firsts[0] or None
 
     @staticmethod
     def _has_unresolved_failure(kinds: list[str]) -> bool:
@@ -733,7 +777,7 @@ class Agent:
 
                 if response.has_tool_calls:
                     outcome = self._commit_step(task, response)
-                    if outcome in ("paused", "awaiting", "blocked"):
+                    if outcome in ("paused", "awaiting", "blocked", "completed"):
                         return AgentResult(task, task.status, task.result, task.steps)
                     continue  # 'continue'
 

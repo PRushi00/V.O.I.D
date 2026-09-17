@@ -2,6 +2,7 @@
 the risk gate, the kill switch, and the safety cap."""
 import pytest
 
+from void.actions.base import Tool, ToolResult
 from void.actions.files import FileActions
 from void.actions.registry import ToolRegistry
 from void.core.agent import Agent
@@ -359,3 +360,167 @@ def test_tool_call_timing_is_logged_without_arguments_or_results(tmp_path, caplo
     assert "risk=" in line and "ok=True" in line and "duration=" in line
     assert "cyber" not in line                    # never the query argument
     assert "SECRET_FILE_CONTENTS" not in line      # never the tool result content
+
+
+# --- latency optimization: skip the final LLM call for a genuinely simple,
+# already-successful, one-shot terminal action ------------------------------
+
+def _terminal_tool(name, handler, *, risk=RiskLevel.LOW):
+    """An ad-hoc terminal_on_success=True tool, decoupled from the real
+    launch_app/open_path implementations, to test the AGENT's own
+    shortcut logic in isolation."""
+    return Tool(name=name, description="test terminal tool",
+               parameters={"type": "object", "properties": {}},
+               handler=handler, risk=risk, terminal_on_success=True)
+
+
+
+def test_simple_successful_terminal_action_skips_the_final_llm_call(tmp_path):
+    launched = []
+
+    def handler(**_kw):
+        launched.append(True)
+        return ToolResult.success("Launched Notepad.")
+
+    provider = FakeProvider([
+        LLMResponse(tool_calls=[tool_call("launch_app", app="notepad")]),
+        LLMResponse(text="this must never be reached"),
+    ])
+    agent = Agent(
+        provider=provider,
+        tools=ToolRegistry(), risk_gate=RiskGate(confirm_at_or_above="high"),
+        kill_switch=KillSwitch(), store=TaskStore(tmp_path / "tasks.sqlite"),
+    )
+    agent.tools.register(_terminal_tool("launch_app", handler))
+    result = agent.run("open notepad")
+    assert launched == [True]
+    assert result.status == Status.COMPLETED
+    assert result.result == "Launched Notepad."   # exact ToolResult wording, not invented
+    assert provider.calls == 1                    # the final LLM call was SKIPPED
+
+
+def test_failed_terminal_action_does_not_trigger_local_acknowledgement(tmp_path):
+    def handler(**_kw):
+        return ToolResult.failure("Could not launch Notepad: file not found.")
+
+    provider = FakeProvider([
+        LLMResponse(tool_calls=[tool_call("launch_app", app="notepad")]),
+        LLMResponse(text="I could not open Notepad."),
+    ])
+    agent = Agent(
+        provider=provider,
+        tools=ToolRegistry(), risk_gate=RiskGate(confirm_at_or_above="high"),
+        kill_switch=KillSwitch(), store=TaskStore(tmp_path / "tasks.sqlite"),
+    )
+    agent.tools.register(_terminal_tool("launch_app", handler))
+    result = agent.run("open notepad")
+    # Failure must NEVER produce a false "opened" acknowledgement - the
+    # normal LLM final-answer path (and the engine's own unresolved-failure
+    # completion guard) must still run, exactly as without the shortcut.
+    assert provider.calls == 2
+    assert result.result != "Launched Notepad."
+    assert result.status == Status.FAILED
+    assert "unresolved execution failure" in (result.task.error or "")
+
+
+def test_ordinary_tool_failure_falls_through_to_normal_llm_path(tmp_path):
+    (tmp_path / "notes.md").write_text("x")
+    agent = build_agent(tmp_path, [
+        LLMResponse(tool_calls=[tool_call("search_files", query="missing")]),
+        LLMResponse(text="I could not find that file."),
+    ])
+    result = agent.run("find missing.md")
+    assert result.result == "I could not find that file."
+
+
+def test_multi_step_chain_still_gets_a_final_llm_call_even_ending_in_a_terminal_tool(tmp_path):
+    # The shortcut is deliberately restricted to a task's FIRST step only -
+    # a chain (discover, then act) always keeps full LLM reasoning at the
+    # end, exactly as a genuinely multi-step task should.
+    def handler(**_kw):
+        return ToolResult.success("Launched Notepad.")
+
+    provider = FakeProvider([
+        LLMResponse(tool_calls=[tool_call("search_files", query="notes")]),
+        LLMResponse(tool_calls=[tool_call("launch_app", app="notepad")]),
+        LLMResponse(text="Found your notes and opened Notepad."),
+    ])
+    (tmp_path / "notes.md").write_text("x")
+    files = FileActions(allowed_roots=[tmp_path], delete_to_recycle_bin=True)
+    registry = ToolRegistry()
+    registry.register_all(files.tools())
+    registry.register(_terminal_tool("launch_app", handler))
+    agent = Agent(
+        provider=provider, tools=registry,
+        risk_gate=RiskGate(confirm_at_or_above="high"),
+        kill_switch=KillSwitch(), store=TaskStore(tmp_path / "tasks.sqlite"),
+    )
+    result = agent.run("find my notes then open notepad")
+    assert provider.calls == 3   # both tool-call turns AND the final answer
+    assert result.result == "Found your notes and opened Notepad."
+
+
+def test_compound_sounding_goal_falls_through_to_normal_llm_path(tmp_path):
+    # Even on step 1 with a single terminal tool call, a goal that READS as
+    # compound ("... and ...") is conservatively excluded from the shortcut.
+    def handler(**_kw):
+        return ToolResult.success("Launched Notepad.")
+
+    provider = FakeProvider([
+        LLMResponse(tool_calls=[tool_call("launch_app", app="notepad")]),
+        LLMResponse(text="Opened Notepad; now opening Calculator."),
+    ])
+    agent = Agent(
+        provider=provider,
+        tools=ToolRegistry(), risk_gate=RiskGate(confirm_at_or_above="high"),
+        kill_switch=KillSwitch(), store=TaskStore(tmp_path / "tasks.sqlite"),
+    )
+    agent.tools.register(_terminal_tool("launch_app", handler))
+    result = agent.run("open notepad and open calculator")
+    assert provider.calls == 2
+    assert result.result == "Opened Notepad; now opening Calculator."
+
+
+def test_unauthorized_terminal_tool_call_does_not_trigger_local_acknowledgement(tmp_path):
+    # RiskGate denial must never be masked as a deterministic "success".
+    called = []
+
+    def handler():
+        called.append(True)
+        return ToolResult.success("Launched a HIGH-risk tool.")
+
+    provider = FakeProvider([
+        LLMResponse(tool_calls=[tool_call("risky_launch")]),
+        LLMResponse(text="That action was not authorized."),
+    ])
+    agent = Agent(
+        provider=provider,
+        tools=ToolRegistry(),
+        risk_gate=RiskGate(confirm_at_or_above="high", confirm_fn=lambda desc: False),
+        kill_switch=KillSwitch(), store=TaskStore(tmp_path / "tasks.sqlite"),
+    )
+    agent.tools.register(_terminal_tool("risky_launch", handler, risk=RiskLevel.HIGH))
+    result = agent.run("do the risky thing")
+    assert called == []                            # never executed
+    assert provider.calls == 2                      # normal LLM path, not skipped
+    assert result.result == "That action was not authorized."
+
+
+def test_multiple_tool_calls_in_one_step_never_use_the_shortcut(tmp_path):
+    def handler(**_kw):
+        return ToolResult.success("Launched Notepad.")
+
+    provider = FakeProvider([
+        LLMResponse(tool_calls=[tool_call("launch_app", app="notepad"),
+                                tool_call("launch_app", app="notepad")]),
+        LLMResponse(text="Opened Notepad twice."),
+    ])
+    agent = Agent(
+        provider=provider,
+        tools=ToolRegistry(), risk_gate=RiskGate(confirm_at_or_above="high"),
+        kill_switch=KillSwitch(), store=TaskStore(tmp_path / "tasks.sqlite"),
+    )
+    agent.tools.register(_terminal_tool("launch_app", handler))
+    result = agent.run("open notepad")
+    assert provider.calls == 2
+    assert result.result == "Opened Notepad twice."

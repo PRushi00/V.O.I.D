@@ -154,6 +154,7 @@ class AppActions:
                 },
                 handler=self.open_path,
                 risk=RiskLevel.LOW,
+                terminal_on_success=True,
             ),
             Tool(
                 name="launch_app",
@@ -175,5 +176,6 @@ class AppActions:
                 },
                 handler=self.launch_app,
                 risk=RiskLevel.LOW,
+                terminal_on_success=True,
             ),
         ]

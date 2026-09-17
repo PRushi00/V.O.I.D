@@ -40,6 +40,16 @@ class Tool:
     # arguments (e.g. writing to a file that ALREADY exists is higher risk than
     # creating a new one). Returns a RiskLevel given the call arguments.
     risk_fn: "Callable[[dict], RiskLevel] | None" = None
+    # True ONLY for tools whose success needs no LLM interpretation - a fire-
+    # and-forget action (launch an app, open a path) where the ToolResult
+    # summary already IS the complete, final thing to tell the owner. False
+    # (the default) for every tool that returns information the LLM might
+    # need to read, choose between, or reason about next (find_app,
+    # search_files, list_directory, ...). The agent loop uses this - ONLY
+    # under narrow, additional conditions of its own - to skip the extra
+    # "final answer" LLM call for a genuinely simple one-shot action; it
+    # never affects authorization, RiskGate, or execution itself.
+    terminal_on_success: bool = False
 
     def effective_risk(self, arguments: dict) -> RiskLevel:
         """Risk for this specific call. Falls back to the static level.
