@@ -76,6 +76,42 @@ def test_create_never_constructs_a_real_tray_under_pytest():
     assert indicator is None
 
 
+def test_indicator_holds_a_persistent_reference_to_its_context_menu():
+    # Regression for the actual root cause found by comparing V.O.I.D
+    # against a working standalone PySide6 script (which kept every Qt
+    # object as a module-level global, so nothing was ever collectible):
+    # QMenu has no QWidget parent available in create() (QSystemTrayIcon is
+    # not a QWidget, so it cannot own one). Without an explicit Python
+    # reference kept for as long as the indicator itself, the menu built in
+    # create() was only reachable via that function's local scope and
+    # became collectible the instant create() returned - taking the tray's
+    # Stop/Rearm/Exit actions, and very plausibly the icon's own shell
+    # registration, down with it once garbage collection actually ran.
+    import gc
+
+    class _FakeApp:
+        pass
+
+    class _FakeTray:
+        def setIcon(self, icon):
+            pass
+
+        def setToolTip(self, tooltip):
+            pass
+
+    class _FakeMenu:
+        pass
+
+    menu = _FakeMenu()
+    menu_id = id(menu)
+    indicator = tray_indicator.TrayIndicator(
+        _FakeApp(), _FakeTray(), {}, bridge=None, menu=menu)
+    del menu
+    gc.collect()
+    assert indicator._menu is not None
+    assert id(indicator._menu) == menu_id   # still the SAME object, not collected
+
+
 def test_indicator_never_imports_riskgate_task_or_secrets_modules():
     # Static guard (imports only, not prose - the module's own docstring
     # legitimately NAMES these to disclaim touching them): this module must

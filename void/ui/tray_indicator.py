@@ -61,11 +61,19 @@ class TrayIndicator:
     """A tray-only listening indicator. Construct via :func:`create`, never
     directly - the factory is what applies the "never break voice" guarantee."""
 
-    def __init__(self, app, tray, icons: dict, bridge=None):
+    def __init__(self, app, tray, icons: dict, bridge=None, menu=None):
         self._app = app
         self._tray = tray
         self._icons = icons          # state name -> prebuilt QIcon
         self._bridge = bridge
+        # QMenu has no QWidget parent available here (QSystemTrayIcon is not
+        # a QWidget, so it cannot own one) - without an explicit Python
+        # reference kept for as long as the indicator itself, the menu (and,
+        # with it, the tray's context menu / Stop-Rearm-Exit actions) is only
+        # reachable via create()'s local scope and becomes collectible the
+        # moment create() returns. Held here so it lives exactly as long as
+        # the tray icon it belongs to.
+        self._menu = menu
         self._on_exit: Callable[[], None] | None = None
         if bridge is not None:
             bridge.stateChanged.connect(self.set_state)
@@ -172,7 +180,7 @@ def create(assistant, bridge, *, on_exit: Callable[[], None] | None = None
 
         menu.aboutToShow.connect(_sync_menu)
 
-        indicator = TrayIndicator(app, tray, icons, bridge=bridge)
+        indicator = TrayIndicator(app, tray, icons, bridge=bridge, menu=menu)
 
         def _exit():
             if on_exit is not None:
