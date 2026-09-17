@@ -393,6 +393,86 @@ def test_faulty_error_callback_is_swallowed():
     b.close()
 
 
+# --- pump-thread resilience (the tray-alive-mic-dead bug) -----------------
+#
+# Reproduces, deterministically and without any real audio hardware, the
+# structural gap found while investigating "tray icon visible, microphone no
+# longer active": _fanout's per-consumer isolation already existed, but
+# nothing guarded the PUMP LOOP ITSELF - an exception escaping from anywhere
+# else in _fanout (its own bookkeeping, not a consumer callback) used to kill
+# the pump thread permanently and silently: the backend kept delivering
+# frames (and logging its own health marker) forever after, but no consumer
+# - wake detector, PTT capture - would ever receive another one.
+
+def test_pump_survives_an_internal_fanout_error(monkeypatch):
+    b, backend = _broker()
+    rec = Recorder()
+    b.subscribe(rec)
+    b.start()
+
+    real_fanout = b._fanout
+    calls = {"n": 0}
+
+    def _flaky_fanout(frame):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated broker-internal fault")
+        return real_fanout(frame)
+
+    monkeypatch.setattr(b, "_fanout", _flaky_fanout)
+    backend.emit(b"first-poisoned")   # would have killed the old pump forever
+    b.drain()
+    backend.emit(b"second")           # proves the pump is still alive afterward
+    b.drain()
+    assert rec.frames == [b"second"]
+    assert b.running                  # the pump thread itself survived
+    b.close()
+
+
+def test_pump_error_is_logged_but_never_raised(monkeypatch, caplog):
+    import logging
+
+    b, backend = _broker()
+    b.start()
+
+    def _boom(_frame):
+        raise RuntimeError("simulated broker-internal fault")
+
+    monkeypatch.setattr(b, "_fanout", _boom)
+    with caplog.at_level(logging.ERROR, logger="void.voice.capture_broker"):
+        backend.emit(b"x")
+        b.drain()
+    assert any("AUDIO_PUMP_ERROR" in r.message for r in caplog.records)
+    b.close()
+
+
+# --- mic-health timestamp (feeds void.voice.runtime's supervisor) ---------
+
+def test_seconds_since_last_frame_is_none_before_any_frame():
+    b, _ = _broker()
+    assert b.seconds_since_last_frame() is None
+    b.close()
+
+
+def test_seconds_since_last_frame_resets_on_each_frame(monkeypatch):
+    import void.voice.capture_broker as mod
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["t"])
+    b, backend = _broker()
+    b.start()
+    backend.emit(b"f")
+    b.drain()
+    assert b.seconds_since_last_frame() == 0.0
+    clock["t"] += 5.0
+    assert b.seconds_since_last_frame() == 5.0
+    clock["t"] += 1.0
+    backend.emit(b"f2")
+    b.drain()
+    assert b.seconds_since_last_frame() == 0.0   # a fresh frame resets it
+    b.close()
+
+
 # --- lifecycle determinism (18) ------------------------------------
 
 def test_repeated_lifecycle_is_deterministic():

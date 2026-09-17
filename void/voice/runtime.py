@@ -20,6 +20,7 @@ import array
 import logging
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -37,6 +38,28 @@ from void.voice.session import VoiceSession
 from void.voice.state import VoiceState
 from void.voice.tts import create_tts_provider
 from void.voice.wake import WAKE_DETECTED, create_wake_detector
+
+# --- mic-health supervision (broker-based runtimes only) -------------------
+#
+# Real, observed failure this closes: the physical microphone stream can go
+# silent - no more frames delivered - for reasons that have nothing to do
+# with anyone speaking (a Windows microphone-privacy toggle revoking then
+# restoring access while a stream is open, a device that disappears and
+# reappears, a transient driver/native-backend fault) while every OTHER part
+# of the process (the tray icon's Qt event loop, the session state machine
+# sitting quietly in IDLE waiting for a wake word) keeps running and looking
+# completely normal. Nothing before this watched for that: the wake detector
+# and PTT capture only ever react to frames that arrive: if none arrive,
+# nothing ever fires, and nothing ever LOGS that fact either - "listening"
+# and "silently dead" were indistinguishable from the outside. This adds
+# exactly one thing: notice the silence, retry re-opening the SAME broker's
+# capture backend with a bounded backoff, and say so (to the log and to the
+# tray) instead of pretending everything is fine.
+_MIC_SILENCE_TIMEOUT_S = 8.0        # no frames for this long while running -> unhealthy
+_MIC_RECOVERY_CONFIRM_S = 2.0       # a frame this fresh after a restart attempt = recovered
+_MIC_RECOVERY_GRACE_S = 3.0         # how long to wait for that fresh frame before retrying
+_MIC_RECOVERY_INITIAL_BACKOFF_S = 2.0
+_MIC_RECOVERY_MAX_BACKOFF_S = 60.0  # never faster than this between attempts - no busy loop
 
 
 class _SerialVoiceWorker:
@@ -197,7 +220,9 @@ class VoiceController:
                  poll_interval: float = 0.1, worker=None,
                  broker: AudioCaptureBroker | None = None,
                  wake=None, wake_policy: _WakePolicy | None = None,
-                 on_message: Callable[[str], None] | None = None):
+                 on_message: Callable[[str], None] | None = None,
+                 on_state: Callable[[str], None] | None = None,
+                 now: Callable[[], float] | None = None):
         self._session = session
         self._activation = activation
         self._poll_interval = poll_interval
@@ -207,6 +232,19 @@ class VoiceController:
         # (e.g. unit tests), on_ptt_release runs inline exactly as before.
         self._worker = worker
         self._msg = on_message or (lambda _m: None)
+        # Separate from VoiceSession's own on_state: this one exists so the
+        # mic-health supervisor (below) can drive the SAME tray/UI channel
+        # with its own orthogonal signal ("mic_unavailable"/"mic_recovering")
+        # without touching the session's lifecycle state machine at all.
+        self._on_state = on_state or (lambda _s: None)
+        self._now = now or time.monotonic
+
+        # --- mic-health supervision state (broker-based runtimes only) ---
+        self._mic_healthy = True
+        self._mic_recovery_attempts = 0
+        self._mic_backoff = _MIC_RECOVERY_INITIAL_BACKOFF_S
+        self._mic_next_retry_at = 0.0
+        self._mic_restart_pending_since: float | None = None
 
         # --- wake + shared-broker integration (Phase 9C-3) ----------------
         # ALL of this is inert when broker or wake is None: the PTT path is
@@ -268,7 +306,7 @@ class VoiceController:
         controller = cls(session, None, poll_interval=poll_interval,
                          worker=worker, broker=broker, wake=wake,
                          wake_policy=_WakePolicy.from_config(config),
-                         on_message=on_message)
+                         on_message=on_message, on_state=on_state)
         # PTT edges go through the controller: press is quick (mic open / barge-
         # in) and runs inline on the hook thread; release runs the blocking
         # STT/Assistant/TTS chain on the serial worker so the hook thread stays
@@ -353,18 +391,20 @@ class VoiceController:
 
     def poll_once(self) -> None:
         """One deterministic monitor tick: kill-switch enforcement + speech
-        retirement (session.poll), then wake arm/disarm reconciliation."""
+        retirement (session.poll), wake arm/disarm reconciliation, then
+        mic-health supervision (broker-based runtimes only)."""
         self._session.poll()
         self._reconcile_wake()
+        self._check_mic_health()
 
     def _run_monitor(self) -> None:
-        # Cadence only; all decisions live in session.poll() / _reconcile_wake().
-        # A failing tick must never kill the monitor (the kill switch must keep
-        # being checked).
+        # Cadence only; all decisions live in poll_once()'s own methods. A
+        # failing tick must never kill the monitor (the kill switch must keep
+        # being checked, and a bug in the mic-health check must never itself
+        # become a second silent-death mode).
         while not self._stop_evt.wait(self._poll_interval):
             try:
-                self._session.poll()
-                self._reconcile_wake()
+                self.poll_once()
             except Exception:  # pragma: no cover - defensive
                 pass
 
@@ -435,6 +475,90 @@ class VoiceController:
                 if self._endpointer is not None:      # defensive
                     self._safe_unsub(self._endpointer)
                     self._endpointer = None
+
+    # --- mic-health supervision (broker-based runtimes only) -----------
+    #
+    # Detects "the backend has stopped delivering frames" independent of the
+    # session/wake state machines, and recovers by restarting the SAME
+    # broker's capture backend (never a second one - the broker itself
+    # guarantees exactly one physical microphone owner; see
+    # void.voice.capture_broker). Bounded backoff, retried indefinitely, and
+    # never allowed to interrupt an in-progress capture.
+
+    def _check_mic_health(self) -> None:
+        if self._broker is None or not self._broker.running:
+            return
+        now = self._now()
+        silence = self._broker.seconds_since_last_frame()
+        if silence is None:
+            return  # nothing delivered yet since start(); nothing to judge
+
+        if self._mic_restart_pending_since is not None:
+            if silence < _MIC_RECOVERY_CONFIRM_S:
+                self._on_mic_recovered()
+            elif now - self._mic_restart_pending_since >= _MIC_RECOVERY_GRACE_S:
+                self._mic_restart_pending_since = None
+                _log.warning("MIC_RECOVERY_FAILED attempt=%d (no frames resumed)",
+                            self._mic_recovery_attempts)
+                self._schedule_next_retry(now)
+            return
+
+        if silence < _MIC_SILENCE_TIMEOUT_S:
+            if not self._mic_healthy:
+                self._on_mic_recovered()   # frames resumed on their own
+            return
+
+        if self._mic_healthy:
+            self._mic_healthy = False
+            self._mic_recovery_attempts = 0
+            self._mic_backoff = _MIC_RECOVERY_INITIAL_BACKOFF_S
+            self._mic_next_retry_at = now   # try to recover right away
+            _log.warning("MIC_UNAVAILABLE_DETECTED silence_s=%.1f", silence)
+            self._msg("(voice) microphone appears unavailable; attempting recovery...")
+            self._emit_mic_status("mic_unavailable")
+
+        if now < self._mic_next_retry_at:
+            return
+        if self._session.state != VoiceState.IDLE:
+            return   # never restart the stream out from under an active capture
+        self._attempt_mic_recovery(now)
+
+    def _attempt_mic_recovery(self, now: float) -> None:
+        self._mic_recovery_attempts += 1
+        _log.info("MIC_RECOVERY_ATTEMPT attempt=%d", self._mic_recovery_attempts)
+        self._emit_mic_status("mic_recovering")
+        try:
+            self._broker.stop()
+            self._broker.start()
+        except Exception:
+            _log.exception("MIC_RECOVERY_ATTEMPT_FAILED attempt=%d",
+                           self._mic_recovery_attempts)
+            self._schedule_next_retry(now)
+            return
+        # Don't declare success yet: opening the stream can succeed while the
+        # device still delivers nothing (e.g. still mid-permission-change).
+        # Wait for a genuinely fresh frame - see _check_mic_health above.
+        self._mic_restart_pending_since = now
+
+    def _schedule_next_retry(self, now: float) -> None:
+        self._mic_backoff = min(self._mic_backoff * 2, _MIC_RECOVERY_MAX_BACKOFF_S)
+        self._mic_next_retry_at = now + self._mic_backoff
+        _log.info("MIC_RECOVERY_BACKOFF next_attempt_in_s=%.1f", self._mic_backoff)
+
+    def _on_mic_recovered(self) -> None:
+        self._mic_healthy = True
+        self._mic_restart_pending_since = None
+        self._mic_recovery_attempts = 0
+        self._mic_backoff = _MIC_RECOVERY_INITIAL_BACKOFF_S
+        _log.info("MIC_RECOVERY_SUCCEEDED")
+        self._msg("(voice) microphone recovered.")
+        self._emit_mic_status(self._session.state)   # snap the tray back to reality
+
+    def _emit_mic_status(self, status: str) -> None:
+        try:
+            self._on_state(status)
+        except Exception:  # pragma: no cover - defensive; never break health checks
+            pass
 
     def _arm_wake_locked(self) -> None:
         # drain() first so a freshly-armed detector never sees residual audio

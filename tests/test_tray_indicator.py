@@ -50,6 +50,26 @@ def test_unknown_state_falls_back_to_default_without_raising():
     assert "V.O.I.D" in tooltip
 
 
+def test_mic_health_states_are_distinct_from_every_normal_and_error_state():
+    # These are NOT VoiceState values - they come from VoiceController's own
+    # mic-health supervisor (void.voice.runtime), an orthogonal signal about
+    # the physical microphone stream itself, not the session lifecycle. The
+    # bug this closes ("tray says listening while the mic is actually dead")
+    # requires these to be visually unmistakable from ordinary operation.
+    other_colors = {tray_indicator.style_for_state(s)[0] for s in (
+        VoiceState.IDLE, VoiceState.LISTENING, VoiceState.CAPTURED,
+        VoiceState.TRANSCRIBING, VoiceState.DISPATCHED, VoiceState.SPEAKING,
+        VoiceState.ERROR, VoiceState.STOPPED, VoiceState.CLOSED,
+    )}
+    unavailable_color, unavailable_tip = tray_indicator.style_for_state("mic_unavailable")
+    recovering_color, recovering_tip = tray_indicator.style_for_state("mic_recovering")
+    assert unavailable_color not in other_colors
+    assert recovering_color not in other_colors
+    assert unavailable_color != recovering_color
+    assert "microphone" in unavailable_tip.lower()
+    assert "microphone" in recovering_tip.lower()
+
+
 def test_style_mapping_is_case_and_whitespace_tolerant():
     assert tray_indicator.style_for_state(" IDLE ") == tray_indicator.style_for_state("idle")
 

@@ -47,6 +47,13 @@ _STATE_STYLE: dict[str, tuple[tuple[int, int, int], str]] = {
     "error":        ((220, 70, 70),   "V.O.I.D - voice error (push-to-talk may still work)"),
     "stopped":      ((160, 160, 160), "V.O.I.D - stopped (kill switch engaged)"),
     "closed":       ((160, 160, 160), "V.O.I.D - voice stopped"),
+    # Orthogonal to the session states above (see
+    # void.voice.runtime.VoiceController's mic-health supervisor): the
+    # microphone stream itself has gone silent independent of what the
+    # session/wake-word state machine thinks is happening, so the tray must
+    # be able to say that distinctly rather than keep showing "listening".
+    "mic_unavailable": ((200, 30, 30),  "V.O.I.D - microphone unavailable (retrying...)"),
+    "mic_recovering":  ((230, 150, 0),  "V.O.I.D - microphone recovering..."),
 }
 _DEFAULT_STYLE = ((120, 120, 120), "V.O.I.D")
 

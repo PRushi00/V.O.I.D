@@ -230,12 +230,18 @@ class AudioCaptureBroker:
                  frame_ms: int = _DEFAULT_FRAME_MS,
                  intake_frames: int = _DEFAULT_INTAKE_FRAMES,
                  consumer_frames: int = _DEFAULT_CONSUMER_FRAMES,
-                 on_consumer_error: Callable[[Consumer, Exception], None] | None = None):
+                 on_consumer_error: Callable[[Consumer, Exception], None] | None = None,
+                 now: Callable[[], float] | None = None):
         self._frame_samples = max(1, SAMPLE_RATE * int(frame_ms) // 1000)
         self._backend = backend           # None -> a real backend is built at start()
         self._intake_depth = max(1, int(intake_frames))
         self._consumer_depth = max(1, int(consumer_frames))
         self._on_consumer_error = on_consumer_error
+        # Injectable only for deterministic tests of the frame-timestamp
+        # health signal (void.voice.runtime's mic-health supervisor uses its
+        # own injectable clock too, and must observe the SAME clock as this
+        # class does); production always uses the real monotonic clock.
+        self._now = now or time.monotonic
 
         self._lock = threading.RLock()
         self._done = threading.Condition(self._lock)   # notified when intake drains
@@ -251,6 +257,13 @@ class AudioCaptureBroker:
         # at what rate, without inspecting or logging what is IN a frame.
         self._frames_since_log = 0
         self._last_frame_log = 0.0
+        # Monotonic timestamp of the last frame actually delivered by the
+        # backend - the ONLY thing that makes "the stream silently stopped
+        # producing frames" (e.g. a mic privacy revocation, a device that
+        # disappeared) distinguishable from "nobody has said anything lately".
+        # Consulted by void.voice.runtime's mic-health supervisor; this class
+        # itself never reacts to it (infrastructure only - see module docstring).
+        self._last_frame_at = 0.0
 
     # --- introspection ----------------------------------------------------
     @property
@@ -278,6 +291,20 @@ class AudioCaptureBroker:
             sub = self._subs.get(consumer)
             return sub.errors if sub is not None else 0
 
+    def seconds_since_last_frame(self) -> float | None:
+        """Seconds since the backend last actually delivered a frame, or
+        ``None`` if none has arrived yet (e.g. just started). Deliberately
+        says nothing about WHY - a long-running backend that has simply
+        gone silent (device revoked, stream invalidated, a native fault that
+        killed the callback) looks identical from here to one that was
+        cleanly stopped; callers that care about that distinction combine
+        this with :attr:`running` themselves (see
+        void.voice.runtime.VoiceController's mic-health supervisor)."""
+        with self._lock:
+            if self._last_frame_at <= 0.0:
+                return None
+            return self._now() - self._last_frame_at
+
     # --- subscription ---------------------------------------------------
     def subscribe(self, consumer: Consumer) -> None:
         if not callable(consumer):
@@ -303,7 +330,7 @@ class AudioCaptureBroker:
                     frame_samples=self._frame_samples)
             self._drain_intake_locked()
             self._frames_since_log = 0
-            self._last_frame_log = time.monotonic()
+            self._last_frame_log = self._now()
             self._pump = threading.Thread(
                 target=self._run_pump, name="void-audio-broker", daemon=True)
             self._running = True
@@ -380,7 +407,8 @@ class AudioCaptureBroker:
             self._intake.put_nowait(frame)
             self._inflight += 1
             self._frames_since_log += 1
-            now = time.monotonic()
+            now = self._now()
+            self._last_frame_at = now
             if now - self._last_frame_log >= _FRAME_LOG_PERIOD_S:
                 _log.info("AUDIO_FRAMES_RECEIVED count=%d over=%.1fs subscribers=%d",
                           self._frames_since_log, now - self._last_frame_log,
@@ -396,6 +424,18 @@ class AudioCaptureBroker:
                 return
             try:
                 self._fanout(frame)
+            except Exception:
+                # _fanout already isolates a single consumer's own exception
+                # (see _fanout) - this is defense-in-depth against a failure
+                # in the broker's OWN bookkeeping. An uncaught error here
+                # would otherwise kill this thread permanently and silently:
+                # the backend would keep happily receiving audio (and logging
+                # its own AUDIO_FRAMES_RECEIVED health marker from the
+                # callback thread) while NO consumer - wake detector or
+                # command capture - ever received another frame again. That
+                # is exactly the "looks healthy, isn't" failure this module
+                # exists to prevent, so the pump must never die quietly.
+                _log.exception("AUDIO_PUMP_ERROR (frame dropped; pump continues)")
             finally:
                 self._intake.task_done()
                 with self._done:
