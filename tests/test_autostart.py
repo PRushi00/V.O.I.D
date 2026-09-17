@@ -68,3 +68,61 @@ def test_custom_value_name_isolated():
     autostart.install(command="a", backend=reg, value_name="VOID_TEST")
     assert autostart.status(backend=reg, value_name="VOID_TEST") == "a"
     assert autostart.status(backend=reg) is None     # default name untouched
+
+
+# --- CLI wiring: 'void autostart' now uses Task Scheduler, migrating away
+# from any older Run-key registration so exactly one mechanism is ever active
+
+def test_cmd_autostart_install_migrates_off_the_old_run_key(monkeypatch, capsys):
+    from void import cli
+    from void.runtime import scheduled_task
+
+    reg = FakeRegistry()
+    reg.set_value(autostart.VALUE_NAME, autostart.default_launch_command())
+    monkeypatch.setattr(autostart, "_WinregBackend", lambda: reg)
+
+    task_backend = {}
+
+    class FakeTaskBackend:
+        def register(self, name, exe, args, description):
+            task_backend[name] = (exe, args)
+
+        def query(self, name):
+            return None
+
+        def delete(self, name):
+            return False
+
+    monkeypatch.setattr(scheduled_task, "_TaskSchedulerBackend", FakeTaskBackend)
+
+    assert cli.cmd_autostart("install") == 0
+    assert scheduled_task.TASK_NAME in task_backend   # new mechanism registered
+    assert autostart.status(backend=reg) is None       # old Run key removed
+    out = capsys.readouterr().out
+    assert "Task Scheduler" in out
+
+
+def test_cmd_autostart_remove_clears_both_mechanisms(monkeypatch):
+    from void import cli
+    from void.runtime import scheduled_task
+
+    reg = FakeRegistry()
+    monkeypatch.setattr(autostart, "_WinregBackend", lambda: reg)
+
+    removed = {"task": False}
+
+    class FakeTaskBackend:
+        def register(self, name, exe, args, description):
+            pass
+
+        def query(self, name):
+            return None
+
+        def delete(self, name):
+            was = removed["task"]
+            removed["task"] = True
+            return not was   # True the first time, False after
+
+    monkeypatch.setattr(scheduled_task, "_TaskSchedulerBackend", FakeTaskBackend)
+
+    assert cli.cmd_autostart("remove") == 0   # does not raise either way

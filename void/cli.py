@@ -531,25 +531,35 @@ def cmd_voice() -> int:
 
 
 def cmd_autostart(action: str) -> int:
-    """Manage silent login autostart of the voice runtime (HKCU Run key,
-    no admin/service/security change). 'install' makes V.O.I.D start at login
-    with no terminal; 'remove' undoes it; 'status' shows the current entry."""
-    from void.runtime import autostart
+    """Manage persistent login autostart of the voice runtime via Task
+    Scheduler (per-user, no admin/service/security change): a login trigger
+    AND a workstation-unlock trigger (the Run key only ever fires once per
+    fresh sign-in, which is why V.O.I.D could go a whole sleep/wake day
+    without starting), plus automatic restart if it ever exits unexpectedly.
+    'install' is idempotent and also removes any older Run-key registration
+    so exactly one autostart mechanism is ever active; 'remove' undoes it;
+    'status' shows the current registration."""
+    from void.runtime import autostart, scheduled_task
 
     if action == "install":
         pythonw = autostart.default_pythonw_path()
-        cmd = autostart.install()
-        print(f"Autostart installed. V.O.I.D will launch at login:\n  {cmd}")
+        cmd = scheduled_task.install()
+        autostart.remove()   # migration: never leave two active mechanisms
+        print(f"Autostart installed (Task Scheduler). V.O.I.D will launch at "
+              f"login and workstation unlock, and restart automatically if it "
+              f"exits unexpectedly:\n  {cmd}")
         if "pythonw.exe" not in pythonw.lower():
             print("  NOTE: pythonw.exe was not found next to this interpreter, "
                   "so a console window may briefly appear at login.")
-        print('  Say "Hey V.O.I.D." after the next login - no terminal needed.')
+        print('  Say "Hey V.O.I.D." after the next login/unlock - no terminal needed.')
         return 0
     if action == "remove":
-        removed = autostart.remove()
+        removed_task = scheduled_task.remove()
+        removed_run_key = autostart.remove()   # defensive: clear either mechanism
+        removed = removed_task or removed_run_key
         print("Autostart removed." if removed else "Autostart was not installed.")
         return 0
-    current = autostart.status()
+    current = scheduled_task.status()
     print(f"Autostart: INSTALLED\n  {current}" if current
           else "Autostart: not installed. Run 'python -m void autostart install'.")
     return 0

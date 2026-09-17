@@ -58,5 +58,19 @@ def test_autostart_launcher_delegates_to_existing_headless_voice_command(monkeyp
 
     calls = []
     monkeypatch.setattr(voice_startup, "_install_background_logging", lambda: None)
+    monkeypatch.setattr(voice_startup, "_acquire_single_instance_lock", lambda: True)
     assert voice_startup.main(lambda argv: calls.append(argv) or 0) == 0
     assert calls == [["voice"]]
+
+
+def test_autostart_launcher_exits_cleanly_when_already_running(monkeypatch):
+    # A second startup trigger (e.g. both the login AND unlock Task
+    # Scheduler triggers firing close together) must never launch a
+    # second, microphone-competing voice runtime.
+    from void.runtime import voice_startup
+
+    calls = []
+    monkeypatch.setattr(voice_startup, "_install_background_logging", lambda: None)
+    monkeypatch.setattr(voice_startup, "_acquire_single_instance_lock", lambda: False)
+    assert voice_startup.main(lambda argv: calls.append(argv) or 0) == 0
+    assert calls == []   # cli_main (which would open the mic) was never called
