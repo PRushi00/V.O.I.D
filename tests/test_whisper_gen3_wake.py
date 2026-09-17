@@ -210,6 +210,30 @@ def test_feed_audio_emits_periodic_frame_received_health_marker(caplog, monkeypa
         assert "count=" in r.message and "over=" in r.message
 
 
+def test_wake_trigger_logs_the_exact_triggering_score(caplog):
+    # False-wake investigation: there was previously no way to see the EXACT
+    # score that triggered a given wake - only a throttled periodic sample
+    # that could be showing a stale/unrelated inference. This must fire
+    # every time a wake is emitted (not throttled like the health markers),
+    # since it shares the same rising-edge condition as the wake event itself.
+    import logging
+
+    det = _make(logit=5.0)   # sigmoid(5) = 0.993 >= 0.34
+    with caplog.at_level(logging.INFO, logger="void.voice.whisper_gen3_wake"):
+        det.start()
+        try:
+            for f in _frames():
+                det.feed_audio(f)
+            assert _wait(lambda: any(
+                "WAKE_TRIGGER_SCORE" in r.message for r in caplog.records))
+        finally:
+            det.close()
+    markers = [r for r in caplog.records if "WAKE_TRIGGER_SCORE" in r.message]
+    assert len(markers) == 1                 # exactly one, matching the one wake
+    assert "score=0.993" in markers[0].message
+    assert "threshold=0.34" in markers[0].message
+
+
 def test_infer_loop_emits_periodic_processing_active_health_marker(caplog, monkeypatch):
     # Proves the background encode+classify loop is actually running
     # end-to-end (not just armed), independent of whether wake ever fires.

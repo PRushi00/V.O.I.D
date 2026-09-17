@@ -21,6 +21,7 @@ import json
 import logging
 import re
 import sys
+import threading
 import time
 
 from void.app import Assistant
@@ -457,9 +458,25 @@ def cmd_voice() -> int:
     from void.voice.adapters import VoiceDependencyError
     from void.voice.runtime import VoiceController
 
+    # Small, optional notification-area listening indicator (NOT the Blackhole/
+    # Singularity developer UI - see void.ui.tray_indicator). Best-effort: any
+    # failure here (no PySide6, no system tray on this session) must never
+    # affect voice - `indicator`/`bridge` simply stay None and cmd_voice()
+    # runs exactly as it always has.
+    indicator = None
+    bridge = None
+    try:
+        from void.ui.voice_bridge import VoiceStateBridge
+        from void.ui import tray_indicator
+        bridge = VoiceStateBridge()
+    except Exception:
+        bridge = None
+
     def on_state(state):
         _log.info("VOICE_STATE %s", state)
         print(f"  [voice] {state}", flush=True)
+        if bridge is not None:
+            bridge.stateChanged.emit(state)
 
     controller = VoiceController.from_assistant(
         assistant,
@@ -467,6 +484,12 @@ def cmd_voice() -> int:
         on_transcript=lambda t: print(f"  [heard] {t}", flush=True),
         on_message=lambda m: print(f"  {m}", flush=True),
     )
+
+    exit_requested = threading.Event()
+    if bridge is not None:
+        indicator = tray_indicator.create(
+            assistant, bridge, on_exit=exit_requested.set)
+
     hotkey = assistant.config.get("voice.ptt_hotkey", "ctrl+space")
     try:
         controller.start()
@@ -488,11 +511,17 @@ def cmd_voice() -> int:
           f"The Whisper model downloads on first use. Ctrl+C to exit.\n"
           f"(To stop everything: run 'python -m void stop' in another terminal.)")
     try:
-        while not controller.stopped:
-            time.sleep(0.2)
+        if indicator is not None:
+            indicator.run_until(
+                lambda: controller.stopped or exit_requested.is_set())
+        else:
+            while not controller.stopped and not exit_requested.is_set():
+                time.sleep(0.2)
     except KeyboardInterrupt:
         print("\nExiting voice.")
     finally:
+        if indicator is not None:
+            indicator.stop()
         controller.shutdown("voice CLI exit")
         _log.info("VOICE_RUNTIME_STOPPED")
     if controller.stopped:

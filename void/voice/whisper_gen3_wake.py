@@ -245,6 +245,14 @@ class WhisperGen3WakeDetector(WakeWordDetector):
             if score >= self._threshold:
                 if not self._above:
                     self._above = True
+                    # Diagnostic only (the classifier's own score - never audio
+                    # content): the false-wake investigation found no existing
+                    # way to see the EXACT score that triggered a given wake,
+                    # only a throttled periodic sample. This always fires,
+                    # exactly once per rising edge (same cadence as the wake
+                    # event itself), so it is never a spam risk.
+                    _log.info("WAKE_TRIGGER_SCORE score=%.3f threshold=%.2f",
+                              score, self._threshold)
                     self._emit_wake()          # exactly one event per rising edge
             else:
                 self._above = False
