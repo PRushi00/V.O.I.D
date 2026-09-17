@@ -184,3 +184,50 @@ def test_inference_error_is_logged_once_not_silent(caplog):
     assert events == []                      # never a false wake on failure
     n = sum("wake inference failed" in r.message for r in caplog.records)
     assert n == 1                            # logged once, not on every hop
+
+
+def test_feed_audio_emits_periodic_frame_received_health_marker(caplog, monkeypatch):
+    # Post-reboot diagnosability: prove frames from the broker are actually
+    # reaching this detector, without logging any audio content - just a
+    # periodic count. Shrink the cadence so the test doesn't need 5 real
+    # seconds of frames.
+    import logging
+
+    import void.voice.whisper_gen3_wake as mod
+    monkeypatch.setattr(mod, "_HEALTH_LOG_PERIOD_S", 0.05)
+    det = _make(logit=-5.0)   # score below threshold: isolates the frame marker
+    det.start()
+    with caplog.at_level(logging.INFO, logger="void.voice.whisper_gen3_wake"):
+        try:
+            for f in _frames(n_seconds=2.0):
+                det.feed_audio(f)
+                time.sleep(0.01)
+        finally:
+            det.close()
+    markers = [r for r in caplog.records if "WAKEWORD_FRAMES_RECEIVED" in r.message]
+    assert markers, "expected at least one WAKEWORD_FRAMES_RECEIVED health marker"
+    for r in markers:
+        assert "count=" in r.message and "over=" in r.message
+
+
+def test_infer_loop_emits_periodic_processing_active_health_marker(caplog, monkeypatch):
+    # Proves the background encode+classify loop is actually running
+    # end-to-end (not just armed), independent of whether wake ever fires.
+    import logging
+
+    import void.voice.whisper_gen3_wake as mod
+    monkeypatch.setattr(mod, "_HEALTH_LOG_PERIOD_S", 0.05)
+    det = _make(logit=-5.0, hop=0.01)
+    with caplog.at_level(logging.INFO, logger="void.voice.whisper_gen3_wake"):
+        det.start()
+        try:
+            for f in _frames(n_seconds=1.5):
+                det.feed_audio(f)
+            assert _wait(lambda: any(
+                "WAKEWORD_PROCESSING_ACTIVE" in r.message for r in caplog.records))
+        finally:
+            det.close()
+    markers = [r for r in caplog.records if "WAKEWORD_PROCESSING_ACTIVE" in r.message]
+    assert markers
+    for r in markers:
+        assert "last_score=" in r.message and "threshold=" in r.message

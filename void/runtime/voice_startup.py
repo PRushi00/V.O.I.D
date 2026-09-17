@@ -20,23 +20,11 @@ def _ensure_repo_on_path() -> None:
 
 
 def _install_background_logging() -> None:
-    """Write privacy-safe lifecycle diagnostics for a ``pythonw`` process."""
-    root_logger = logging.getLogger()
-    if any(getattr(handler, "_void_voice_startup", False)
-           for handler in root_logger.handlers):
-        return
-    try:
-        from void.config import Config
-        log_path = Config.load().state_dir() / "void.log"
-        handler = logging.FileHandler(log_path, encoding="utf-8")
-        handler._void_voice_startup = True
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(levelname)s %(name)s: %(message)s"))
-        root_logger.addHandler(handler)
-        root_logger.setLevel(logging.WARNING)
-        logging.getLogger("void").setLevel(logging.INFO)
-    except Exception:
-        pass
+    """Write privacy-safe lifecycle diagnostics (void.log) for a ``pythonw``
+    process. Shared with the other launchers - see void.runtime.diagnostics."""
+    _ensure_repo_on_path()
+    from void.runtime.diagnostics import install_background_logging
+    install_background_logging()
 
 
 def main(cli_main: Callable[[list[str]], int] | None = None) -> int:

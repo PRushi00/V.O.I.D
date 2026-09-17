@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -42,6 +43,7 @@ _DEFAULT_THRESHOLD = 0.34          # validated Gen3 Exp02 operating point (owner
 _DEFAULT_WINDOW_S = 2.0            # must match training/eval clip_seconds
 _DEFAULT_HOP_S = 0.2              # inference cadence
 _MIN_INFER_SAMPLES = int(0.6 * _SAMPLE_RATE)   # don't score until ~0.6 s has arrived
+_HEALTH_LOG_PERIOD_S = 5.0    # periodic marker cadence; never per-frame/per-inference
 
 
 class WhisperGen3WakeDetector(WakeWordDetector):
@@ -87,6 +89,14 @@ class WhisperGen3WakeDetector(WakeWordDetector):
         self._closed = False
         self._above = False              # rising-edge latch (infer thread only)
         self._infer_error_logged = False  # observability: log a persistent failure once
+
+        # Health markers only (counts/scores, never audio content): prove
+        # frames actually reach this detector and that inference is actually
+        # running, independent of whether a wake ever fires.
+        self._frames_fed = 0
+        self._last_feed_log = 0.0
+        self._infers_since_log = 0
+        self._last_infer_log = 0.0
 
     @property
     def threshold(self) -> float:
@@ -144,6 +154,10 @@ class WhisperGen3WakeDetector(WakeWordDetector):
         self._buf = self._np.zeros(0, dtype=self._np.int16)
         self._above = False
         self._infer_error_logged = False
+        self._frames_fed = 0
+        self._last_feed_log = time.monotonic()
+        self._infers_since_log = 0
+        self._last_infer_log = time.monotonic()
         self._stop_evt.clear()
         self._running = True
         self._infer_thread = threading.Thread(
@@ -176,6 +190,16 @@ class WhisperGen3WakeDetector(WakeWordDetector):
             self._buf = np.concatenate([self._buf, samples])
             if len(self._buf) > self._window_samples:
                 self._buf = self._buf[-self._window_samples:]
+        # Health marker only (a frame count, never audio content): proves
+        # frames from the broker actually reach THIS detector, independent of
+        # whether the background inference thread is keeping up.
+        self._frames_fed += 1
+        now = time.monotonic()
+        if now - self._last_feed_log >= _HEALTH_LOG_PERIOD_S:
+            _log.info("WAKEWORD_FRAMES_RECEIVED count=%d over=%.1fs",
+                      self._frames_fed, now - self._last_feed_log)
+            self._frames_fed = 0
+            self._last_feed_log = now
 
     # --- background inference -----------------------------------------
     def _infer_loop(self) -> None:
@@ -205,6 +229,19 @@ class WhisperGen3WakeDetector(WakeWordDetector):
                 _log.info("gen3 wake inference recovered")
             if score is None:
                 continue
+            # Health marker only (the classifier's own score, never audio
+            # content): proves the background inference loop is actually
+            # running end-to-end (encode + classify), independent of whether
+            # the score ever crosses the wake threshold.
+            self._infers_since_log += 1
+            now = time.monotonic()
+            if now - self._last_infer_log >= _HEALTH_LOG_PERIOD_S:
+                _log.info("WAKEWORD_PROCESSING_ACTIVE inferences=%d last_score=%.3f "
+                          "threshold=%.2f over=%.1fs",
+                          self._infers_since_log, score, self._threshold,
+                          now - self._last_infer_log)
+                self._infers_since_log = 0
+                self._last_infer_log = now
             if score >= self._threshold:
                 if not self._above:
                     self._above = True

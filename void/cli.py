@@ -431,6 +431,17 @@ def cmd_voice() -> int:
     NOT approved by voice - they defer to AWAITING_CONFIRMATION (no confirm_fn),
     handled out-of-band; a spoken 'yes' is just another goal, never an approval.
     """
+    # Diagnostics: without this, the mic/wakeword lifecycle logging below is a
+    # no-op (no handler is attached anywhere in the logger hierarchy) when this
+    # command is run directly from a terminal - the file handler makes a
+    # manual run reboot-comparable via ~/.void/void.log; the console handler
+    # additionally echoes it live, and safely no-ops under the console-less
+    # pythonw autostart (see void.runtime.diagnostics).
+    from void.runtime.diagnostics import (
+        install_background_logging, install_console_diagnostics,
+    )
+    install_background_logging()
+    install_console_diagnostics()
     _log.info("VOICE_RUNTIME_STARTING")
     assistant = Assistant(on_event=_event)  # no confirm_fn -> HIGH-risk deferred
     if not assistant.config.get("voice.enabled", False):

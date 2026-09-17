@@ -37,6 +37,7 @@ of active capture. Nothing is written to disk, nothing logs raw audio, and
 """
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -44,6 +45,8 @@ from collections import deque
 from typing import Callable
 
 from void.voice.adapters import VoiceDependencyError
+
+_log = logging.getLogger(__name__)
 
 # One frame is raw PCM bytes: 16-bit signed little-endian, mono, 16 kHz.
 Frame = bytes
@@ -56,6 +59,7 @@ SAMPLE_WIDTH = 2             # bytes per sample (int16)
 _DEFAULT_FRAME_MS = 30       # 480 samples / 960 bytes per frame at 16 kHz
 _DEFAULT_INTAKE_FRAMES = 64  # bounded broker intake buffer (drop-oldest)
 _DEFAULT_CONSUMER_FRAMES = 32  # bounded per-consumer buffer (drop-oldest)
+_FRAME_LOG_PERIOD_S = 5.0    # health-marker cadence; never per-frame (no spam)
 
 
 class AudioBrokerError(RuntimeError):
@@ -157,6 +161,18 @@ class SoundDeviceCaptureBackend(CaptureBackend):
             raise AudioBrokerError(
                 f"could not open a {SAMPLE_RATE} Hz mono microphone stream: "
                 f"{exc}") from exc
+        # Diagnostics only (no audio content): WHICH physical device PortAudio
+        # actually opened. A stream can start successfully yet be bound to the
+        # wrong (or a silent/virtual) input device, so recording device
+        # identity is the only way to later tell "no wake" apart from
+        # "wrong microphone".
+        try:
+            idx = sd.default.device[0]
+            name = sd.query_devices(idx)["name"] if idx is not None and idx >= 0 else "?"
+            _log.info("MICROPHONE_OPENED device=%r index=%s samplerate=%d",
+                      name, idx, SAMPLE_RATE)
+        except Exception:
+            _log.info("MICROPHONE_OPENED device=<unknown> (query failed)")
 
     def stop(self) -> None:
         stream, self._stream = self._stream, None
@@ -230,6 +246,12 @@ class AudioCaptureBroker:
         self._running = False
         self._closed = False
 
+        # Health-marker only (a count, never audio content or its shape/level):
+        # proves whether the backend is actually delivering frames at all, and
+        # at what rate, without inspecting or logging what is IN a frame.
+        self._frames_since_log = 0
+        self._last_frame_log = 0.0
+
     # --- introspection ----------------------------------------------------
     @property
     def running(self) -> bool:
@@ -280,6 +302,8 @@ class AudioCaptureBroker:
                 self._backend = SoundDeviceCaptureBackend(
                     frame_samples=self._frame_samples)
             self._drain_intake_locked()
+            self._frames_since_log = 0
+            self._last_frame_log = time.monotonic()
             self._pump = threading.Thread(
                 target=self._run_pump, name="void-audio-broker", daemon=True)
             self._running = True
@@ -355,6 +379,14 @@ class AudioCaptureBroker:
                     pass
             self._intake.put_nowait(frame)
             self._inflight += 1
+            self._frames_since_log += 1
+            now = time.monotonic()
+            if now - self._last_frame_log >= _FRAME_LOG_PERIOD_S:
+                _log.info("AUDIO_FRAMES_RECEIVED count=%d over=%.1fs subscribers=%d",
+                          self._frames_since_log, now - self._last_frame_log,
+                          len(self._subs))
+                self._frames_since_log = 0
+                self._last_frame_log = now
 
     def _run_pump(self) -> None:
         while True:

@@ -336,32 +336,9 @@ class SingularityOverlay(QWidget):
         super().closeEvent(event)
 
 
-def _install_background_logging() -> None:
-    """Route V.O.I.D's own WARNING+ (and its own INFO) to a local diagnostic
-    file so a CONSOLE-LESS run (pythonw autostart) is still diagnosable: a
-    startup crash or a wake-inference failure lands in ~/.void/void.log instead
-    of vanishing. Third-party libraries stay at WARNING so the file does not
-    fill with noise. Never records audio, transcripts, secrets or credentials -
-    only lifecycle + exceptions. Idempotent."""
-    root = logging.getLogger()
-    if any(getattr(h, "_void_bg", False) for h in root.handlers):
-        return
-    try:
-        from void.app import Config
-        log_path = Config.load().state_dir() / "void.log"
-    except Exception:
-        import tempfile
-        log_path = Path(tempfile.gettempdir()) / "void.log"
-    try:
-        handler = logging.FileHandler(log_path, encoding="utf-8")
-        handler._void_bg = True
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(levelname)s %(name)s: %(message)s"))
-        root.addHandler(handler)
-        root.setLevel(logging.WARNING)          # quiet by default (third-party)
-        logging.getLogger("void").setLevel(logging.INFO)   # our own lifecycle
-    except Exception:
-        pass
+# Writes to void.log (~/.void/void.log) so a CONSOLE-LESS pythonw run is still
+# diagnosable. Shared with the other launchers - see void.runtime.diagnostics.
+from void.runtime.diagnostics import install_background_logging as _install_background_logging
 
 
 def launch() -> int:

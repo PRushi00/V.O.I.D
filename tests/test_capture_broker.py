@@ -519,6 +519,83 @@ def test_sounddevice_backend_wraps_open_failure(monkeypatch):
         be.start(lambda _f: None)
 
 
+def test_sounddevice_backend_logs_which_device_it_opened(monkeypatch, caplog):
+    # Post-reboot diagnosability: "the stream opened" is not the same as
+    # "the right physical microphone opened" - a wrong/virtual/silent default
+    # input device can still open successfully. Record device identity so a
+    # stale/incorrect default device is distinguishable after the fact.
+    import logging
+
+    pytest.importorskip("numpy")
+
+    class _FakeStream:
+        def start(self): pass
+        def stop(self): pass
+        def close(self): pass
+
+    class _FakeSD:
+        class default:
+            device = (3, 7)
+
+        def InputStream(self, **kw):       # noqa: N802
+            return _FakeStream()
+
+        def query_devices(self, idx):
+            assert idx == 3
+            return {"name": "Fake USB Microphone"}
+
+    monkeypatch.setitem(sys.modules, "sounddevice", _FakeSD())
+    be = SoundDeviceCaptureBackend(frame_samples=480)
+    with caplog.at_level(logging.INFO, logger="void.voice.capture_broker"):
+        be.start(lambda _f: None)
+    assert any("MICROPHONE_OPENED" in r.message and "Fake USB Microphone" in r.message
+              for r in caplog.records)
+    be.close()
+
+
+def test_sounddevice_backend_device_query_failure_does_not_break_start(monkeypatch, caplog):
+    # A device-identity query is diagnostics only - if it fails, capture must
+    # still proceed; the health marker just falls back to "unknown".
+    import logging
+
+    pytest.importorskip("numpy")
+
+    class _FakeStream:
+        def start(self): pass
+        def stop(self): pass
+        def close(self): pass
+
+    class _FakeSD:
+        def InputStream(self, **kw):       # noqa: N802
+            return _FakeStream()
+        # no .default / .query_devices at all
+
+    monkeypatch.setitem(sys.modules, "sounddevice", _FakeSD())
+    be = SoundDeviceCaptureBackend(frame_samples=480)
+    with caplog.at_level(logging.INFO, logger="void.voice.capture_broker"):
+        be.start(lambda _f: None)          # must not raise
+    assert any("MICROPHONE_OPENED" in r.message for r in caplog.records)
+    be.close()
+
+
+def test_broker_emits_periodic_audio_frames_received_health_marker(monkeypatch, caplog):
+    # Post-reboot diagnosability: prove the broker is actually delivering
+    # frames from the backend, without inspecting or logging frame content.
+    import logging
+
+    import void.voice.capture_broker as mod
+    monkeypatch.setattr(mod, "_FRAME_LOG_PERIOD_S", 0.0)   # log on first frame
+    b, backend = _broker()
+    with caplog.at_level(logging.INFO, logger="void.voice.capture_broker"):
+        b.start()
+        backend.emit(b"\x00\x00" * 480)
+        b.drain()
+    b.close()
+    markers = [r for r in caplog.records if "AUDIO_FRAMES_RECEIVED" in r.message]
+    assert markers
+    assert "count=" in markers[0].message
+
+
 # --- authority boundary (12 of the spec) --------------------------
 
 def test_broker_holds_no_authority_references():
@@ -544,7 +621,7 @@ def test_capture_broker_module_imports_stay_infra_only():
     # stdlib + the shared voice-IO error module + the two lazy audio deps only
     assert imported <= {
         "__future__", "queue", "threading", "time", "collections", "typing",
-        "void.voice.adapters", "numpy", "sounddevice",
+        "logging", "void.voice.adapters", "numpy", "sounddevice",
     }, f"unexpected imports: {imported}"
     for banned in ("void.voice.wake", "void.voice.session", "void.voice.state",
                    "void.voice.runtime", "void.core.agent",
