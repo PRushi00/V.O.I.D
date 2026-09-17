@@ -133,21 +133,24 @@ def create(assistant, bridge, *, on_exit: Callable[[], None] | None = None
             app = QApplication([])
         app.setQuitOnLastWindowClosed(False)
 
-        if not QSystemTrayIcon.isSystemTrayAvailable():
+        tray_available = QSystemTrayIcon.isSystemTrayAvailable()
+        _log.info("TRAY_SYSTEM_AVAILABLE %s", tray_available)
+        if not tray_available:
             _log.info("TRAY_INDICATOR_UNAVAILABLE no system tray on this session")
             return None
 
         def _make_icon(rgb: tuple[int, int, int]) -> "QIcon":
+            # A small translucent ring is easy to miss at the ~16x16 size
+            # Windows actually renders in the tray - a solid, fully opaque
+            # disc with a bright white border reads clearly at that size
+            # against both light and dark taskbars.
             pm = QPixmap(32, 32)
             pm.fill(Qt.transparent)
             p = QPainter(pm)
             p.setRenderHint(QPainter.Antialiasing, True)
-            p.setPen(QPen(QColor(*rgb, 230), 3))
-            p.setBrush(Qt.NoBrush)
-            p.drawEllipse(6, 6, 20, 20)
-            p.setPen(Qt.NoPen)
+            p.setPen(QPen(QColor(255, 255, 255, 255), 3))
             p.setBrush(QColor(*rgb, 255))
-            p.drawEllipse(11, 11, 10, 10)
+            p.drawEllipse(3, 3, 26, 26)
             p.end()
             return QIcon(pm)
 
@@ -179,7 +182,12 @@ def create(assistant, bridge, *, on_exit: Callable[[], None] | None = None
         tray.setContextMenu(menu)
         tray.show()
         indicator._owns_app = owns_app     # diagnostics/tests only
-        _log.info("TRAY_INDICATOR_READY")
+        # isVisible() reflects Qt's own internal flag, not confirmation from
+        # the shell - "no window handle to register against" and similar
+        # failures can still leave this True, but a False here would be a
+        # definite, unambiguous sign something is wrong on THIS side.
+        _log.info("TRAY_INDICATOR_READY qt_is_visible=%s platform=%s",
+                  tray.isVisible(), app.platformName())
         return indicator
     except Exception:
         _log.info("TRAY_INDICATOR_UNAVAILABLE", exc_info=True)
