@@ -109,3 +109,17 @@ voice:
   mic_frame_ms: 30               # broker frame size in ms (16 kHz mono int16)
   mic_intake_frames: 64          # bounded broker intake buffer (drop-oldest)
   mic_consumer_frames: 32        # bounded per-consumer buffer (drop-oldest)
+
+# Mobile companion Device Gateway (V1 foundation, opt-in - see void/device/).
+# NOT started by voice/autostart; only "python -m void device serve" opens
+# this port. A paired device still only reaches the small, fixed capability
+# allow-list in void.device.capabilities - never the raw ToolRegistry - and
+# every action still passes through the same RiskGate/KillSwitch as any
+# other V.O.I.D entry point.
+device:
+  host: "0.0.0.0"        # listen on all interfaces (needed to be reachable
+                         # over a phone hotspot); the port is TLS + paired-
+                         # device-only, not an open door - see the gateway's
+                         # module docstring for the full authorization chain.
+  port: 8765
+  pairing_window_seconds: 300   # how long a `device pair-start` token is valid

@@ -565,6 +565,172 @@ def cmd_autostart(action: str) -> int:
     return 0
 
 
+# --- device gateway (mobile companion, V1 foundation) -------------------
+#
+# Off by default: none of these commands are called from voice/autostart, and
+# 'device serve' is the only thing that ever opens a network port. Pairing
+# and capability grants are owner-only CLI actions, exactly like `roots`/
+# `protect` - never something the agent/LLM or a network request can do to
+# itself.
+
+def _device_state_dir():
+    from void.config import Config
+    return Config.load().state_dir()
+
+
+def _local_ip_hint() -> str | None:
+    """Best-effort local IP hint for the pairing screen. Uses a UDP socket's
+    routing lookup (no packets are actually sent for a connected UDP socket)
+    to find the address of the interface that would reach the open internet
+    - on a laptop tethered to a phone hotspot with no other network, that is
+    the hotspot interface's address, which is what needs to be typed into
+    the companion device. Purely a convenience hint: the owner should confirm
+    it (e.g. via `ipconfig`) if more than one network interface is active."""
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
+        return None
+
+
+def cmd_device_pair_start(name: str | None, minutes: float) -> int:
+    from void.config import Config
+    from void.device import cert as cert_mod
+    from void.device.pairing import PairingManager
+
+    state_dir = _device_state_dir()
+    cert_path, _ = cert_mod.ensure_cert(state_dir)
+    fingerprint = cert_mod.fingerprint(cert_path)
+    label = (name or "companion device").strip() or "companion device"
+
+    pairing = PairingManager(state_dir, window_seconds=max(30.0, minutes * 60))
+    token = pairing.begin(label)
+
+    from void.device.gateway import running_port
+    cfg = Config.load()
+    live_port = running_port(state_dir)
+    port = live_port if live_port is not None else cfg.get("device.port", 8765)
+    ip_hint = _local_ip_hint()
+
+    print(f"Pairing window open for {minutes:.0f} minute(s) (single use).")
+    print(f"  Device name:                {label}")
+    print(f"  Pairing token:              {token.token}")
+    print(f"  Port:                       {port}"
+         + ("" if live_port is not None else
+            "  (device serve does not appear to be running - this is the "
+            "configured default)"))
+    print(f"  Certificate fingerprint:    {fingerprint}")
+    if ip_hint:
+        print(f"  This laptop's address (best guess): {ip_hint}")
+        print("  Confirm with 'ipconfig' if this machine has more than one "
+              "active network.")
+    else:
+        print("  Could not guess this laptop's address - check with 'ipconfig'.")
+    print("\nOn the companion device, enter the address, port, token, and "
+          "fingerprint above. The gateway must be running:\n"
+          "  python -m void device serve")
+    return 0
+
+
+def cmd_device_list() -> int:
+    import time as time_mod
+
+    from void.device.identity import DeviceRegistry
+
+    reg = DeviceRegistry(_device_state_dir() / "devices.json")
+    devices = reg.list()
+    if not devices:
+        print("No paired devices.")
+        return 0
+    print("Paired devices:")
+    for d in devices:
+        last_seen = (time_mod.strftime("%Y-%m-%d %H:%M:%S",
+                                       time_mod.localtime(d.last_seen))
+                    if d.last_seen else "never")
+        print(f"  {d.device_id}  name={d.name!r}  "
+              f"capabilities={d.capabilities}  last_seen={last_seen}")
+    return 0
+
+
+def cmd_device_grant(device_id: str, capability: str) -> int:
+    from void.device.capabilities import ALL_CAPABILITIES
+    from void.device.identity import DeviceRegistry
+
+    if capability not in ALL_CAPABILITIES:
+        print(f"Unknown capability {capability!r}. Valid: "
+              f"{sorted(ALL_CAPABILITIES)}")
+        return 1
+    reg = DeviceRegistry(_device_state_dir() / "devices.json")
+    try:
+        dev = reg.grant(device_id, capability)
+    except KeyError:
+        print(f"Unknown device: {device_id}")
+        return 1
+    print(f"Granted {capability!r} to {dev.name!r} ({dev.device_id}).")
+    return 0
+
+
+def cmd_device_revoke(device_id: str, capability: str) -> int:
+    from void.device.identity import DeviceRegistry
+
+    reg = DeviceRegistry(_device_state_dir() / "devices.json")
+    try:
+        dev = reg.revoke_capability(device_id, capability)
+    except KeyError:
+        print(f"Unknown device: {device_id}")
+        return 1
+    print(f"Revoked {capability!r} from {dev.name!r} ({dev.device_id}).")
+    return 0
+
+
+def cmd_device_forget(device_id: str) -> int:
+    from void.device.identity import DeviceRegistry
+
+    reg = DeviceRegistry(_device_state_dir() / "devices.json")
+    removed = reg.forget(device_id)
+    print(f"Unpaired {device_id}." if removed
+          else f"No such paired device: {device_id}")
+    return 0
+
+
+def cmd_device_serve(host: str | None, port: int | None) -> int:
+    """Run the Device Gateway in the foreground. The ONLY command that opens
+    a network port; never called by voice/autostart. Authorization for any
+    action a paired device requests flows through the SAME KillSwitch and
+    RiskGate as every other V.O.I.D entry point (see void.device.capabilities)
+    - a headless gateway supplies no confirm_fn, so anything requiring owner
+    confirmation is denied, never silently allowed."""
+    from void.device.gateway import DeviceGateway
+    from void.runtime.diagnostics import (
+        install_background_logging, install_console_diagnostics,
+    )
+
+    install_background_logging()
+    install_console_diagnostics()
+    assistant = Assistant(on_event=_event)
+    if assistant.kill_switch.engaged:
+        print("A stop is currently engaged. Run 'python -m void clear-stop' first.")
+        return 1
+
+    gw = DeviceGateway(assistant.config, assistant.tools, assistant.risk_gate,
+                      assistant.kill_switch, assistant.config.state_dir(),
+                      host=host, port=port)
+    gw.start()
+    print(f"Device gateway listening on {gw.host}:{gw.port} (HTTPS).")
+    print(f"  Certificate fingerprint: {gw.fingerprint}")
+    print("Pair a device from another terminal: python -m void device pair-start")
+    print("Ctrl+C to stop.")
+    try:
+        gw.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping device gateway.")
+    finally:
+        gw.stop()
+    return 0
+
+
 # --- argument parsing --------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -635,6 +801,39 @@ def build_parser() -> argparse.ArgumentParser:
     p_protect.add_argument("path", nargs="?", default=None,
                            help="Exact directory path (for add/remove).")
 
+    p_device = sub.add_parser(
+        "device",
+        help="Manage the mobile companion device gateway (owner-only, opt-in)")
+    device_sub = p_device.add_subparsers(dest="device_action")
+
+    p_pair = device_sub.add_parser(
+        "pair-start", help="Open a short-lived, single-use pairing window")
+    p_pair.add_argument("--name", default=None,
+                        help="Label for the device being paired.")
+    p_pair.add_argument("--minutes", type=float, default=5.0,
+                        help="Pairing window length in minutes (default 5).")
+
+    device_sub.add_parser("list", help="List paired devices")
+
+    p_grant = device_sub.add_parser(
+        "grant", help="Grant a capability to a paired device")
+    p_grant.add_argument("device_id")
+    p_grant.add_argument("capability")
+
+    p_revoke = device_sub.add_parser(
+        "revoke", help="Revoke a capability from a paired device")
+    p_revoke.add_argument("device_id")
+    p_revoke.add_argument("capability")
+
+    p_forget = device_sub.add_parser(
+        "forget", help="Fully unpair a device (deletes its shared secret)")
+    p_forget.add_argument("device_id")
+
+    p_serve = device_sub.add_parser(
+        "serve", help="Run the device gateway in the foreground (Ctrl+C to stop)")
+    p_serve.add_argument("--host", default=None)
+    p_serve.add_argument("--port", type=int, default=None)
+
     return parser
 
 
@@ -645,7 +844,7 @@ def main(argv: list[str] | None = None) -> int:
     known = {"run", "resume", "clarify", "approve", "deny", "set-key",
              "list-keys", "remove-key", "set-pin", "tasks", "stop",
              "clear-stop", "ui", "voice", "app", "singularity", "autostart",
-             "roots", "protect", "-h", "--help"}
+             "roots", "protect", "device", "-h", "--help"}
     if argv and argv[0] not in known:
         return cmd_run(" ".join(argv))
 
@@ -690,6 +889,22 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_roots(args.action, args.path)
     if args.command == "protect":
         return cmd_protect(args.action, args.path)
+    if args.command == "device":
+        if args.device_action == "pair-start":
+            return cmd_device_pair_start(args.name, args.minutes)
+        if args.device_action == "list":
+            return cmd_device_list()
+        if args.device_action == "grant":
+            return cmd_device_grant(args.device_id, args.capability)
+        if args.device_action == "revoke":
+            return cmd_device_revoke(args.device_id, args.capability)
+        if args.device_action == "forget":
+            return cmd_device_forget(args.device_id)
+        if args.device_action == "serve":
+            return cmd_device_serve(args.host, args.port)
+        print("Usage: python -m void device "
+              "{pair-start,list,grant,revoke,forget,serve}")
+        return 1
 
     parser.print_help()
     return 0

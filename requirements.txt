@@ -12,6 +12,11 @@ requests>=2.31                 # local provider talks to Ollama over HTTP
 psutil>=5.9                              # running-process / window-owner identity
 pywin32>=306; sys_platform == "win32"   # window enumeration/activation/WM_CLOSE
 
+# Mobile companion Device Gateway (V1 foundation)
+cryptography>=42.0     # self-signed TLS identity for the local device gateway
+                       # (already a transitive dependency of this stack; declared
+                       # directly because void/device/cert.py imports it itself)
+
 # UI (optional at runtime; CLI works without it)
 PySide6>=6.6
 

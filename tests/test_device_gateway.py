@@ -1,0 +1,274 @@
+"""Device Gateway tests.
+
+One real end-to-end test opens an actual TLS socket on 127.0.0.1 and speaks
+real HTTP/1.1 over it (the closest thing to "real Android/Windows
+validation" available without physical hardware - see the final report for
+what real-hotspot/Android validation this could NOT cover and the manual
+procedure left for it). The rest of the edge cases (replay, rate limiting,
+staleness, malformed/oversized bodies, unknown devices) call the gateway's
+own request-handling methods directly - same registry/auth/capability code
+path, without paying for a TLS handshake per case.
+"""
+import http.client
+import json
+import ssl
+import time
+
+import pytest
+
+from void.actions.base import Tool, ToolResult
+from void.actions.registry import ToolRegistry
+from void.config import Config
+from void.core.kill_switch import KillSwitch
+from void.device import auth, cert
+from void.device.gateway import PAIR_PATH, REQUEST_PATH, DeviceGateway, running_port
+from void.device.protocol import MAX_BODY_BYTES
+from void.security.risk import RiskGate, RiskLevel
+
+
+def _config():
+    return Config({"app": {"name": "V.O.I.D", "version": "1.0"},
+                  "voice": {"enabled": False}})
+
+
+@pytest.fixture
+def launched():
+    return []
+
+
+@pytest.fixture
+def tools(launched):
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name="launch_app", description="d", parameters={"type": "object"},
+        handler=lambda name: launched.append(name) or ToolResult.success(f"Launched {name}."),
+        risk=RiskLevel.LOW))
+    return registry
+
+
+@pytest.fixture
+def gw(tmp_path, tools):
+    gateway = DeviceGateway(_config(), tools, RiskGate(), KillSwitch(), tmp_path,
+                           host="127.0.0.1", port=0)
+    gateway.start()
+    gateway.serve_in_background()
+    yield gateway
+    gateway.stop()
+
+
+def _tls_connection(gw) -> http.client.HTTPSConnection:
+    """Connect and PIN the server's certificate fingerprint - exactly what a
+    real client must do (see void.device.cert): no CA, no hostname check,
+    trust comes only from matching the fingerprint shown at pairing time."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    conn = http.client.HTTPSConnection("127.0.0.1", gw.port, context=context, timeout=5)
+    conn.connect()
+    der = conn.sock.getpeercert(binary_form=True)
+    assert cert.fingerprint_from_der(der) == gw.fingerprint, (
+        "fingerprint pinning check failed - would refuse to proceed for real")
+    return conn
+
+
+def _post(conn, path, raw: bytes, extra_headers=None):
+    headers = {"Content-Type": "application/json"}
+    headers.update(extra_headers or {})
+    conn.request("POST", path, body=raw, headers=headers)
+    resp = conn.getresponse()
+    payload = json.loads(resp.read().decode("utf-8"))
+    return resp.status, payload
+
+
+# --- real socket, real TLS, end-to-end -----------------------------------
+
+def test_pair_then_authenticated_get_status_over_real_tls(gw):
+    token = gw.pairing.begin("Test Phone")
+    conn = _tls_connection(gw)
+
+    pair_body = json.dumps({"protocol": 1, "token": token.token,
+                            "name": "Test Phone"}).encode()
+    status, payload = _post(conn, PAIR_PATH, pair_body)
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["result"]["capabilities"] == ["get_status"]
+    device_id = payload["result"]["device_id"]
+    secret = payload["result"]["shared_secret"]
+
+    request = {"protocol": 1, "request_id": "r1", "device_id": device_id,
+              "operation": "get_status", "parameters": {}, "timestamp": time.time()}
+    raw = json.dumps(request).encode()
+    sig = auth.sign(secret, raw)
+
+    conn2 = _tls_connection(gw)
+    status, payload = _post(conn2, REQUEST_PATH, raw, {auth.SIGNATURE_HEADER: sig})
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["result"]["name"] == "V.O.I.D"
+
+
+def test_launch_app_requires_explicit_grant_then_works(gw, launched):
+    token = gw.pairing.begin("Test Phone")
+    conn = _tls_connection(gw)
+    _, pair_payload = _post(conn, PAIR_PATH, json.dumps(
+        {"protocol": 1, "token": token.token, "name": "Test Phone"}).encode())
+    device_id = pair_payload["result"]["device_id"]
+    secret = pair_payload["result"]["shared_secret"]
+
+    def signed_request(op, request_id):
+        body = {"protocol": 1, "request_id": request_id, "device_id": device_id,
+                "operation": op, "parameters": {"name": "notepad"},
+                "timestamp": time.time()}
+        raw = json.dumps(body).encode()
+        return raw, auth.sign(secret, raw)
+
+    raw, sig = signed_request("launch_app", "r-denied")
+    conn2 = _tls_connection(gw)
+    status, payload = _post(conn2, REQUEST_PATH, raw, {auth.SIGNATURE_HEADER: sig})
+    assert status == 200
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "capability_not_authorized"
+    assert launched == []
+
+    gw.registry.grant(device_id, "launch_app")
+    raw, sig = signed_request("launch_app", "r-granted")
+    conn3 = _tls_connection(gw)
+    status, payload = _post(conn3, REQUEST_PATH, raw, {auth.SIGNATURE_HEADER: sig})
+    assert payload["ok"] is True
+    assert launched == ["notepad"]
+
+
+def test_wrong_pairing_token_rejected_over_real_tls(gw):
+    gw.pairing.begin("Test Phone")
+    conn = _tls_connection(gw)
+    status, payload = _post(conn, PAIR_PATH, json.dumps(
+        {"protocol": 1, "token": "wrong-token", "name": "Test Phone"}).encode())
+    assert status == 401
+    assert payload["ok"] is False
+
+
+# --- direct method calls: fast coverage of every rejection path ----------
+
+def _pair(gw, name="Phone"):
+    token = gw.pairing.begin(name)
+    status, payload = gw.handle_pair(
+        json.dumps({"protocol": 1, "token": token.token, "name": name}).encode(),
+        "127.0.0.1")
+    assert status == 200 and payload["ok"] is True
+    return payload["result"]["device_id"], payload["result"]["shared_secret"]
+
+
+def _request(gw, device_id, secret, operation="get_status", request_id="r1",
+            timestamp=None, parameters=None, bad_signature=False):
+    body = {"protocol": 1, "request_id": request_id, "device_id": device_id,
+            "operation": operation, "parameters": parameters or {},
+            "timestamp": timestamp if timestamp is not None else time.time()}
+    raw = json.dumps(body).encode()
+    sig = "deadbeef" if bad_signature else auth.sign(secret, raw)
+    return gw.handle_request(raw, sig, "127.0.0.1")
+
+
+def test_bad_signature_rejected(gw):
+    device_id, secret = _pair(gw)
+    status, payload = _request(gw, device_id, secret, bad_signature=True)
+    assert status == 401
+    assert payload["error"]["code"] == "bad_signature"
+
+
+def test_unknown_device_rejected(gw):
+    status, payload = _request(gw, "no-such-device", "irrelevant-secret")
+    assert status == 401
+    assert payload["error"]["code"] == "unknown_device"
+
+
+def test_stale_timestamp_rejected(gw):
+    device_id, secret = _pair(gw)
+    status, payload = _request(gw, device_id, secret,
+                               timestamp=time.time() - 1000)
+    assert status == 401
+    assert payload["error"]["code"] == "stale_request"
+
+
+def test_replayed_request_id_rejected_on_second_use(gw):
+    device_id, secret = _pair(gw)
+    status1, payload1 = _request(gw, device_id, secret, request_id="dup")
+    assert payload1["ok"] is True
+    status2, payload2 = _request(gw, device_id, secret, request_id="dup")
+    assert status2 == 401
+    assert payload2["error"]["code"] == "replayed_request"
+
+
+def test_malformed_body_rejected(gw):
+    status, payload = gw.handle_request(b"not json at all", "sig", "127.0.0.1")
+    assert status == 400
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "malformed_message"
+
+
+def test_oversized_body_rejected(gw):
+    huge = json.dumps({"protocol": 1, "request_id": "r1", "device_id": "d1",
+                       "operation": "get_status",
+                       "parameters": {"pad": "x" * (MAX_BODY_BYTES + 100)},
+                       "timestamp": time.time()}).encode()
+    status, payload = gw.handle_request(huge, "sig", "127.0.0.1")
+    assert status == 400
+    assert payload["error"]["code"] == "message_too_large"
+
+
+def test_request_rate_limit_eventually_denies(gw):
+    device_id, secret = _pair(gw)
+    statuses = []
+    for i in range(35):
+        status, _ = _request(gw, device_id, secret, request_id=f"r-{i}")
+        statuses.append(status)
+    assert 429 in statuses
+
+
+def test_pairing_rate_limit_eventually_denies(gw):
+    statuses = []
+    for i in range(15):
+        gw.pairing.begin(f"Phone-{i}")
+        status, _ = gw.handle_pair(
+            json.dumps({"protocol": 1, "token": "wrong", "name": "x"}).encode(),
+            "10.0.0.5")
+        statuses.append(status)
+    assert 429 in statuses
+
+
+def test_unknown_capability_operation_rejected(gw):
+    device_id, secret = _pair(gw)
+    status, payload = _request(gw, device_id, secret, operation="execute_shell")
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "unknown_operation"
+
+
+# --- cross-process port discovery (pair-start reading a separately-running
+# `device serve`'s actual bound port - see void.device.gateway.running_port) --
+
+def test_running_port_none_when_nothing_is_running(tmp_path):
+    assert running_port(tmp_path) is None
+
+
+def test_running_port_reflects_the_actual_bound_port_while_running(gw):
+    assert running_port(gw.state_dir) == gw.port
+
+
+def test_stop_after_start_without_ever_serving_does_not_hang(tmp_path, tools):
+    """Regression guard: stop() must never call BaseServer.shutdown() unless
+    serve_forever()/serve_in_background() actually ran, or it blocks forever
+    waiting for an acknowledgement that will never come (hit for real while
+    writing these tests - see void.device.gateway.DeviceGateway.stop)."""
+    gateway = DeviceGateway(_config(), tools, RiskGate(), KillSwitch(), tmp_path,
+                           host="127.0.0.1", port=0)
+    gateway.start()
+    gateway.stop()   # must return promptly, not hang
+
+
+def test_running_port_cleared_after_stop(tmp_path, tools):
+    gateway = DeviceGateway(_config(), tools, RiskGate(), KillSwitch(), tmp_path,
+                           host="127.0.0.1", port=0)
+    gateway.start()
+    gateway.serve_in_background()
+    assert running_port(tmp_path) == gateway.port
+    gateway.stop()
+    assert running_port(tmp_path) is None
