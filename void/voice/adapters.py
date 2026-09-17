@@ -8,8 +8,11 @@ Windows live smoke test (verify/voice_smoke.py).
 """
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Callable
+
+_log = logging.getLogger(__name__)
 
 
 class VoiceDependencyError(RuntimeError):
@@ -623,9 +626,20 @@ class SapiTTS(TTS):
                 voice.Rate = int(self._rate)  # apply current rate before speaking
             except Exception:
                 pass
+            # Diagnostic only (device identity + character count, never the
+            # text itself): the tray can correctly show SPEAKING while SAPI
+            # reports success end-to-end, yet nothing is audible if this
+            # device isn't what the user is actually listening on - this
+            # makes that distinguishable after the fact instead of invisible.
+            try:
+                out_name = voice.AudioOutput.GetDescription()
+            except Exception:
+                out_name = "<unknown>"
+            _log.info("TTS_SPEAK_STARTED device=%r chars=%d", out_name, len(text or ""))
             try:
                 voice.Speak(text, self._SVSF_ASYNC)
-            except Exception:
+            except Exception as exc:
+                _log.warning("TTS_SPEAK_FAILED %s", type(exc).__name__)
                 with self._lock:
                     if self._latest is None:
                         self._speaking = False
@@ -644,6 +658,8 @@ class SapiTTS(TTS):
                 if not interrupted and done:
                     self._speaking = False
                     self._idle.set()
+            if not interrupted and done:
+                _log.info("TTS_SPEAK_DONE")
             if interrupted:
                 self._purge(voice)            # cut current; outer loop handles next
                 return

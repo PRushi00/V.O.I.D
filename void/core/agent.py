@@ -7,6 +7,7 @@ State is checkpointed after every step so the task is resumable.
 """
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -16,6 +17,11 @@ from void.core.kill_switch import KillSwitch, StopRequested
 from void.core.task import CorruptedTaskState, Status, Task, TaskStore
 from void.providers.base import LLMProvider, ProviderUnavailable
 from void.security.risk import RiskGate, RiskLevel
+
+# Latency investigation: privacy-safe stage timing only - tool NAMES (engine-
+# defined identifiers, never model-supplied paths/commands) and durations,
+# never goal text, tool arguments, or LLM output content.
+_log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are V.O.I.D, a local-first personal assistant running on \
 the owner's Windows laptop. You accomplish goals by calling the tools provided.
@@ -139,14 +145,22 @@ class Agent:
         last_exc: Exception | None = None
         for attempt in range(self.max_retries + 1):
             self.kill_switch.raise_if_engaged()
+            t0 = time.monotonic()
             try:
-                return self.provider.generate(messages, tools=specs)
+                response = self.provider.generate(messages, tools=specs)
             except ProviderUnavailable:
                 raise  # not transient - fail fast
             except Exception as exc:  # transient (network, rate limit, ...)
+                _log.info("LLM_CALL_FAILED attempt=%d duration=%.2fs %s",
+                          attempt + 1, time.monotonic() - t0, type(exc).__name__)
                 last_exc = exc
                 self.on_event(f"LLM call failed (attempt {attempt + 1}): {exc}")
                 time.sleep(min(2 ** attempt, 5))
+                continue
+            n_calls = len(response.tool_calls) if response.has_tool_calls else 0
+            _log.info("LLM_CALL_DONE attempt=%d duration=%.2fs tool_calls=%d",
+                      attempt + 1, time.monotonic() - t0, n_calls)
+            return response
         raise last_exc  # type: ignore[misc]
 
     @staticmethod
@@ -205,7 +219,13 @@ class Agent:
                     "unauthorized", None)
 
         self.on_event(f"-> {description}")
+        t0 = time.monotonic()
         result = self.tools.execute(name, arguments)
+        # Diagnostic only: tool NAME (an engine-defined identifier) + risk +
+        # outcome + duration - never arguments or the result summary, which
+        # can contain file paths or other user-specific content.
+        _log.info("TOOL_CALL_DONE name=%s risk=%s ok=%s duration=%.2fs",
+                  name, risk.name, bool(result.ok), time.monotonic() - t0)
         first = result.summary.splitlines()[0] if result.summary else ""
         self.on_event(f"   {first}")
         kind = "ok" if result.ok else "tool_failure"

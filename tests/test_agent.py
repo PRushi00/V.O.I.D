@@ -290,3 +290,72 @@ def test_E_resolution_flow_preserves_high_risk_gate(tmp_path):
     assert existing.read_text() == "original"  # unchanged
     tool_msgs = [m for m in result.task.messages if m["role"] == "tool"]
     assert any("not authorized" in m["content"] for m in tool_msgs)
+
+
+# --- latency investigation: privacy-safe stage timing instrumentation ----
+
+def test_llm_call_timing_is_logged_without_goal_or_message_content(tmp_path, caplog):
+    import logging
+
+    (tmp_path / "cybersecurity_notes.md").write_text("x")
+    agent = build_agent(tmp_path, [
+        LLMResponse(tool_calls=[tool_call("search_files", query="cyber")]),
+        LLMResponse(text="I found your cybersecurity notes."),
+    ])
+    with caplog.at_level(logging.INFO, logger="void.core.agent"):
+        agent.run("find my SUPER_SECRET_GOAL_TEXT cybersecurity notes")
+    llm_lines = [r.message for r in caplog.records if "LLM_CALL_" in r.message]
+    assert len(llm_lines) == 2   # one per generate() call
+    for line in llm_lines:
+        assert "LLM_CALL_DONE attempt=" in line
+        assert "duration=" in line
+        assert "SUPER_SECRET_GOAL_TEXT" not in line   # never the goal/message text
+    assert "tool_calls=1" in llm_lines[0]
+    assert "tool_calls=0" in llm_lines[1]
+
+
+def test_llm_call_failure_is_logged_with_type_only_not_exception_text(tmp_path, caplog):
+    import logging
+
+    class _Flaky(FakeProvider):
+        def generate(self, messages, tools=None):
+            if self.calls == 0:
+                self.calls += 1
+                raise RuntimeError("SUPER_SECRET_ERROR_DETAIL")
+            return super().generate(messages, tools=tools)
+
+    files = FileActions(allowed_roots=[tmp_path], delete_to_recycle_bin=True)
+    tools = ToolRegistry()
+    tools.register_all(files.tools())
+    agent = Agent(
+        provider=_Flaky([LLMResponse(text="done")]),
+        tools=tools,
+        risk_gate=RiskGate(confirm_at_or_above="high"),
+        kill_switch=KillSwitch(),
+        store=TaskStore(tmp_path / "tasks.sqlite"),
+    )
+    with caplog.at_level(logging.INFO, logger="void.core.agent"):
+        agent.run("do something")
+    failed = [r.message for r in caplog.records if "LLM_CALL_FAILED" in r.message]
+    assert len(failed) == 1
+    assert "RuntimeError" in failed[0]
+    assert "SUPER_SECRET_ERROR_DETAIL" not in failed[0]   # type only, never the message
+
+
+def test_tool_call_timing_is_logged_without_arguments_or_results(tmp_path, caplog):
+    import logging
+
+    (tmp_path / "cybersecurity_notes.md").write_text("SECRET_FILE_CONTENTS")
+    agent = build_agent(tmp_path, [
+        LLMResponse(tool_calls=[tool_call("search_files", query="cyber")]),
+        LLMResponse(text="found it"),
+    ])
+    with caplog.at_level(logging.INFO, logger="void.core.agent"):
+        agent.run("find my cybersecurity notes")
+    tool_lines = [r.message for r in caplog.records if "TOOL_CALL_DONE" in r.message]
+    assert len(tool_lines) == 1
+    line = tool_lines[0]
+    assert "name=search_files" in line
+    assert "risk=" in line and "ok=True" in line and "duration=" in line
+    assert "cyber" not in line                    # never the query argument
+    assert "SECRET_FILE_CONTENTS" not in line      # never the tool result content

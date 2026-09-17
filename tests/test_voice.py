@@ -960,6 +960,52 @@ def test_sapi_stop_while_idle_is_noop():
         tts.close()
 
 
+def test_sapi_speak_logs_device_and_length_never_text(caplog):
+    # "Speaking but nothing audible" investigation: there was previously no
+    # way to see which output device SAPI actually targeted for a given
+    # utterance. Must log device identity + char count for later comparison
+    # against what the user was actually listening on - and must NEVER log
+    # the spoken text itself (privacy).
+    import logging
+
+    tts, fake = _sapi()
+    try:
+        with caplog.at_level(logging.INFO, logger="void.voice.adapters"):
+            tts.speak("SUPER_SECRET_SPOKEN_TEXT")
+            assert fake.wait_utterances(1)
+            fake.finish_utterance()
+            assert tts._idle.wait(2.0)
+    finally:
+        tts.close()
+    started = [r.message for r in caplog.records if "TTS_SPEAK_STARTED" in r.message]
+    done = [r.message for r in caplog.records if "TTS_SPEAK_DONE" in r.message]
+    assert len(started) == 1 and len(done) == 1
+    assert "device=" in started[0] and "chars=" in started[0]
+    assert "SUPER_SECRET_SPOKEN_TEXT" not in started[0]
+    assert f"chars={len('SUPER_SECRET_SPOKEN_TEXT')}" in started[0]
+
+
+def test_sapi_speak_failure_is_logged_with_type_only(caplog):
+    import logging
+
+    tts, fake = _sapi(raise_on_speak=True)
+    try:
+        with caplog.at_level(logging.WARNING, logger="void.voice.adapters"):
+            tts.speak("hello")
+            assert fake.wait_utterances(1)   # Speak() was called (and raised)
+            import time as _t
+            for _ in range(50):
+                if not tts.is_speaking:
+                    break
+                _t.sleep(0.02)
+        assert tts.is_speaking is False
+    finally:
+        tts.close()
+    failed = [r.message for r in caplog.records if "TTS_SPEAK_FAILED" in r.message]
+    assert len(failed) == 1
+    assert "RuntimeError" in failed[0]
+
+
 def test_sapi_repeated_stop_is_safe():
     tts, fake = _sapi()
     try:
