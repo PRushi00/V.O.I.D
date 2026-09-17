@@ -191,7 +191,18 @@ class OpenWakeWordDetector(WakeWordDetector):
         if self._closed or not self._running:
             return                        # ignored before start / after stop/close
         try:
-            scores = self._model.predict(frame)
+            import numpy as np
+            # AudioCaptureBroker's documented frame contract: 16 kHz mono
+            # signed 16-bit little-endian PCM, delivered as raw bytes.
+            # openwakeword.model.Model.predict() requires a NumPy array, so
+            # the conversion happens here rather than upstream in the broker
+            # (whose frame contract - raw bytes - is unchanged).
+            audio = np.frombuffer(frame, dtype="<i2")
+        except Exception as exc:
+            raise WakeWordBackendError(
+                f"wake inference failed: could not decode audio frame: {exc}") from exc
+        try:
+            scores = self._model.predict(audio)
         except Exception as exc:
             raise WakeWordBackendError(f"wake inference failed: {exc}") from exc
         score = self._score_of(scores)

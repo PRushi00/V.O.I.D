@@ -249,10 +249,11 @@ def _fake_build_kwargs():
         made["voice_controller"] = FakeVoiceController()
         return made["voice_controller"]
 
-    def widget_factory(assistant, bridge):
+    def widget_factory(assistant, bridge, voice_controller):
         counts["widget"] += 1
         assert assistant is made["assistant"]
         assert bridge is made["bridge"]
+        assert voice_controller is made["voice_controller"]
         made["widget"] = FakeWidget()
         return made["widget"]
 

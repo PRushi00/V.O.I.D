@@ -127,7 +127,7 @@ def build_runtime(
     assistant_factory: Callable[[], object] | None = None,
     bridge_factory: Callable[[], object] | None = None,
     voice_controller_factory: Callable[[object, object], object] | None = None,
-    widget_factory: Callable[[object, object], object] | None = None,
+    widget_factory: Callable[[object, object, object], object] | None = None,
     qapplication_factory: Callable[[], object] | None = None,
 ):
     """Compose exactly ONE Assistant, ONE VoiceController (the sole
@@ -160,8 +160,9 @@ def build_runtime(
     if widget_factory is None:
         from void.ui.widget import VoidWidget
 
-        def widget_factory(assistant, bridge):
-            return VoidWidget(assistant, voice_bridge=bridge)
+        def widget_factory(assistant, bridge, voice_controller):
+            return VoidWidget(assistant, voice_bridge=bridge,
+                              voice_controller=voice_controller)
     if qapplication_factory is None:
         import sys as _sys
         from PySide6.QtWidgets import QApplication
@@ -174,7 +175,7 @@ def build_runtime(
     assistant = assistant_factory()
     bridge = bridge_factory()
     voice_controller = voice_controller_factory(assistant, bridge)
-    widget = widget_factory(assistant, bridge)
+    widget = widget_factory(assistant, bridge, voice_controller)
 
     runtime = VoidRuntime(assistant, voice_controller, bridge, widget,
                           quit_fn=getattr(app, "quit", lambda: None))

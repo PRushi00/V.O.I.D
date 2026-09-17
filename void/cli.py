@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import logging
 import re
 import sys
 import time
@@ -26,6 +27,8 @@ from void.app import Assistant
 from void.core.task import Status
 from void.providers.base import ProviderUnavailable
 from void.security import credentials, secrets
+
+_log = logging.getLogger("void.cli")
 
 
 def _confirm(description: str) -> bool:
@@ -420,7 +423,7 @@ def cmd_singularity() -> int:
 
 
 def cmd_voice() -> int:
-    """Launch the push-to-talk voice interface.
+    """Launch the headless, voice-first runtime.
 
     Voice is a thin I/O adapter over the SAME Assistant.run() path the text CLI
     uses: transcripts are ordinary untrusted input, and RiskGate / KillSwitch /
@@ -428,6 +431,7 @@ def cmd_voice() -> int:
     NOT approved by voice - they defer to AWAITING_CONFIRMATION (no confirm_fn),
     handled out-of-band; a spoken 'yes' is just another goal, never an approval.
     """
+    _log.info("VOICE_RUNTIME_STARTING")
     assistant = Assistant(on_event=_event)  # no confirm_fn -> HIGH-risk deferred
     if not assistant.config.get("voice.enabled", False):
         print("Voice is disabled. Set 'voice.enabled: true' in "
@@ -442,9 +446,13 @@ def cmd_voice() -> int:
     from void.voice.adapters import VoiceDependencyError
     from void.voice.runtime import VoiceController
 
+    def on_state(state):
+        _log.info("VOICE_STATE %s", state)
+        print(f"  [voice] {state}", flush=True)
+
     controller = VoiceController.from_assistant(
         assistant,
-        on_state=lambda s: print(f"  [voice] {s}", flush=True),
+        on_state=on_state,
         on_transcript=lambda t: print(f"  [heard] {t}", flush=True),
         on_message=lambda m: print(f"  {m}", flush=True),
     )
@@ -452,11 +460,17 @@ def cmd_voice() -> int:
     try:
         controller.start()
     except VoiceDependencyError as exc:
+        _log.exception("VOICE_RUNTIME_START_FAILED dependency")
         print(f"Voice dependencies missing: {exc}\n"
               f"  pip install -r requirements-voice.txt")
         return 1
+    except Exception:
+        _log.exception("VOICE_RUNTIME_START_FAILED")
+        print("Voice runtime could not start. Check ~/.void/void.log for details.")
+        return 1
 
     wake_on = getattr(controller, "_wake", None) is not None
+    _log.info("VOICE_RUNTIME_READY wake_configured=%s", wake_on)
     wake_line = ('Say "Hey V.O.I.D." to start, or hold'
                  if wake_on else "Hold")
     print(f"V.O.I.D voice ready. {wake_line} '{hotkey}' to talk, release to send.\n"
@@ -469,6 +483,7 @@ def cmd_voice() -> int:
         print("\nExiting voice.")
     finally:
         controller.shutdown("voice CLI exit")
+        _log.info("VOICE_RUNTIME_STOPPED")
     if controller.stopped:
         print("Voice stopped (kill switch). Run 'clear-stop' and restart voice "
               "to talk again.")
@@ -476,7 +491,7 @@ def cmd_voice() -> int:
 
 
 def cmd_autostart(action: str) -> int:
-    """Manage silent login autostart of the persistent app (HKCU Run key,
+    """Manage silent login autostart of the voice runtime (HKCU Run key,
     no admin/service/security change). 'install' makes V.O.I.D start at login
     with no terminal; 'remove' undoes it; 'status' shows the current entry."""
     from void.runtime import autostart
@@ -547,14 +562,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("clear-stop", help="Clear an engaged stop")
     sub.add_parser("ui", help="Launch the circular widget")
-    sub.add_parser("voice", help="Launch the push-to-talk voice interface")
+    sub.add_parser("voice", help="Launch the headless voice-first runtime")
     sub.add_parser(
         "app", help="Launch the persistent desktop application (orb + voice)")
     sub.add_parser(
         "singularity",
         help="Launch the persistent app with the WebGL Blackhole overlay (opt-in)")
     p_autostart = sub.add_parser(
-        "autostart", help="Manage silent login autostart of the persistent app")
+        "autostart", help="Manage silent login autostart of the voice runtime")
     p_autostart.add_argument("action", choices=["install", "remove", "status"])
 
     p_roots = sub.add_parser(

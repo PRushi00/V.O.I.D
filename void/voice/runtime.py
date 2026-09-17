@@ -332,7 +332,9 @@ class VoiceController:
         if self._worker is not None:
             self._worker.start()
         if self._broker is not None:
+            _log.info("AUDIO_BROKER_STARTING")
             self._broker.start()          # the ONE physical microphone owner
+            _log.info("AUDIO_BROKER_STARTED")
         self._activation.start()
         if monitor and self._monitor is None:
             self._monitor = threading.Thread(
@@ -442,11 +444,13 @@ class VoiceController:
             self._wake.start()               # may raise config/dep/backend errors
         except Exception as exc:
             self._wake_broken = True
+            _log.exception("WAKE_ARM_FAILED")
             self._msg(f"(voice) wake word unavailable: {type(exc).__name__}. "
                       f"Push-to-talk still works.")
             return
         self._broker.subscribe(self._wake_consumer)
         self._wake_armed = True
+        _log.info("WAKE_ARMED")
 
     def _disarm_wake_locked(self) -> None:
         self._safe_unsub(self._wake_consumer)

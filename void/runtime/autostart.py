@@ -1,12 +1,15 @@
 """Windows login autostart for the persistent V.O.I.D app.
 
-Registers ``pythonw.exe -m void singularity`` under the per-user HKCU ``Run``
+Registers ``pythonw.exe <absolute voice_startup.py>`` under the per-user HKCU
+``Run``
 key so V.O.I.D starts silently at login - NO console window, NO terminal, NO
 administrator rights, NO Windows service, and NO change to Smart App Control
 or any security control. Using ``pythonw.exe`` (the windowed Python launcher)
-is what makes it console-less. The target is the approved WebGL Blackhole
-overlay (``singularity``); the QPainter orb (``app``) remains available for
-development/debugging from a terminal.
+is what makes it console-less. The absolute launcher makes source-tree startup
+independent of Windows' login working directory; it delegates to the existing
+``void voice`` command and imports no Qt or WebEngine. The QPainter orb
+(``app``) and WebGL Blackhole overlay (``singularity``)
+remain explicit development/debugging launchers.
 
 install() / remove() / status() are the whole API. The registry access is
 behind an injectable backend so the logic is unit-testable without touching
@@ -21,6 +24,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 RUN_SUBKEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 VALUE_NAME = "VOID"
@@ -39,12 +43,23 @@ def default_pythonw_path() -> str:
     return exe
 
 
-def default_launch_command(pythonw: str | None = None) -> str:
-    """The exact command written to the Run key: the windowed interpreter plus
-    ``-m void singularity`` (the persistent desktop runtime with the approved
-    WebGL Blackhole overlay, launched console-less)."""
+def voice_startup_path() -> str:
+    """Absolute source-tree launcher used by the HKCU Run entry.
+
+    Windows Run entries do not provide a reliable project working directory.
+    Starting an uninstalled source package with ``-m void`` can therefore fail
+    before V.O.I.D reaches its microphone setup.  This launcher resolves the
+    repository from its own path and delegates to the existing CLI command.
+    """
+    return str(Path(__file__).resolve().with_name("voice_startup.py"))
+
+
+def default_launch_command(pythonw: str | None = None,
+                           launcher: str | None = None) -> str:
+    """The exact console-less, working-directory-independent Run command."""
     exe = pythonw or default_pythonw_path()
-    return f'"{exe}" -m void singularity'
+    script = launcher or voice_startup_path()
+    return f'"{exe}" "{script}"'
 
 
 class _WinregBackend:

@@ -68,11 +68,11 @@ kill_switch:
   # still allowed (you must never be unable to stop). Set a PIN to enforce auth.
   require_pin: true
 
-# Voice interface (Phase 9A). OPTIONAL - core V.O.I.D works without the voice
-# stack. Enable only after installing requirements-voice.txt and choosing to
-# download the Whisper model (models are NOT downloaded during normal startup).
+# Voice is V.O.I.D's normal runtime. Install requirements-voice.txt and set the
+# machine-local wake_model_path before enabling autostart; models are never
+# downloaded during normal startup.
 voice:
-  enabled: false                 # off by default; the orb/CLI opt in explicitly
+  enabled: true                  # normal runtime is voice-only; UI is developer opt-in
   ptt_hotkey: "ctrl+space"       # push-to-talk: hold to talk, release to send
   stt_model: "small"             # faster-whisper model (tiny|base|small|medium)
   stt_device: "cpu"              # "cpu" (int8) or "cuda"
