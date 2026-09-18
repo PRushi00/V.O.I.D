@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- The only permission this app needs: the V.O.I.D device connection is
+         one outbound HTTPS request to a laptop's Device Gateway. No location,
+         no storage, no contacts, no camera/mic access - none of that is used. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:label="V.O.I.D Companion"
+        android:allowBackup="false">
+        <!-- allowBackup=false: this app's private SharedPreferences hold the
+             per-device shared secret issued at pairing (see MainActivity.kt).
+             Android's default Auto Backup would otherwise copy that secret
+             off-device (to Google Drive, or via `adb backup`) - a real
+             credential-leakage vector for exactly the secret this app is
+             designed to protect, not something the V1 threat model accepts. -->
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <!-- exported=true is REQUIRED (not just conventional) here: this
+                 is the app's launcher activity, and Android 12+ (API 31+,
+                 which this app's targetSdk exceeds) refuses to install an
+                 app whose intent-filtered component omits an explicit
+                 android:exported value. -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

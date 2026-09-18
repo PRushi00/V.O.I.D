@@ -1,0 +1,9 @@
+# Copy this file to `local.properties` (gitignored - never commit it) and
+# point sdk.dir at your own Android SDK location. Gradle reads this file
+# automatically; it is machine-specific by design.
+#
+# Windows example:
+sdk.dir=C\:\\android-build-tools\\android-sdk
+#
+# macOS/Linux example:
+# sdk.dir=/Users/you/Library/Android/sdk

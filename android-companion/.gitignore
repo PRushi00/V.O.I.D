@@ -1,0 +1,15 @@
+# Machine-specific SDK location - never commit (see local.properties.sample)
+local.properties
+
+# Gradle
+.gradle/
+build/
+app/build/
+
+# Android Studio / IDE (kept here too even though the repo root already
+# ignores .idea/, so this subproject is self-explanatory on its own)
+.idea/
+*.iml
+captures/
+.cxx/
+local.properties.bak

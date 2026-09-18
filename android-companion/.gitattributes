@@ -1,0 +1,6 @@
+# The Gradle wrapper's Unix launcher script MUST keep LF line endings
+# regardless of the checkout platform's autocrlf setting - a CRLF shebang
+# line breaks it on Linux/macOS (the interpreter sees a literal \r in the
+# first line and fails). The Windows launcher is unaffected either way.
+gradlew text eol=lf
+*.jar binary
