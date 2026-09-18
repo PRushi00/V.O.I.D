@@ -37,6 +37,17 @@ package com.void_project.companion
  *    LIMITATION (see README "Deferred to V2"): hardening this to
  *    Android-Keystore-backed encryption (e.g. EncryptedSharedPreferences)
  *    was deliberately deferred rather than shipped untested.
+ *
+ * DEVICE IDENTITY IS NOT THE NETWORK ADDRESS: pairing (the token flow) and
+ * connecting (host/port/fingerprint) are deliberately separate actions here.
+ * `device_id` + the shared secret are the persistent trust - once pairing
+ * succeeds they survive app restarts and are never touched again except by
+ * a fresh Pair or an explicit Forget Pairing. `host`/`port` are just where
+ * to send bytes right now: the laptop's hotspot-assigned IP can and does
+ * change (a new DHCP lease, a reconnect), and updating "Update Connection"
+ * to point at wherever the laptop is NOW never requires - or performs - a
+ * new pairing exchange. The certificate fingerprint is verified on every
+ * connection regardless of which of the two actions last changed it.
  */
 
 import android.app.Activity
@@ -151,13 +162,27 @@ class MainActivity : Activity() {
         val pad = (16 * resources.displayMetrics.density).toInt()
         layout.setPadding(pad, pad, pad, pad)
 
-        hostField = labeledField(layout, "Laptop address (from `device pair-start`)")
-        portField = labeledField(layout, "Port", "8765")
-        fingerprintField = labeledField(layout, "Certificate fingerprint")
-        tokenField = labeledField(layout, "Pairing token")
-        nameField = labeledField(layout, "This device's name", "My Phone")
-
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+
+        // Pre-fill from whatever is already persisted, so a restarted app
+        // shows the device's actual current configuration instead of blank
+        // fields that quietly hide an already-paired, already-connectable
+        // state. The pairing token is the one field NEVER pre-filled or
+        // persisted - it is a one-time bootstrap value, not something kept
+        // around after use.
+        hostField = labeledField(layout, "Laptop address (from `device pair-start`)",
+            prefs.getString("host", "") ?: "")
+        portField = labeledField(layout, "Port", prefs.getInt("port", 8765).toString())
+        fingerprintField = labeledField(layout, "Certificate fingerprint",
+            prefs.getString("fingerprint", "") ?: "")
+        tokenField = labeledField(layout, "Pairing token (only needed to (re)pair)")
+        nameField = labeledField(layout, "This device's name",
+            prefs.getString("device_name", "") ?: "My Phone")
+
+        val updateConnectionButton = Button(this)
+        updateConnectionButton.text = "Update Connection"
+        updateConnectionButton.setOnClickListener { updateConnection(prefs) }
+        layout.addView(updateConnectionButton)
 
         pairButton = Button(this)
         pairButton.text = "Pair"
@@ -176,10 +201,25 @@ class MainActivity : Activity() {
         }
         layout.addView(launchButton)
 
+        val forgetButton = Button(this)
+        forgetButton.text = "Forget Pairing"
+        forgetButton.setOnClickListener { forgetPairing(prefs) }
+        layout.addView(forgetButton)
+
         statusView = TextView(this)
+        statusView.text = pairingStatusText(prefs)
         layout.addView(statusView)
 
         setContentView(layout)
+    }
+
+    /** Local-only description of whatever is currently persisted - never a
+     * network call. Shown at startup so restarting the app doesn't look
+     * indistinguishable from never having paired at all. */
+    private fun pairingStatusText(prefs: android.content.SharedPreferences): String {
+        val deviceId = prefs.getString("device_id", null)
+        return if (deviceId != null) "Paired (device_id=$deviceId)."
+        else "Not paired yet - enter a pairing token and tap Pair."
     }
 
     private fun labeledField(parent: LinearLayout, hint: String, default: String = ""): EditText {
@@ -227,6 +267,7 @@ class MainActivity : Activity() {
                         .putString("host", host)
                         .putInt("port", port)
                         .putString("fingerprint", fingerprint)
+                        .putString("device_name", name)
                         .putString("device_id", result.getString("device_id"))
                         .putString("shared_secret", result.getString("shared_secret"))
                         .apply()
@@ -241,6 +282,46 @@ class MainActivity : Activity() {
                 runOnUiThread { pairButton.isEnabled = true }
             }
         }
+    }
+
+    /** Updates ONLY the connection endpoint (host/port/fingerprint) from the
+     * current field values - never touches device_id/shared_secret and
+     * never talks to the network. This is how a laptop IP change (a new
+     * hotspot DHCP lease, a reconnect) is handled: point the SAME paired
+     * identity at wherever the laptop is now, without a new pairing token.
+     * Certificate fingerprint verification stays mandatory either way - if
+     * the laptop's certificate ever genuinely changes, this is also where
+     * the new fingerprint gets entered. */
+    private fun updateConnection(prefs: android.content.SharedPreferences) {
+        val host = hostField.text.toString().trim()
+        val port = portField.text.toString().trim().toIntOrNull() ?: 8765
+        val fingerprint = fingerprintField.text.toString().trim()
+        if (host.isEmpty() || fingerprint.isEmpty()) {
+            show("Enter both an address and a certificate fingerprint first.")
+            return
+        }
+        prefs.edit()
+            .putString("host", host)
+            .putInt("port", port)
+            .putString("fingerprint", fingerprint)
+            .apply()
+        show("Connection updated: $host:$port")
+    }
+
+    /** Client-side reset: clears the persistent trust (device_id + shared
+     * secret) so this app can no longer authenticate as the device it used
+     * to be, mirroring the laptop's own `device forget`. Does not contact
+     * the network - the laptop-side registry entry is a separate thing and
+     * is removed independently via `device forget <device_id>`. Connection
+     * fields (host/port/fingerprint/name) are left alone since they are not
+     * secrets and re-typing them for the next Pair is just friction. */
+    private fun forgetPairing(prefs: android.content.SharedPreferences) {
+        prefs.edit()
+            .remove("device_id")
+            .remove("shared_secret")
+            .apply()
+        show("Pairing forgotten on this phone. Run 'device forget <device_id>' " +
+            "on the laptop too if you want to fully revoke it there.")
     }
 
     private fun call(prefs: android.content.SharedPreferences, operation: String,

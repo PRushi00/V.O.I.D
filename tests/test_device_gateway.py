@@ -259,6 +259,203 @@ def test_pair_rejection_reason_distinguishes_wrong_token_from_no_window(gw, capl
     assert "reason=wrong_token" in reject_lines[0]
 
 
+# --- persistent device trust: the pairing token is a bootstrap, not a
+# permanent credential (see the redesigned pairing lifecycle) - a device
+# that has ALREADY paired must keep working across gateway restarts, IP
+# changes, and reconnects using ONLY its device_id + shared secret, with the
+# original pairing token playing no further role at all. --------------------
+
+def test_paired_device_survives_a_full_gateway_restart(tmp_path, tools):
+    """Not just the pairing WINDOW (see test_pairing_survives_a_gateway_restart
+    above) - an ALREADY-COMPLETED pairing's resulting device_id + shared
+    secret must go on authenticating fine after the gateway process that
+    issued them is gone and a brand new one has taken its place, because
+    trust lives in the registry/keyring, never in the gateway object."""
+    first_gateway = DeviceGateway(_config(), tools, RiskGate(), KillSwitch(), tmp_path,
+                                 host="127.0.0.1", port=0)
+    first_gateway.start()
+    first_gateway.serve_in_background()
+    device_id, secret = _pair(first_gateway, name="Real Phone")
+    first_gateway.stop()   # simulates a full restart - a NEW gateway object
+
+    second_gateway = DeviceGateway(_config(), tools, RiskGate(), KillSwitch(), tmp_path,
+                                  host="127.0.0.1", port=0)
+    second_gateway.start()
+    second_gateway.serve_in_background()
+    try:
+        status, payload = _request(second_gateway, device_id, secret)
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["result"]["name"] == "V.O.I.D"
+    finally:
+        second_gateway.stop()
+
+
+def test_paired_device_survives_the_gateways_own_address_changing(tmp_path, tools):
+    """Device identity must never be tied to WHICH network address the
+    gateway happens to be reachable at - exactly the phone-hotspot-IP-change
+    scenario this redesign exists for. Pairs against a gateway bound to one
+    host, then authenticates against a second gateway instance (same state,
+    a DIFFERENT bound address) with no re-pairing."""
+    first_gateway = DeviceGateway(_config(), tools, RiskGate(), KillSwitch(), tmp_path,
+                                 host="127.0.0.1", port=0)
+    first_gateway.start()
+    first_gateway.serve_in_background()
+    device_id, secret = _pair(first_gateway, name="Real Phone")
+    first_gateway.stop()
+
+    # A different bind address - standing in for "the laptop's hotspot IP
+    # changed" (127.0.0.2 is a real, distinct loopback address on most OSes).
+    second_gateway = DeviceGateway(_config(), tools, RiskGate(), KillSwitch(), tmp_path,
+                                  host="127.0.0.2", port=0)
+    second_gateway.start()
+    second_gateway.serve_in_background()
+    try:
+        status, payload = _request(second_gateway, device_id, secret)
+        assert status == 200
+        assert payload["ok"] is True
+    finally:
+        second_gateway.stop()
+
+
+def test_reconnect_after_a_gap_needs_no_pairing_state_at_all(gw):
+    """No session/connection state exists to expire between requests - two
+    ordinary authenticated requests, separated in (simulated) time, both
+    succeed using nothing but the persisted device_id + secret, modeling a
+    phone that disconnected from the hotspot and reconnected later."""
+    device_id, secret = _pair(gw, name="Real Phone")
+    status1, payload1 = _request(gw, device_id, secret, request_id="r-before-gap")
+    assert payload1["ok"] is True
+    status2, payload2 = _request(
+        gw, device_id, secret, request_id="r-after-gap",
+        timestamp=time.time() + 5)   # "later", well within the skew window
+    assert payload2["ok"] is True
+
+
+def test_forgotten_device_is_rejected_and_its_old_secret_is_dead(gw):
+    """The laptop-side counterpart to the Android app's "Forget Pairing":
+    void.device.identity.DeviceRegistry.forget deletes both the registry
+    entry and the keyring secret, so a revoked device cannot reconnect with
+    its old credential even if it is replayed byte-for-byte."""
+    device_id, secret = _pair(gw, name="Real Phone")
+    status, payload = _request(gw, device_id, secret, request_id="before-forget")
+    assert payload["ok"] is True
+
+    assert gw.registry.forget(device_id) is True
+
+    status, payload = _request(gw, device_id, secret, request_id="after-forget")
+    assert status == 401
+    assert payload["error"]["code"] == "unknown_device"
+
+
+# --- a capability grant/revoke/forget made through a SEPARATE
+# DeviceRegistry instance (exactly what `device grant`/`device revoke`/
+# `device forget` do as their own CLI process) must be honored by an
+# ALREADY-RUNNING gateway's OWN registry instance immediately - not only
+# after that gateway restarts. Real bug found during physical-validation
+# rehearsal: DeviceRegistry used to load its device list once at
+# construction and cache it, so a grant made by a separate process was
+# invisible to a long-lived gateway until it happened to restart - for a
+# revocation specifically, that is a real security gap, not just staleness.
+
+def test_capability_granted_by_a_separate_process_works_without_a_gateway_restart(gw):
+    from void.device.identity import DeviceRegistry
+
+    device_id, secret = _pair(gw, name="Real Phone")
+    status, payload = _request(gw, device_id, secret, operation="launch_app",
+                               parameters={"name": "notepad"}, request_id="before-grant")
+    assert payload["error"]["code"] == "capability_not_authorized"
+
+    # A genuinely separate DeviceRegistry object, over the same directory -
+    # modeling `device grant` as its own CLI process, NOT gw.registry itself.
+    cli_process_registry = DeviceRegistry(gw.state_dir / "devices.json")
+    cli_process_registry.grant(device_id, "launch_app")
+
+    status, payload = _request(gw, device_id, secret, operation="launch_app",
+                               parameters={"name": "notepad"}, request_id="after-grant")
+    assert status == 200
+    assert payload["ok"] is True
+
+
+def test_capability_revoked_by_a_separate_process_takes_effect_immediately(gw):
+    from void.device.identity import DeviceRegistry
+
+    device_id, secret = _pair(gw, name="Real Phone")
+    gw.registry.grant(device_id, "launch_app")
+    status, payload = _request(gw, device_id, secret, operation="launch_app",
+                               parameters={"name": "notepad"}, request_id="before-revoke")
+    assert payload["ok"] is True
+
+    cli_process_registry = DeviceRegistry(gw.state_dir / "devices.json")
+    cli_process_registry.revoke_capability(device_id, "launch_app")
+
+    status, payload = _request(gw, device_id, secret, operation="launch_app",
+                               parameters={"name": "notepad"}, request_id="after-revoke")
+    assert payload["error"]["code"] == "capability_not_authorized"
+
+
+def test_forget_by_a_separate_process_is_honored_by_an_already_running_gateway(gw):
+    """The precise real-world scenario: the owner runs `device forget` in one
+    terminal while `device serve` keeps running in another - the revoked
+    device must be rejected on its VERY NEXT request, not after a restart."""
+    from void.device.identity import DeviceRegistry
+
+    device_id, secret = _pair(gw, name="Real Phone")
+    status, payload = _request(gw, device_id, secret, request_id="before-forget")
+    assert payload["ok"] is True
+
+    cli_process_registry = DeviceRegistry(gw.state_dir / "devices.json")
+    assert cli_process_registry.forget(device_id) is True
+
+    status, payload = _request(gw, device_id, secret, request_id="after-forget")
+    assert status == 401
+    assert payload["error"]["code"] == "unknown_device"
+
+
+def test_pairing_token_itself_is_never_a_usable_device_credential(gw):
+    """The pairing token establishes trust ONCE; it must never double as a
+    device_id or a shared secret for the ordinary authenticated endpoint -
+    that would make it a de facto permanent credential, which this redesign
+    explicitly forbids. Using the raw token string in place of device_id
+    (with a made-up signature) must be rejected exactly like any other
+    unknown device - the token has no standing at /void/v1/request at all."""
+    token = gw.pairing.begin("Real Phone")
+    body = {"protocol": 1, "request_id": "r1", "device_id": token.token,
+            "operation": "get_status", "parameters": {}, "timestamp": time.time()}
+    raw = json.dumps(body).encode()
+    status, payload = gw.handle_request(raw, auth.sign("guessed-secret", raw), "127.0.0.1")
+    assert status == 401
+    assert payload["error"]["code"] == "unknown_device"
+    # And the pairing window itself must still be intact - a failed attempt
+    # to (ab)use it as a device credential does not consume it either.
+    assert gw.handle_pair(
+        json.dumps({"protocol": 1, "token": token.token, "name": "Real Phone"}).encode(),
+        "127.0.0.1")[1]["ok"] is True
+
+
+def test_successful_pairing_and_request_never_log_the_secret_or_token(gw, caplog):
+    import logging
+
+    token = gw.pairing.begin("Real Phone")
+    with caplog.at_level(logging.INFO, logger="void.device.gateway"):
+        _, pair_payload = gw.handle_pair(
+            json.dumps({"protocol": 1, "token": token.token, "name": "Real Phone"}).encode(),
+            "127.0.0.1")
+        device_id = pair_payload["result"]["device_id"]
+        secret = pair_payload["result"]["shared_secret"]
+        gw.handle_request(*_signed(device_id, secret), "127.0.0.1")
+    all_log_text = " ".join(r.message for r in caplog.records)
+    assert secret not in all_log_text
+    assert token.token not in all_log_text
+
+
+def _signed(device_id, secret, operation="get_status", request_id="r1"):
+    body = {"protocol": 1, "request_id": request_id, "device_id": device_id,
+            "operation": operation, "parameters": {}, "timestamp": time.time()}
+    raw = json.dumps(body).encode()
+    return raw, auth.sign(secret, raw)
+
+
 # --- direct method calls: fast coverage of every rejection path ----------
 
 def _pair(gw, name="Phone"):
