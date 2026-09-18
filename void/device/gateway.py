@@ -252,7 +252,16 @@ class DeviceGateway:
             try:
                 name = self.pairing.redeem(req.token)
             except PairingError as exc:
-                _log.warning("DEVICE_PAIR_REJECTED ip=%s reason=invalid_token", client_ip)
+                # exc.reason distinguishes WHY (no_window/expired/wrong_token)
+                # for diagnostics only - the response to the caller is
+                # unchanged (still a generic invalid_pairing_token, never
+                # revealing which case it was to an unauthenticated caller).
+                # Before this, every rejection logged identically, so a
+                # genuine "the gateway never saw a pairing window at all"
+                # bug (e.g. two processes resolving different state
+                # directories) was indistinguishable from an ordinary wrong
+                # guess or a stale token - undiagnosable after the fact.
+                _log.warning("DEVICE_PAIR_REJECTED ip=%s reason=%s", client_ip, exc.reason)
                 return 401, {"ok": False,
                              "error": {"code": ErrorCode.INVALID_TOKEN.value,
                                        "message": str(exc)}}

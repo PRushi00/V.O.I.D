@@ -132,6 +132,17 @@ class MainActivity : Activity() {
     private lateinit var tokenField: EditText
     private lateinit var nameField: EditText
     private lateinit var statusView: TextView
+    private lateinit var pairButton: Button
+
+    // Guards against a real-world race: the pairing token is single-use
+    // server-side (see void/device/pairing.py), so a SECOND concurrent Pair
+    // request - a double-tap, or a retry after a slow/flaky hotspot
+    // connection makes the first tap feel unresponsive - would burn the
+    // token before the first request's response is even shown, making a
+    // correctly-typed, still-valid token look like it failed. This does not
+    // change (or need to change) the server's single-use semantics; it just
+    // stops the client from accidentally submitting the same token twice.
+    private val pairingInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -148,7 +159,7 @@ class MainActivity : Activity() {
 
         val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
 
-        val pairButton = Button(this)
+        pairButton = Button(this)
         pairButton.text = "Pair"
         pairButton.setOnClickListener { pair(prefs) }
         layout.addView(pairButton)
@@ -190,6 +201,12 @@ class MainActivity : Activity() {
     }
 
     private fun pair(prefs: android.content.SharedPreferences) {
+        if (!pairingInFlight.compareAndSet(false, true)) {
+            show("Already pairing - please wait for that request to finish.")
+            return
+        }
+        runOnUiThread { pairButton.isEnabled = false }
+
         val host = hostField.text.toString().trim()
         val port = portField.text.toString().trim().toIntOrNull() ?: 8765
         val fingerprint = fingerprintField.text.toString().trim()
@@ -219,6 +236,9 @@ class MainActivity : Activity() {
                 }
             } catch (e: Exception) {
                 show("Pairing error: ${e.message}")
+            } finally {
+                pairingInFlight.set(false)
+                runOnUiThread { pairButton.isEnabled = true }
             }
         }
     }

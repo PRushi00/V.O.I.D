@@ -29,13 +29,30 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
+import os
 import secrets as _pysecrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
+_log = logging.getLogger("void.device.pairing")
+
 DEFAULT_WINDOW_SECONDS = 300  # 5 minutes
 _FILENAME = "pairing_window.json"
+
+# Distinguishes WHY a token was rejected, for diagnostics only - never
+# changes the response the caller gets (still always "invalid_pairing_token"
+# to a network caller; see void.device.gateway). Before this, every
+# rejection reason collapsed into one generic log line, so a real field
+# failure (e.g. the gateway silently failing to READ the file at all - a
+# permissions problem, a corrupt write, two processes resolving different
+# state directories) was indistinguishable in the log from an ordinary wrong
+# guess or an expired window. That made exactly this class of bug
+# undiagnosable after the fact.
+NO_WINDOW = "no_window"
+EXPIRED = "expired"
+WRONG_TOKEN = "wrong_token"
 
 
 @dataclass
@@ -47,7 +64,12 @@ class PairingToken:
 
 class PairingError(Exception):
     """Raised when a presented pairing token is missing, wrong, expired, or
-    already used."""
+    already used. ``reason`` is one of NO_WINDOW/EXPIRED/WRONG_TOKEN -
+    diagnostic only, never exposed to the network caller as-is."""
+
+    def __init__(self, message: str, reason: str):
+        super().__init__(message)
+        self.reason = reason
 
 
 class PairingManager:
@@ -66,7 +88,25 @@ class PairingManager:
             data = json.loads(self._path.read_text(encoding="utf-8"))
             return PairingToken(token=str(data["token"]), name=str(data["name"]),
                                expires_at=float(data["expires_at"]))
-        except (OSError, ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError):
+            # The file exists but its CONTENT is unusable (corrupt/partial
+            # JSON, missing field) - genuinely equivalent to "no window", but
+            # worth a diagnostic trace since it means something wrote a bad
+            # file rather than there simply being no pairing in progress.
+            # Never logs file content - only that this happened.
+            _log.warning("PAIRING_FILE_UNREADABLE path=%s (corrupt/partial content)",
+                        self._path)
+            return None
+        except OSError as exc:
+            # Distinct from "the file doesn't exist" (handled above): this is
+            # something like a permissions error stopping an EXISTING file
+            # from being read at all. Silently treating this the same as "no
+            # window" is exactly what made this class of bug undiagnosable in
+            # the field - a real read failure and a genuine absence produced
+            # an IDENTICAL, generic "no pairing window is open" with no trace
+            # of which one actually happened.
+            _log.warning("PAIRING_FILE_READ_FAILED path=%s error=%s",
+                        self._path, type(exc).__name__)
             return None
 
     def _write(self, token: PairingToken | None) -> None:
@@ -74,9 +114,18 @@ class PairingManager:
             self._path.unlink(missing_ok=True)
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps({
+        payload = json.dumps({
             "token": token.token, "name": token.name, "expires_at": token.expires_at,
-        }), encoding="utf-8")
+        })
+        # Atomic write (temp file + os.replace): a plain write_text() leaves
+        # a window where a concurrent _read() on another process/thread can
+        # observe a truncated/partial file (and silently treat it as "no
+        # window" per the except clause above). os.replace is atomic on both
+        # Windows and POSIX, so a reader only ever sees the old complete
+        # file or the new complete file, never a partial one.
+        tmp_path = self._path.parent / f"{self._path.name}.tmp{os.getpid()}"
+        tmp_path.write_text(payload, encoding="utf-8")
+        os.replace(tmp_path, self._path)
 
     def begin(self, name: str, now: float | None = None) -> PairingToken:
         now = time.time() if now is None else now
@@ -97,11 +146,11 @@ class PairingManager:
         now = time.time() if now is None else now
         active = self._read()
         if active is None:
-            raise PairingError("No pairing window is open.")
+            raise PairingError("No pairing window is open.", reason=NO_WINDOW)
         if now > active.expires_at:
             self._write(None)
-            raise PairingError("Pairing window has expired.")
+            raise PairingError("Pairing window has expired.", reason=EXPIRED)
         if not token or not hmac.compare_digest(token, active.token):
-            raise PairingError("Incorrect pairing token.")
+            raise PairingError("Incorrect pairing token.", reason=WRONG_TOKEN)
         self._write(None)  # single-use
         return active.name

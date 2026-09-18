@@ -147,6 +147,118 @@ def test_wrong_pairing_token_rejected_over_real_tls(gw):
     assert payload["ok"] is False
 
 
+# --- cross-process pairing at the FULL gateway stack (not just the bare
+# PairingManager class - see tests/test_device_pairing.py for that level).
+# Root-causing the real-world "invalid_pairing_token / No pairing" report
+# required proving the exact lifecycle a real deployment goes through: a
+# separate `pair-start` process's PairingManager instance, pointed at the
+# same state_dir, writing a token that an ALREADY-RUNNING (or since-
+# restarted) gateway process's OWN, independently-constructed PairingManager
+# instance then reads back and redeems - never the gateway reusing the same
+# in-memory PairingManager object that created the token, which non-real-
+# world unit tests could accidentally rely on without ever noticing. ----
+
+def test_fresh_pair_start_token_accepted_by_an_already_running_gateway(gw):
+    """`pair-start` is modeled here exactly as it is for real: a genuinely
+    separate PairingManager instance over the SAME directory as the
+    already-started, already-serving gateway's own - not gw.pairing itself."""
+    from void.device.pairing import PairingManager
+
+    pair_start_process = PairingManager(gw.state_dir,
+                                        window_seconds=300)
+    token = pair_start_process.begin("Real Phone")
+
+    conn = _tls_connection(gw)
+    status, payload = _post(conn, PAIR_PATH, json.dumps(
+        {"protocol": 1, "token": token.token, "name": "Real Phone"}).encode())
+    assert status == 200
+    assert payload["ok"] is True
+    assert "device_id" in payload["result"]
+
+
+def test_pair_start_token_created_before_the_gateway_even_started(tmp_path, tools):
+    """The reverse ordering: the pairing window is opened, THEN the gateway
+    process is constructed and started - proving order between the two
+    processes never matters, since the token lives in a file, not memory."""
+    from void.device.pairing import PairingManager
+
+    pair_start_process = PairingManager(tmp_path, window_seconds=300)
+    token = pair_start_process.begin("Real Phone")
+
+    gateway = DeviceGateway(_config(), tools, RiskGate(), KillSwitch(), tmp_path,
+                           host="127.0.0.1", port=0)
+    gateway.start()
+    gateway.serve_in_background()
+    try:
+        conn = _tls_connection(gateway)
+        status, payload = _post(conn, PAIR_PATH, json.dumps(
+            {"protocol": 1, "token": token.token, "name": "Real Phone"}).encode())
+        assert status == 200
+        assert payload["ok"] is True
+    finally:
+        gateway.stop()
+
+
+def test_pairing_survives_a_gateway_restart(tmp_path, tools):
+    """A gateway process restart (crash/manual restart/upgrade) must not
+    lose an in-progress pairing window - it is file-backed specifically so
+    restarting the SERVER never requires restarting the pairing flow too."""
+    from void.device.pairing import PairingManager
+
+    first_gateway = DeviceGateway(_config(), tools, RiskGate(), KillSwitch(), tmp_path,
+                                 host="127.0.0.1", port=0)
+    first_gateway.start()
+    first_gateway.serve_in_background()
+    pairing_process = PairingManager(tmp_path, window_seconds=300)
+    token = pairing_process.begin("Real Phone")
+    first_gateway.stop()   # simulates a restart
+
+    second_gateway = DeviceGateway(_config(), tools, RiskGate(), KillSwitch(), tmp_path,
+                                  host="127.0.0.1", port=0)
+    second_gateway.start()
+    second_gateway.serve_in_background()
+    try:
+        conn = _tls_connection(second_gateway)
+        status, payload = _post(conn, PAIR_PATH, json.dumps(
+            {"protocol": 1, "token": token.token, "name": "Real Phone"}).encode())
+        assert status == 200
+        assert payload["ok"] is True
+    finally:
+        second_gateway.stop()
+
+
+def test_pair_rejection_reason_is_logged_distinctly_never_the_token(gw, caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="void.device.gateway"):
+        status, payload = gw.handle_pair(
+            json.dumps({"protocol": 1, "token": "made-up-guess",
+                       "name": "Phone"}).encode(),
+            "127.0.0.1")
+    assert status == 401
+    assert payload["ok"] is False
+    reject_lines = [r.message for r in caplog.records if "DEVICE_PAIR_REJECTED" in r.message]
+    assert reject_lines
+    # No window was ever opened on this gateway, so the reason is no_window -
+    # never collapsed into a generic, undifferentiated rejection.
+    assert "reason=no_window" in reject_lines[0]
+    assert "made-up-guess" not in " ".join(reject_lines)   # never logs the token
+
+
+def test_pair_rejection_reason_distinguishes_wrong_token_from_no_window(gw, caplog):
+    import logging
+
+    gw.pairing.begin("Phone")
+    with caplog.at_level(logging.WARNING, logger="void.device.gateway"):
+        status, payload = gw.handle_pair(
+            json.dumps({"protocol": 1, "token": "made-up-guess",
+                       "name": "Phone"}).encode(),
+            "127.0.0.1")
+    assert status == 401
+    reject_lines = [r.message for r in caplog.records if "DEVICE_PAIR_REJECTED" in r.message]
+    assert "reason=wrong_token" in reject_lines[0]
+
+
 # --- direct method calls: fast coverage of every rejection path ----------
 
 def _pair(gw, name="Phone"):
