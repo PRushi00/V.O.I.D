@@ -16,6 +16,7 @@ from void import perf
 from void.actions.registry import ToolRegistry
 from void.memory import scope as memory_scope
 from void.memory.intent import RECALL_NO_ANSWER
+from void.memory.persist import Injection, MemorySafeStore, was_redacted
 from void.core.kill_switch import KillSwitch, StopRequested
 from void.core.task import CorruptedTaskState, Status, Task, TaskStore
 from void.providers.base import LLMProvider, ProviderUnavailable
@@ -132,7 +133,10 @@ class Agent:
         self.tools = tools
         self.risk_gate = risk_gate
         self.kill_switch = kill_switch
-        self.store = store
+        # Every task save goes through MemorySafeStore: while this run's provider context carries
+        # decrypted memory, it persists a REDACTED copy so memory never lands in plaintext history
+        # (void/memory/persist.py). Otherwise it is a transparent pass-through to ``store``.
+        self.store = MemorySafeStore(store, lambda: self._injection)
         self.max_steps = max_steps
         self.max_retries = max_retries
         self.on_event = on_event or (lambda _msg: None)
@@ -152,6 +156,8 @@ class Agent:
         # hallucinates anyway is dropped, never executed.
         self.recall_only = recall_only
         self._memory_msgs: list[dict] | None = None
+        self._injection: Injection | None = None
+        self._sticky_memory = False
         self._memory_goal = ""
         self._scope = memory_scope.RunScope()
 
@@ -164,6 +170,8 @@ class Agent:
                                for m in task.messages)
         self._scope = memory_scope.RunScope(task_id=task.id, tainted=seen_tool_output)
         self._memory_msgs = None
+        self._sticky_memory = was_redacted(task)          # once memory-influenced, a task stays protected
+        self._injection = Injection(carries_memory=True) if self._sticky_memory else None
         self._memory_goal = task.goal or ""
 
     def _with_memory(self, messages: list[dict]) -> list[dict]:
@@ -171,10 +179,17 @@ class Agent:
             return messages
         if self._memory_msgs is None:
             try:
-                self._memory_msgs = list(self._memory_context(self._memory_goal) or [])
+                got = self._memory_context(self._memory_goal)
+                if not isinstance(got, Injection):    # a plain message list: contents unknown, so protect the run
+                    got = Injection(messages=tuple(got or ()), carries_memory=bool(got))
+                if self._sticky_memory and not got.carries_memory:
+                    got = Injection(messages=got.messages, protected=got.protected, carries_memory=True)
+                self._injection = got
+                self._memory_msgs = list(got.messages)
             except Exception:                 # memory must never break a run
                 _log.exception("MEMORY_CONTEXT_FAILED")
                 self._memory_msgs = []
+                self._injection = Injection(carries_memory=True) if self._sticky_memory else None
         if not self._memory_msgs:
             return messages
         head = 1 if messages and messages[0].get("role") == "system" else 0

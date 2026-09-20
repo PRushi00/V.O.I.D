@@ -105,6 +105,9 @@ class TaskStore:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        # Overwritten/deleted row content is zeroed instead of lingering in free pages: a value that is
+        # cleared or redacted (e.g. a resolved pending step) must not stay readable in the file.
+        conn.execute("PRAGMA secure_delete=ON")
         return conn
 
     def _init_db(self) -> None:

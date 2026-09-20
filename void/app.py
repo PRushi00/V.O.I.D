@@ -19,6 +19,7 @@ from void.core.task import Status, Task, TaskStore
 from void.memory import intent as memory_intent
 from void.memory import scope as memory_scope
 from void.memory.crypto import MemoryUnavailable
+from void.memory.persist import Injection
 from void.memory.service import MemoryService
 from void.memory.tool import make_tool as make_memory_tool
 from void.providers.registry import ProviderRegistry
@@ -116,15 +117,19 @@ class Assistant:
             return None
         for_cloud = getattr(provider, "name", "") != "local"
 
-        def fn(goal: str) -> list[dict]:
+        def fn(goal: str) -> Injection:
             try:
                 block = self.memory.build_context(goal, for_cloud=for_cloud)
             except MemoryUnavailable as exc:
                 _log.warning("MEMORY_UNAVAILABLE code=%s", exc.code)   # the run proceeds without memory
-                return [memory_intent.recall_context_message(None)] if memory_first else []
+                block = None
             if memory_first:
-                return [memory_intent.recall_context_message(block)]
-            return [block.as_message()] if block else []
+                msgs = (memory_intent.recall_context_message(block),)
+            else:
+                msgs = (block.as_message(),) if block else ()
+            # ``protected``: the memory strings that must never reach plaintext task history.
+            return Injection(messages=msgs, protected=block.texts if block else (),
+                             carries_memory=block is not None)
 
         return fn
 

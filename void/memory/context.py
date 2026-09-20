@@ -41,6 +41,7 @@ class MemoryContext:
     ids: tuple[str, ...]
     tokens: int
     cloud_safe: bool          # True only if every included item is cloud_ok
+    texts: tuple[str, ...] = ()   # the memory strings in the block: never to be persisted (see persist.py)
 
     def as_message(self) -> dict:
         return {"role": "user", "content": self.text}
@@ -50,7 +51,7 @@ def render(hits, *, max_items: int = MAX_ITEMS, max_tokens: int = MAX_TOKENS) ->
     """``hits``: ranked MemoryItems (readable). Includes items in rank order while they fit."""
     max_items, max_tokens = min(max_items, MAX_ITEMS), min(max_tokens, MAX_TOKENS)     # hard ceilings
     used = estimate_tokens(HEADER) + estimate_tokens(FOOTER) + 2
-    lines, ids, cloud_safe = [], [], True
+    lines, ids, texts, cloud_safe = [], [], [], True
     for item in hits:
         if len(ids) >= max_items:
             break
@@ -62,8 +63,10 @@ def render(hits, *, max_items: int = MAX_ITEMS, max_tokens: int = MAX_TOKENS) ->
         used += cost
         lines.append(line)
         ids.append(item.id)
+        texts.extend((item.text, neutralise(item.text)))
         cloud_safe = cloud_safe and bool(item.cloud_ok)
     if not lines:
         return None
     text = "\n".join([HEADER, *lines, FOOTER])
-    return MemoryContext(text=text, ids=tuple(ids), tokens=estimate_tokens(text), cloud_safe=cloud_safe)
+    return MemoryContext(text=text, ids=tuple(ids), tokens=estimate_tokens(text), cloud_safe=cloud_safe,
+                         texts=tuple(dict.fromkeys(texts)))
