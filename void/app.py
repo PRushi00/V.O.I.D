@@ -144,7 +144,7 @@ class Assistant:
         reply = memory_intent.handle(self.memory, goal, memory_scope.current_channel())
         if reply is None:
             return None
-        task = Task(goal="[memory command]", status=Status.COMPLETED, result=reply)
+        task = Task(goal="[memory command]", id="(memory)", status=Status.COMPLETED, result=reply)
         return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0)
 
     def run(self, goal: str) -> AgentResult:

@@ -109,12 +109,13 @@ class MemoryStore:
         self._now = now
         self._cipher: MemoryCipher | None = None
         self._lock = threading.RLock()
+        self.busy_timeout_s = 15.0
 
     # ------------------------------------------------------------ connection / open
     @contextlib.contextmanager
     def _conn(self):
         try:
-            con = sqlite3.connect(str(self.path), timeout=15.0, isolation_level=None)
+            con = sqlite3.connect(str(self.path), timeout=self.busy_timeout_s, isolation_level=None)
             try:
                 con.execute("PRAGMA secure_delete=ON")
                 con.execute("PRAGMA journal_mode=DELETE")
@@ -125,7 +126,13 @@ class MemoryStore:
             if _is_corruption(exc):
                 raise MemoryUnavailable("db_corrupt", "The memory database is damaged or is not a memory database; "
                                         "it was left untouched.") from exc
-            raise                       # e.g. a lock timeout: not corruption, do not mislabel it
+            msg = str(exc).lower()
+            if "locked" in msg or "busy" in msg:
+                raise MemoryUnavailable("busy", "The memory database is busy (locked by another process); "
+                                        "try again.") from exc
+            raise MemoryUnavailable("db_error", f"The memory database could not be used ({type(exc).__name__}).") from exc
+        except sqlite3.Error as exc:
+            raise MemoryUnavailable("db_error", f"The memory database could not be used ({type(exc).__name__}).") from exc
 
     def exists(self) -> bool:
         try:
@@ -319,7 +326,7 @@ class MemoryStore:
                 con.executemany("UPDATE memory_items SET use_count = use_count + 1, last_used_at = ? WHERE id = ?",
                                 [(self._now(), i) for i in ids])
                 con.execute("COMMIT")
-        except sqlite3.Error:
+        except (sqlite3.Error, MemoryUnavailable):
             pass
 
     def _chain(self, con, item_id: str) -> set[str]:

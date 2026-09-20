@@ -4,14 +4,13 @@ import ast
 import json
 import logging
 import socket
-import types
 from pathlib import Path
 
 import keyring
 import pytest
 
 from tests.helpers import FakeProvider, tool_call
-from tests.memory_helpers import CANARY, Clock, FixedKeys
+from tests.memory_helpers import CANARY, FixedKeys
 from void import perf
 from void.app import Assistant
 from void.config import Config
@@ -635,3 +634,65 @@ def test_cli_rejects_secrets_and_reports_an_unavailable_store(capsys):
     code, out = _cli(["list"], capsys)
     assert code == 2 and "key_missing" in out and "durable fact" not in out
     assert keyring.get_password("void", "memory_key") is None
+
+
+# ================================================================== review follow-ups
+def test_a_locked_database_is_reported_as_busy_not_as_a_crash_or_corruption(tmp_path):
+    import sqlite3
+
+    from void.memory.crypto import MemoryUnavailable
+    a = make_assistant(tmp_path)
+    a.run("Remember that I prefer dark mode")
+    db = tmp_path / "state" / "memory.sqlite"
+    blocker = sqlite3.connect(str(db), isolation_level=None)
+    blocker.execute("BEGIN EXCLUSIVE")                                # another process holds the database
+    try:
+        b = make_assistant(tmp_path)
+        b.memory._store.busy_timeout_s = 0.2
+        with pytest.raises(MemoryUnavailable) as e:
+            b.memory.list()
+        assert e.value.code == "busy" and "dark mode" not in str(e.value)
+        reply = b.run("Remember that I prefer light mode").result      # no exception escapes Assistant.run
+        assert reply.startswith("Memory is unavailable:") and "busy" in reply
+        p = script(b, answer("ok"))
+        assert b.run("what do I prefer").status == Status.COMPLETED    # the model call proceeds without memory
+        assert [m["role"] for m in p.seen_messages[0]] == ["system", "user"]
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+    assert [i.text for i in make_assistant(tmp_path).memory.list()] == ["I prefer dark mode"]      # nothing was lost
+
+
+def test_the_voice_channel_does_not_leak_into_later_owner_commands(tmp_path):
+    a = make_assistant(tmp_path)
+    _voice(a, "remember that I prefer dark mode")
+    assert scope.current_channel() == "cli"
+    a.run("Remember that I use Windows eleven")
+    assert {i.text: i.status for i in a.memory.list()} == {"I prefer dark mode": "proposed", "I use Windows eleven": "active"}
+
+
+def test_a_memory_command_is_not_a_resumable_task(tmp_path):
+    a = make_assistant(tmp_path)
+    res = a.run("Remember that I prefer dark mode")
+    assert res.task.id == "(memory)" and a.store.load(res.task.id) is None and a.store.list() == []
+
+
+def test_owner_channel_names_are_the_only_ones_that_can_write_active(tmp_path):
+    svc = MemoryService(tmp_path / "m.sqlite", key_provider=FixedKeys())
+    for ch in ("voice", "agent", "device", "web", "", "CLI", "admin", "system"):
+        r = svc.remember(f"channel probe statement for {ch or 'empty'} here", channel=ch)
+        assert r.status == "proposed", f"channel {ch!r} produced {r.status}"
+    assert svc.list(statuses=("active",)) == []
+
+
+def test_plain_cli_goal_remember_works_without_any_model_or_network(capsys, monkeypatch):
+    """`python -m void "remember that ..."` needs no provider: it is handled before one is selected."""
+    from void import cli
+    _block_network(monkeypatch)
+    assert cli.main(["Remember", "that", "I", "am", "building", "V.O.I.D"]) == 0
+    out = capsys.readouterr().out
+    assert "Remembered (m_" in out and "COMPLETED" in out and "Task (memory)" in out
+    code, out = _cli(["list"], capsys)
+    assert code == 0 and "I am building V.O.I.D" in out
+    assert cli.main(["Forget", "that", "I", "am", "building", "V.O.I.D"]) == 0
+    assert "Forgot 1" in capsys.readouterr().out

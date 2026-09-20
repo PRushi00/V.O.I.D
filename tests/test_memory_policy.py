@@ -5,9 +5,8 @@ import string
 import pytest
 
 from void.memory import intent, policy
-from void.memory.service import Settings
 from void.security import secretscan
-from tests.memory_helpers import Clock, make_service
+from tests.memory_helpers import make_service
 
 
 # ------------------------------------------------------------------ secret scanner

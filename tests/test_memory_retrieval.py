@@ -7,7 +7,6 @@ import pytest
 
 from void.memory import context as ctx
 from void.memory.index import BM25Index, tokenize
-from void.memory.service import Settings
 from tests.memory_helpers import Clock, make_service
 
 CORPUS = [

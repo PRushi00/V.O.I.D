@@ -12,7 +12,6 @@ import pytest
 from void.memory import crypto
 from void.memory.crypto import KeyringKeyProvider, MemoryUnavailable
 from void.memory.service import MemoryService
-from void.memory.store import MemoryStore
 from void.security import secrets
 from tests.memory_helpers import CANARY, Clock, FixedKeys, db_bytes, make_service, sql
 
