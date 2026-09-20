@@ -117,8 +117,7 @@ def test_d02_harness_chord_with_ctrl_held_starts_ptt(monkeypatch):
     assert events == ["down"]
 
 
-@_xfail("D-02", "bare Space (Ctrl NOT held) starts a voice session because only the last chord token is hooked")
-def test_d02_bare_space_does_not_start_ptt(monkeypatch):
+def test_d02_bare_space_does_not_start_ptt(monkeypatch):                  # fixed by T0.4
     kb = _fake_keyboard(monkeypatch, held=set())      # Ctrl is NOT down
     events = []
     ptt = PTTActivation(lambda: events.append("down"), lambda: events.append("up"),

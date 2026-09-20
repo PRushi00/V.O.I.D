@@ -70,10 +70,21 @@ class PTTActivation(ActivationAdapter):
         artifact); capture keeps running until the real release.
 
     A single physical press/hold => exactly one capture session.
+
+    Chord matching (D-02): the underlying library hooks ONE key (the last token,
+    e.g. "space" for "ctrl+space"). The chord's modifiers are checked when that key
+    goes down: a bare Space with Ctrl not held is ignored. (V1 activated on every
+    Space press anywhere.) Modifier-free hotkeys such as "f9" are unaffected.
     """
 
+    _MODIFIER_ALIASES = {"ctrl": "ctrl", "control": "ctrl", "alt": "alt",
+                         "shift": "shift", "windows": "windows", "win": "windows",
+                         "cmd": "windows", "super": "windows"}
+
     def __init__(self, on_press, on_release, hotkey: str = "ctrl+space",
-                 key_is_down: Callable[[], bool] | None = None):
+                 key_is_down: Callable[[], bool] | None = None,
+                 modifier_is_down: Callable[[str], bool] | None = None,
+                 strict_chord: bool = True):
         super().__init__(on_press, on_release)
         self._hotkey = hotkey
         self._kb = None
@@ -83,17 +94,40 @@ class PTTActivation(ActivationAdapter):
         # reject spurious key-up events during auto-repeat. Injected in tests;
         # bound to keyboard.is_pressed at start().
         self._key_is_down = key_is_down
+        # D-02: the chord's MODIFIERS (e.g. Ctrl in "ctrl+space") must be down for
+        # a key-down to count. Predicate(name) -> bool; injected in tests, bound to
+        # keyboard.is_pressed at start(). None (handlers driven directly, never
+        # started) means "not enforced". ``strict_chord=False`` restores the V1
+        # behaviour (only the last token matters) as a rollback switch.
+        self._modifier_is_down = modifier_is_down
+        self._strict_chord = bool(strict_chord)
+        tokens = [t.strip().lower() for t in hotkey.split("+") if t.strip()]
+        self._modifiers = [self._MODIFIER_ALIASES.get(t, t) for t in tokens[:-1]]
 
     def _key_token(self) -> str:
-        # The library hooks a single key; use the final chord token (e.g.
-        # "ctrl+space" -> "space"). Chord/modifier matching is out of scope.
+        # The library hooks a single key: the final chord token (e.g.
+        # "ctrl+space" -> "space"). The modifiers are NOT hooked; they are checked
+        # by _modifiers_satisfied() when that key goes down (D-02).
         return self._hotkey.split("+")[-1].strip().lower()
+
+    def _modifiers_satisfied(self) -> bool:
+        if not self._strict_chord or not self._modifiers:
+            return True
+        predicate = self._modifier_is_down
+        if predicate is None:
+            return True                 # handlers driven directly (tests): not enforced
+        try:
+            return all(predicate(m) for m in self._modifiers)
+        except Exception:               # fail CLOSED: an unreadable key state is "not down"
+            return False
 
     # --- event normalization (edge-triggered, deterministic) ----------
     def _handle_key_down(self) -> None:
         with self._lock:
             if self._held:
                 return                  # auto-repeat: ignore, no on_press, no noise
+            if not self._modifiers_satisfied():
+                return                  # D-02: bare Space (Ctrl not held) is not PTT
             self._held = True
         self._on_press()
 
@@ -119,6 +153,8 @@ class PTTActivation(ActivationAdapter):
         token = self._key_token()
         if self._key_is_down is None:
             self._key_is_down = lambda: bool(self._kb and self._kb.is_pressed(token))
+        if self._modifier_is_down is None:
+            self._modifier_is_down = lambda name: bool(self._kb and self._kb.is_pressed(name))
         keyboard.on_press_key(token, lambda _e: self._handle_key_down())
         keyboard.on_release_key(token, lambda _e: self._handle_key_up())
 

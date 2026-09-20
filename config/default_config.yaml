@@ -74,6 +74,8 @@ kill_switch:
 voice:
   enabled: true                  # normal runtime is voice-only; UI is developer opt-in
   ptt_hotkey: "ctrl+space"       # push-to-talk: hold to talk, release to send
+  ptt_strict_chord: true         # true: the chord's modifiers (Ctrl) MUST be held; a bare Space does
+                                 # nothing (D-02). false restores the V1 behaviour (last key only).
   stt_model: "small"             # faster-whisper model (tiny|base|small|medium)
   stt_device: "cpu"              # "cpu" (int8) or "cuda"
   stt_language: "en"

@@ -314,6 +314,7 @@ class VoiceController:
         controller._activation = PTTActivation(
             controller.on_ptt_press, controller.on_ptt_release,
             hotkey=config.get("voice.ptt_hotkey", "ctrl+space"),
+            strict_chord=bool(config.get("voice.ptt_strict_chord", True)),
         )
         return controller
 
