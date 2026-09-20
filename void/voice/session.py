@@ -32,6 +32,7 @@ from typing import Callable
 from void import perf
 
 from void.voice.adapters import STTError, TTSError
+from void.voice.status_phrases import phrase_for
 from void.voice.state import VoiceCommand, VoiceEvent, VoiceState, reduce_voice
 
 # Lifecycle diagnostics -> local diagnostic log. Privacy: only stage names and
@@ -318,9 +319,16 @@ class VoiceSession:
             self._apply(VoiceEvent.DISPATCH_FAILED, gen=gen)
             return
         self._last_result = result
-        text = getattr(result, "result", None) or ""
+        # D-13: a task that needs the owner (approval / input / failed / paused) is announced
+        # with a CONSTANT phrase chosen by status alone - never the task, error or tool text.
+        status_phrase = phrase_for(getattr(result, "status", None))
+        if status_phrase is not None:
+            text, kind = status_phrase, "engine_status"
+        else:
+            text = getattr(result, "result", None) or ""
+            kind = "llm_text" if text else "silent"
         self._pending_response = text
-        self._perf("respond", kind="llm_text" if text else "silent")
+        self._perf("respond", kind=kind)
         if self._speak_response and text:
             _log.info("DISPATCH_OK -> SPEAK (response_len=%d)", len(text))
             self._apply(VoiceEvent.DISPATCH_OK_SPEAK, gen=gen)

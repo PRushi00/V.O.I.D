@@ -345,7 +345,6 @@ def test_d13_harness_completed_text_is_spoken():
 
 @pytest.mark.parametrize("status", [Status.AWAITING_CONFIRMATION, Status.BLOCKED,
                                     Status.FAILED, Status.PAUSED])
-@_xfail("D-13", "the voice runtime speaks nothing when a task is awaiting approval / blocked / failed / paused")
 def test_d13_non_completed_outcomes_speak_a_constant_phrase(status):
     spoke = _dispatch(_FakeResult(status, None, error="SECRET-ERROR-TEXT"))
     assert len(spoke) == 1, f"expected one spoken status phrase, got {spoke!r}"

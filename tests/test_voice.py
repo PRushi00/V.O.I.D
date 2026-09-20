@@ -14,6 +14,7 @@ from void.voice.adapters import (
     VoiceDependencyError,
 )
 from void.voice.session import VoiceSession
+from void.voice.status_phrases import ENGINE_STATUS_PHRASES
 from void.voice.state import (
     VoiceCommand, VoiceEvent, VoiceState, reduce_voice,
 )
@@ -215,15 +216,18 @@ def test_voice_dispatches_only_via_assistant_run():
 
 
 def test_high_risk_is_opaque_and_voice_cannot_approve():
-    # A HIGH-risk result (AWAITING_CONFIRMATION, no speakable text) is treated as
-    # opaque output: the voice SM never inspects task status, never enters an
-    # approval state, and never approves. It just dispatches and returns to IDLE.
+    # A HIGH-risk result (AWAITING_CONFIRMATION, no speakable text): the voice SM never
+    # enters an approval state and never approves. V2.0 (D-13) changed ONE thing: instead
+    # of silently returning to IDLE it announces a CONSTANT phrase ("use the command
+    # line") so the owner knows approval is pending - then returns to IDLE.
     asst = FakeAssistant(FakeResult(Status.AWAITING_CONFIRMATION))
     states = []
     s, cap, stt, tts, a, ks, ev = _session(assistant=asst,
                                            on_state=lambda st: states.append(st))
     s.on_ptt_press(); s.on_ptt_release()
     assert VoiceState.DISPATCHED in states  # handed to Assistant.run()...
+    assert tts.spoke == [ENGINE_STATUS_PHRASES[Status.AWAITING_CONFIRMATION]]
+    s.notify_speech_finished()
     assert s.state == VoiceState.IDLE       # ...then released; no approval state
     assert asst.calls == ["hello void"]     # RUN only, never approve/deny
     assert not hasattr(asst, "approved")    # voice never approves
