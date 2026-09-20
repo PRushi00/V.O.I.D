@@ -14,6 +14,7 @@ from typing import Callable
 
 from void import perf
 from void.actions.registry import ToolRegistry
+from void.memory import scope as memory_scope
 from void.core.kill_switch import KillSwitch, StopRequested
 from void.core.task import CorruptedTaskState, Status, Task, TaskStore
 from void.providers.base import LLMProvider, ProviderUnavailable
@@ -123,6 +124,7 @@ class Agent:
         max_retries: int = 2,
         on_event: OnEvent | None = None,
         defer_confirmation: bool = False,
+        memory_context: Callable[[str], list[dict]] | None = None,
     ):
         self.provider = provider
         self.tools = tools
@@ -138,11 +140,43 @@ class Agent:
         # When False (interactive), confirmation is synchronous via the
         # RiskGate's confirm_fn, exactly as before.
         self.defer_confirmation = defer_confirmation
+        # Persistent memory (V2.0): a callable goal -> [context messages] (or None). The
+        # returned messages are EPHEMERAL - sent to the provider but never appended to
+        # task.messages, so decrypted memory is never persisted into tasks.sqlite. Memory
+        # is data: nothing about it reaches RiskGate or any authorization decision.
+        self._memory_context = memory_context
+        self._memory_msgs: list[dict] | None = None
+        self._memory_goal = ""
+        self._scope = memory_scope.RunScope()
 
     # --- helpers -------------------------------------------------------
 
+    def _begin_run(self, task: Task) -> None:
+        """Fresh provenance for this run. A run that resumes a task which already holds tool
+        output starts TAINTED: memory writes proposed from it are quarantined."""
+        seen_tool_output = any(m.get("role") == "tool" and m.get("name") != memory_scope.PROPOSE_TOOL
+                               for m in task.messages)
+        self._scope = memory_scope.RunScope(task_id=task.id, tainted=seen_tool_output)
+        self._memory_msgs = None
+        self._memory_goal = task.goal or ""
+
+    def _with_memory(self, messages: list[dict]) -> list[dict]:
+        if self._memory_context is None:
+            return messages
+        if self._memory_msgs is None:
+            try:
+                self._memory_msgs = list(self._memory_context(self._memory_goal) or [])
+            except Exception:                 # memory must never break a run
+                _log.exception("MEMORY_CONTEXT_FAILED")
+                self._memory_msgs = []
+        if not self._memory_msgs:
+            return messages
+        head = 1 if messages and messages[0].get("role") == "system" else 0
+        return [*messages[:head], *self._memory_msgs, *messages[head:]]
+
     def _generate_with_retry(self, messages: list[dict]):
         specs = self.tools.specs()
+        messages = self._with_memory(messages)
         last_exc: Exception | None = None
         for attempt in range(self.max_retries + 1):
             self.kill_switch.raise_if_engaged()
@@ -226,7 +260,10 @@ class Agent:
 
         self.on_event(f"-> {description}")
         t0 = time.monotonic()
-        result = self.tools.execute(name, arguments)
+        with memory_scope.bind(self._scope):
+            result = self.tools.execute(name, arguments)
+        if name != memory_scope.PROPOSE_TOOL:
+            self._scope.taint()          # this run has now seen tool output (untrusted)
         # Diagnostic only: tool NAME (an engine-defined identifier) + risk +
         # outcome + duration - never arguments or the result summary, which
         # can contain file paths or other user-specific content.
@@ -307,6 +344,7 @@ class Agent:
 
     def run(self, goal: str) -> AgentResult:
         task = Task(goal=goal)
+        self._begin_run(task)
         task.messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": goal},
@@ -344,6 +382,7 @@ class Agent:
                 f"Task {task.id} is blocked pending clarification.")
             return AgentResult(task, task.status, task.result, task.steps)
         self.on_event(f"Resuming task {task.id} from step {task.steps}.")
+        self._begin_run(task)
         return self._loop(task)
 
     def resume_pending(self, task: Task, decision: bool) -> AgentResult:
@@ -370,6 +409,7 @@ class Agent:
             # An ambiguity block is resolved by resume_clarification (a numeric
             # directory choice), never by approve/deny - execute nothing here.
             return self.resume(task)
+        self._begin_run(task)
         pending = task.pending
         assistant_msg = {
             "role": "assistant",
@@ -731,6 +771,7 @@ class Agent:
             self.on_event(task.error)
             return AgentResult(task, task.status, task.result, task.steps)
 
+        self._begin_run(task)
         chosen = candidates[idx - 1]
         path = chosen["path"]
         self.on_event(f"Owner selected [{idx}] {path}. Continuing the request.")

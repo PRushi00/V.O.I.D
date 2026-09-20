@@ -142,3 +142,16 @@ device:
   ip_rate_per_minute: 120       # pre-auth requests per source address per minute
   limiter_max_keys: 1024        # cap on distinct rate-limiter keys (LRU eviction)
   stats_period_s: 60            # aggregate gateway counters to the perf stream (0 = off)
+
+# Persistent memory (V2.0). Encrypted at rest (AES-256-GCM; key in the OS credential store),
+# offline, and DATA ONLY: memory can inform a reply but can never authorize anything.
+memory:
+  enabled: true
+  propose_tool: true            # let the model SUGGEST memories (owner review required; never auto-active)
+  voice_auto_accept: false      # spoken "remember ..." lands for review; true = auto-accept non-sensitive preferences
+  cloud_normal: true            # false = keep ALL memory local-only (never included in cloud prompts)
+  max_items: 5                  # hard caps on what one request may recall (ceilings: 5 items, 400 tokens)
+  max_context_tokens: 400
+  proposal_ttl_days: 30         # unreviewed proposals/quarantined items expire
+  episode_ttl_days: 90          # episodic notes expire unless pinned
+  max_proposals_per_task: 3

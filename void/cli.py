@@ -155,7 +155,8 @@ _ALIAS_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 def _reserved_names() -> set[str]:
     """Names that must never be used as an additional-credential alias."""
-    return {secrets.GEMINI_API_KEY, secrets.STOP_PIN, credentials.MANIFEST_KEY}
+    return {secrets.GEMINI_API_KEY, secrets.STOP_PIN, credentials.MANIFEST_KEY,
+            secrets.MEMORY_KEY}
 
 
 def _validate_alias(alias: str) -> str | None:
@@ -885,6 +886,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--host", default=None)
     p_serve.add_argument("--port", type=int, default=None)
 
+    from void.memory import cli as memory_cli
+    memory_cli.add_parser(sub)
+
     p_perf = sub.add_parser("perf", help="Performance telemetry tools (read-only)")
     perf_sub = p_perf.add_subparsers(dest="perf_action")
     p_report = perf_sub.add_parser("report", help="Latency tables (p50/p95; p99 only if n>=300)")
@@ -908,7 +912,7 @@ def main(argv: list[str] | None = None) -> int:
     known = {"run", "resume", "clarify", "approve", "deny", "set-key",
              "list-keys", "remove-key", "set-pin", "tasks", "stop",
              "clear-stop", "ui", "voice", "app", "singularity", "autostart",
-             "roots", "protect", "device", "perf", "doctor", "-h", "--help"}
+             "roots", "protect", "device", "perf", "doctor", "memory", "-h", "--help"}
     if argv and argv[0] not in known:
         return cmd_run(" ".join(argv))
 
@@ -953,6 +957,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_roots(args.action, args.path)
     if args.command == "protect":
         return cmd_protect(args.action, args.path)
+    if args.command == "memory":
+        from void.config import Config
+        from void.memory import cli as memory_cli
+        return memory_cli.run(args, Config.load())
     if args.command == "perf":
         if args.perf_action == "report":
             return cmd_perf_report(args.state_dir, args.legacy, args.as_json)

@@ -31,6 +31,7 @@ from typing import Callable
 
 from void import perf
 
+from void.memory import scope as memory_scope
 from void.voice.adapters import STTError, TTSError
 from void.voice.status_phrases import phrase_for
 from void.voice.state import VoiceCommand, VoiceEvent, VoiceState, reduce_voice
@@ -312,7 +313,8 @@ class VoiceSession:
         # is NOT inspected here.
         _log.info("DISPATCH_STARTED (transcript_len=%d)", len(transcript))
         try:
-            result = self._assistant.run(transcript)
+            with memory_scope.use_channel("voice"):      # a transcript is not typed by the owner
+                result = self._assistant.run(transcript)
         except Exception as exc:
             _log.warning("DISPATCH_FAILED: %s: %s", type(exc).__name__, exc)
             self._msg(f"(voice) dispatch failed: {exc}")

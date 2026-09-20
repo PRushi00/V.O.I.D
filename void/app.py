@@ -3,6 +3,7 @@ agent into one object the CLI and UI can drive.
 """
 from __future__ import annotations
 
+import logging
 import time
 from typing import Callable
 
@@ -15,14 +16,23 @@ from void.config import Config
 from void.core.agent import Agent, AgentResult
 from void.core.kill_switch import KillSwitch
 from void.core.task import Status, Task, TaskStore
+from void.memory import intent as memory_intent
+from void.memory import scope as memory_scope
+from void.memory.crypto import MemoryUnavailable
+from void.memory.service import MemoryService
+from void.memory.tool import make_tool as make_memory_tool
 from void.providers.registry import ProviderRegistry
 from void.security.risk import RiskGate
+
+_log = logging.getLogger(__name__)
 
 ConfirmFn = Callable[[str], bool]
 OnEvent = Callable[[str], None]
 
 
 class Assistant:
+    memory: MemoryService | None = None      # set in __init__; None when disabled
+
     def __init__(self, config: Config | None = None,
                  confirm_fn: ConfirmFn | None = None,
                  on_event: OnEvent | None = None):
@@ -71,6 +81,14 @@ class Assistant:
         self.tools.register_all(app_actions.tools())
         self.tools.register_all(computer_actions.tools())
 
+        # Persistent memory (V2.0). Lazy: no file and no key exist until the first write.
+        # Memory is DATA - it never feeds RiskGate. The model may only SUGGEST via
+        # propose_memory; its suggestions need owner review before they can be recalled.
+        if self.config.get("memory.enabled", True):
+            self.memory = MemoryService.from_config(self.config)
+            if self.config.get("memory.propose_tool", True):
+                self.tools.register(make_memory_tool(self.memory))
+
         # Providers
         self.providers = ProviderRegistry.from_config(self.config)
 
@@ -87,7 +105,25 @@ class Assistant:
             max_retries=self.config.get("agent.max_retries", 2),
             on_event=self.on_event,
             defer_confirmation=self._confirm_fn is None,
+            memory_context=self._memory_context_fn(provider),
         )
+
+    def _memory_context_fn(self, provider):
+        """Goal -> [context messages]. Sensitive / non-cloud memory is withheld whenever the
+        selected provider is not the local one (unknown providers count as cloud)."""
+        if self.memory is None:
+            return None
+        for_cloud = getattr(provider, "name", "") != "local"
+
+        def fn(goal: str) -> list[dict]:
+            try:
+                block = self.memory.build_context(goal, for_cloud=for_cloud)
+            except MemoryUnavailable as exc:
+                _log.warning("MEMORY_UNAVAILABLE code=%s", exc.code)   # the run proceeds without memory
+                return []
+            return [block.as_message()] if block else []
+
+        return fn
 
     def _measured(self, fn) -> AgentResult:
         """Run one agent operation inside a telemetry interaction (joining the
@@ -100,7 +136,21 @@ class Assistant:
                       total_s=round(time.monotonic() - t0, 3), steps=result.steps)
             return result
 
+    def _memory_command(self, goal: str) -> AgentResult | None:
+        """"remember that ..." and friends, handled deterministically BEFORE any model sees the
+        goal. The goal is not stored as a task (tasks.sqlite is plaintext)."""
+        if self.memory is None or self.kill_switch.engaged:
+            return None
+        reply = memory_intent.handle(self.memory, goal, memory_scope.current_channel())
+        if reply is None:
+            return None
+        task = Task(goal="[memory command]", status=Status.COMPLETED, result=reply)
+        return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0)
+
     def run(self, goal: str) -> AgentResult:
+        handled = self._memory_command(goal)
+        if handled is not None:
+            return handled
         return self._measured(lambda: self._agent().run(goal))
 
     def resume(self, task_id: str) -> AgentResult:
