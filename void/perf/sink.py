@@ -49,6 +49,22 @@ def interaction(interaction_id: str | None = None):
         _current.reset(token)
 
 
+@contextlib.contextmanager
+def ensure_interaction(source: str = "cli"):
+    """Join the current interaction, or start one (emitting ``activation``).
+
+    Voice mints its own id at activation and binds it in the worker thread, so a voice
+    command that reaches ``Assistant.run`` JOINS that id; a bare CLI/one-shot call has
+    none, so it gets a fresh id and its own ``activation`` event here."""
+    existing = _current.get()
+    if existing is not None:
+        yield existing
+        return
+    with interaction() as iid:
+        emit("activation", source=source)
+        yield iid
+
+
 def configure(directory, *, max_bytes: int = 5 * 1024 * 1024, backup_count: int = 5) -> Path | None:
     """Start writing ``<directory>/perf.jsonl``. Idempotent; never raises."""
     global _handler

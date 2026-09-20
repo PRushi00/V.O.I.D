@@ -665,7 +665,7 @@ class VoiceController:
                 return
             if self._wake_armed:
                 self._disarm_wake_locked()
-        self._session.on_ptt_press()         # IDLE -> LISTENING: NEW_GENERATION + MIC_OPEN
+        self._session.on_ptt_press(source="wake")   # IDLE -> LISTENING: NEW_GENERATION + MIC_OPEN
         if self._session.state != VoiceState.LISTENING:
             with self._wake_lock:            # e.g. KillSwitch coerced the press
                 self._wake_capture_active = False
@@ -704,6 +704,7 @@ class VoiceController:
         _log.info("COMMAND_ENDPOINT reason=%s stale=%s", reason, stale)
         if stale:
             return                           # a newer session owns the mic now
+        self._session.note_endpoint_reason(reason)    # telemetry label only
         self.on_ptt_release()                # -> worker: finalize + STT + dispatch + speak
 
     @property

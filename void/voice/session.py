@@ -23,10 +23,13 @@ Authoritative invariants (Phase 9B step 3):
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
 from typing import Callable
+
+from void import perf
 
 from void.voice.adapters import STTError, TTSError
 from void.voice.state import VoiceCommand, VoiceEvent, VoiceState, reduce_voice
@@ -67,6 +70,14 @@ class VoiceSession:
         self._now = now or time.monotonic
         self._speech_seen = False
         self._speaking_since = 0.0
+        # Performance-telemetry correlation (V2.0 T0.7). One id per voice session
+        # (minted with the generation at PTT_DOWN), bound in the worker thread around
+        # STT / dispatch / speak so the agent's own events join the same chain.
+        # Telemetry only: never consulted for any decision.
+        self._interaction_id: str | None = None
+        self._activation_source = "ptt"
+        self._endpoint_reason = "ptt_release"
+        self._capture_started: float | None = None
 
     # --- observability ------------------------------------------------
     @property
@@ -82,8 +93,15 @@ class VoiceSession:
         return self._last_transcript
 
     # --- public entry points (translate to lifecycle events) ----------
-    def on_ptt_press(self) -> None:
+    def on_ptt_press(self, source: str = "ptt") -> None:
+        """``source`` (ptt|wake) is telemetry only: it labels the activation event."""
+        self._activation_source = source
         self._apply(VoiceEvent.PTT_DOWN)
+
+    def note_endpoint_reason(self, reason: str) -> None:
+        """Telemetry only: why an automatic (wake) capture ended."""
+        if reason in ("silence", "no_speech", "max_duration"):
+            self._endpoint_reason = reason
 
     def on_ptt_release(self) -> None:
         self._apply(VoiceEvent.PTT_UP)
@@ -183,12 +201,21 @@ class VoiceSession:
             for c in commands:
                 if c == VoiceCommand.NEW_GENERATION:
                     self._generation += 1
+                    if event == VoiceEvent.PTT_DOWN:          # a new session (not an invalidation)
+                        self._interaction_id = perf.new_interaction_id()
+                        self._endpoint_reason = "ptt_release"
+                        self._perf("activation", source=self._activation_source)
                 elif c == VoiceCommand.MIC_OPEN:
+                    self._capture_started = self._now()
                     if not self._safe_open_mic():
                         g = self._generation
                         after.append(lambda g=g: self._apply(
                             VoiceEvent.INTERNAL_ERROR, gen=g))
                 elif c == VoiceCommand.CAPTURE_FINALIZE:
+                    if self._capture_started is not None:
+                        self._perf("endpoint", reason=self._endpoint_reason,
+                                   capture_s=round(self._now() - self._capture_started, 3))
+                        self._capture_started = None
                     ok, audio = self._safe_finalize_capture()
                     g = self._generation
                     if ok:
@@ -206,18 +233,20 @@ class VoiceSession:
                     self._safe_tts_close()
                 elif c == VoiceCommand.RUN_STT:
                     g = self._generation
-                    after.append(lambda g=g: self._run_stt(g))
+                    after.append(lambda g=g: self._in_interaction(self._run_stt, g))
                 elif c == VoiceCommand.RUN_DISPATCH:
                     g = self._generation
-                    after.append(lambda g=g: self._run_dispatch(g))
+                    after.append(lambda g=g: self._in_interaction(self._run_dispatch, g))
                 elif c == VoiceCommand.SPEAK:
                     self._speech_seen = False
                     self._speaking_since = self._now()
                     g = self._generation
-                    after.append(lambda g=g: self._run_speak(g))
+                    after.append(lambda g=g: self._in_interaction(self._run_speak, g))
                 elif c == VoiceCommand.WARN_EMPTY:
                     self._msg("No speech detected.")
 
+            if event == VoiceEvent.TTS_DONE and prev == VoiceState.SPEAKING:
+                self._perf("speak", dur_s=round(self._now() - self._speaking_since, 3))
             self._set_state(new_state)
             # ERROR is transient: clean up (above) then recover to IDLE, unless a
             # higher-priority transition (KillSwitch/shutdown) supersedes it.
@@ -229,6 +258,20 @@ class VoiceSession:
         for cont in after:
             cont()
 
+    # --- telemetry helpers (no decision ever depends on these) --------
+    def _perf(self, event: str, **fields) -> None:
+        if self._interaction_id:
+            fields.setdefault("interaction_id", self._interaction_id)
+        perf.emit(event, **fields)
+
+    def _in_interaction(self, fn, *args) -> None:
+        """Run a blocking step with this session's interaction id bound, so the
+        agent/provider/tool events emitted underneath join the same chain."""
+        cm = (perf.interaction(self._interaction_id) if self._interaction_id
+              else contextlib.nullcontext())
+        with cm:
+            fn(*args)
+
     # --- blocking pipeline steps (run outside the lock) ---------------
     def _run_stt(self, gen: int) -> None:
         audio = self._pending_audio
@@ -237,6 +280,7 @@ class VoiceSession:
         except Exception:
             n = -1
         _log.info("STT_STARTED (audio_samples=%s)", n)
+        t0 = time.monotonic()
         try:
             transcript = self._stt.transcribe(audio)
         except STTError as exc:
@@ -248,6 +292,11 @@ class VoiceSession:
             self._apply(VoiceEvent.STT_FAILED, gen=gen)
             return
         transcript = (transcript or "").strip()
+        stt_fields = {"decode_s": round(time.monotonic() - t0, 3), "empty": not transcript,
+                      "backend": type(self._stt).__name__}
+        if n >= 0:
+            stt_fields["audio_s"] = round(n / 16000.0, 3)
+        self._perf("stt", **stt_fields)
         if not transcript:
             _log.info("STT_DONE empty=True (no command recognized)")
             self._apply(VoiceEvent.STT_EMPTY, gen=gen)
@@ -271,6 +320,7 @@ class VoiceSession:
         self._last_result = result
         text = getattr(result, "result", None) or ""
         self._pending_response = text
+        self._perf("respond", kind="llm_text" if text else "silent")
         if self._speak_response and text:
             _log.info("DISPATCH_OK -> SPEAK (response_len=%d)", len(text))
             self._apply(VoiceEvent.DISPATCH_OK_SPEAK, gen=gen)
@@ -281,6 +331,7 @@ class VoiceSession:
 
     def _run_speak(self, gen: int) -> None:
         _log.info("SPEAK_STARTED")
+        self._perf("speak", chars=len(self._pending_response or ""))
         try:
             self._tts.speak(self._pending_response)
         except TTSError as exc:

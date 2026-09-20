@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
+from void import perf
 from void.actions.registry import ToolRegistry
 from void.core.kill_switch import KillSwitch, StopRequested
 from void.core.task import CorruptedTaskState, Status, Task, TaskStore
@@ -153,6 +154,9 @@ class Agent:
             except Exception as exc:  # transient (network, rate limit, ...)
                 _log.info("LLM_CALL_FAILED attempt=%d duration=%.2fs %s",
                           attempt + 1, time.monotonic() - t0, type(exc).__name__)
+                perf.emit("llm", attempt=attempt + 1, duration_s=round(time.monotonic() - t0, 3),
+                          ok=False, error_class=type(exc).__name__,
+                          provider=getattr(self.provider, "name", "unknown"))
                 last_exc = exc
                 self.on_event(f"LLM call failed (attempt {attempt + 1}): {exc}")
                 time.sleep(min(2 ** attempt, 5))
@@ -160,6 +164,8 @@ class Agent:
             n_calls = len(response.tool_calls) if response.has_tool_calls else 0
             _log.info("LLM_CALL_DONE attempt=%d duration=%.2fs tool_calls=%d",
                       attempt + 1, time.monotonic() - t0, n_calls)
+            perf.emit("llm", attempt=attempt + 1, duration_s=round(time.monotonic() - t0, 3),
+                      ok=True, tool_calls=n_calls, provider=getattr(self.provider, "name", "unknown"))
             return response
         raise last_exc  # type: ignore[misc]
 
@@ -226,6 +232,8 @@ class Agent:
         # can contain file paths or other user-specific content.
         _log.info("TOOL_CALL_DONE name=%s risk=%s ok=%s duration=%.2fs",
                   name, risk.name, bool(result.ok), time.monotonic() - t0)
+        perf.emit("tool", name=name, risk=risk.name, duration_s=round(time.monotonic() - t0, 3),
+                  ok=bool(result.ok))
         first = result.summary.splitlines()[0] if result.summary else ""
         self.on_event(f"   {first}")
         kind = "ok" if result.ok else "tool_failure"

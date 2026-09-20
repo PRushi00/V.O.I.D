@@ -3,8 +3,10 @@ agent into one object the CLI and UI can drive.
 """
 from __future__ import annotations
 
+import time
 from typing import Callable
 
+from void import perf
 from void.actions.apps import AppActions
 from void.actions.computer import AppCatalog, ComputerActions, make_backend
 from void.actions.files import FileActions
@@ -74,6 +76,7 @@ class Assistant:
 
     def _agent(self) -> Agent:
         provider = self.providers.select()  # raises if none available
+        perf.emit("route", provider=getattr(provider, "name", "unknown"), reason="select")
         return Agent(
             provider=provider,
             tools=self.tools,
@@ -86,31 +89,42 @@ class Assistant:
             defer_confirmation=self._confirm_fn is None,
         )
 
+    def _measured(self, fn) -> AgentResult:
+        """Run one agent operation inside a telemetry interaction (joining the
+        voice session's id when there is one) and record its completion. Pure
+        observation: the result and any exception pass through unchanged."""
+        t0 = time.monotonic()
+        with perf.ensure_interaction("cli"):
+            result = fn()
+            perf.emit("complete", status=result.status,
+                      total_s=round(time.monotonic() - t0, 3), steps=result.steps)
+            return result
+
     def run(self, goal: str) -> AgentResult:
-        return self._agent().run(goal)
+        return self._measured(lambda: self._agent().run(goal))
 
     def resume(self, task_id: str) -> AgentResult:
         task = self.store.load(task_id)
         if task is None:
             raise ValueError(f"No such task: {task_id}")
-        return self._agent().resume(task)
+        return self._measured(lambda: self._agent().resume(task))
 
     def approve(self, task_id: str) -> AgentResult:
         """Owner approves a task's pending HIGH-risk step; execute it once."""
         task = self._load_awaiting(task_id)
-        return self._agent().resume_pending(task, decision=True)
+        return self._measured(lambda: self._agent().resume_pending(task, decision=True))
 
     def deny(self, task_id: str) -> AgentResult:
         """Owner denies a task's pending HIGH-risk step; it will not execute."""
         task = self._load_awaiting(task_id)
-        return self._agent().resume_pending(task, decision=False)
+        return self._measured(lambda: self._agent().resume_pending(task, decision=False))
 
     def clarify(self, task_id: str, selection) -> AgentResult:
         """Owner resolves a BLOCKED directory-disambiguation by number; the
         original task then continues through the normal risk pipeline. A plain
         ``resume`` never consumes the pending choice."""
         task = self._load_blocked_disambiguation(task_id)
-        return self._agent().resume_clarification(task, selection)
+        return self._measured(lambda: self._agent().resume_clarification(task, selection))
 
     def cancel(self, task_id: str) -> Task:
         """Owner cancels a task (terminal). No pending action executes."""
