@@ -47,10 +47,10 @@ class DiagnosticsTest {
         // Exact shape Android's libcore produces when nothing answers (stale
         // IP, gateway stopped, firewall drop).
         val e = SocketTimeoutException(
-            "failed to connect to /10.192.243.47 (port 8765) from /:: (port 41234) after 8000ms")
-        val msg = describeFailure(e, "10.192.243.47", 8765)
+            "failed to connect to /192.0.2.10 (port 8765) from /:: (port 41234) after 8000ms")
+        val msg = describeFailure(e, "192.0.2.10", 8765)
         assertTrue(msg, msg.startsWith("TIMEOUT"))
-        assertTrue(msg, msg.contains("10.192.243.47:8765"))
+        assertTrue(msg, msg.contains("192.0.2.10:8765"))
         assertTrue(msg, msg.contains("SocketTimeoutException"))
     }
 
@@ -79,14 +79,14 @@ class DiagnosticsTest {
             it.initCause(CertificateException(
                 "Certificate fingerprint mismatch - refusing to connect. expected=AA actual=BB"))
         }
-        val msg = describeFailure(e, "10.192.243.47", 8765)
+        val msg = describeFailure(e, "192.0.2.10", 8765)
         assertTrue(msg, msg.startsWith("TLS: certificate fingerprint MISMATCH"))
         assertTrue(msg, msg.contains("expected=AA actual=BB"))
     }
 
     @Test fun `a TCP-level failure is never reported as a fingerprint failure`() {
         val tcp = listOf<Throwable>(
-            SocketTimeoutException("failed to connect to /10.192.243.47 (port 8765) after 8000ms"),
+            SocketTimeoutException("failed to connect to /192.0.2.10 (port 8765) after 8000ms"),
             ConnectException("ECONNREFUSED (Connection refused)"),
             ConnectException("EHOSTUNREACH (No route to host)"),
             UnknownHostException("x"),
@@ -114,11 +114,11 @@ class DiagnosticsTest {
     // ---- display vs saved endpoint (stale-config detector) ---------------
 
     @Test fun `screen matching the saved endpoint is not flagged`() {
-        assertFalse(endpointDiffers("10.192.243.47", 8765, pinColon, "10.192.243.47", 8765, pinPlain))
+        assertFalse(endpointDiffers("192.0.2.10", 8765, pinColon, "192.0.2.10", 8765, pinPlain))
     }
 
     @Test fun `an IP typed on screen but not saved is flagged`() {
-        assertTrue(endpointDiffers("10.192.243.99", 8765, pinColon, "10.192.243.47", 8765, pinColon))
+        assertTrue(endpointDiffers("192.0.2.99", 8765, pinColon, "192.0.2.10", 8765, pinColon))
     }
 
     @Test fun `changed port or fingerprint is flagged, formatting differences are not`() {

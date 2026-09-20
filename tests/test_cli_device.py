@@ -44,7 +44,7 @@ def test_pair_start_prints_a_token_and_opens_a_window(state_dir, capsys):
     assert mgr.redeem(out.split("Pairing token:")[1].splitlines()[0].strip()) == "My Phone"
 
 
-def _pair_start_fields(capsys, monkeypatch, ip_hint="10.192.243.47", name="My Android Phone"):
+def _pair_start_fields(capsys, monkeypatch, ip_hint="192.0.2.10", name="My Android Phone"):
     """Run pair-start and parse each printed field's VALUE (not just its
     label - a label-only check passes even when the value after it is
     blank). Returns a dict; the token is returned so tests can test it, but
@@ -72,7 +72,7 @@ def test_pair_start_prints_a_nonblank_value_for_every_field(state_dir, capsys, m
     assert bool(fields.get("fingerprint")), "fingerprint value is blank"
     assert bool(fields.get("port")), "port value is blank"
     assert fields["name"] == "My Android Phone"
-    assert fields["address"] == "10.192.243.47"
+    assert fields["address"] == "192.0.2.10"
 
 
 def test_pair_start_fingerprint_is_the_real_certificates_sha256(state_dir, capsys, monkeypatch):

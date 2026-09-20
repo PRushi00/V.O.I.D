@@ -8,7 +8,7 @@ package com.void_project.companion
  * host/port are connection config, not credentials.
  *
  * Why this exists: before, every network failure reached the screen as just
- * `e.message`, e.g. "failed to connect to /10.192.243.47:8765". That one
+ * `e.message`, e.g. "failed to connect to /192.0.2.10:8765". That one
  * string is what Android produces for a connect TIMEOUT (nothing answered:
  * gateway not running, firewall drop, wrong address), for a REFUSED
  * connection (host up, nothing listening) and for "no route" alike - three
@@ -17,7 +17,7 @@ package com.void_project.companion
  * makes each of them recognizable without USB and without adb logcat.
  */
 
-/** Strips separators/whitespace and lower-cases, so `17:40:F7...`, `1740f7...`
+/** Strips separators/whitespace and lower-cases, so `AB:CD:EF...`, `abcdef...`
  * and a value with a stray space/newline from copy-paste all compare equal.
  * Returns null unless the result is exactly 64 hex digits (a SHA-256), so a
  * malformed entry is reported as MALFORMED rather than as a "mismatch". This
