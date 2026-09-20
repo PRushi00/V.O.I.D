@@ -63,6 +63,8 @@ security:
 logging:
   max_bytes: 5242880            # per file; ~6 files kept (live + backups) => ~30 MB ceiling
   backup_count: 5
+tasks:
+  sweep_stale_on_start: true   # at runtime start, pause tasks left 'running' by a dead process (never resumes them)
 perf:
   enabled: true                 # <state_dir>/perf/perf.jsonl: numbers/ids/enums only, never content
 

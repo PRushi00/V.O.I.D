@@ -311,6 +311,12 @@ class VoiceController:
         )
         wake = cls._build_wake(config)
         worker = _SerialVoiceWorker()
+        if config.get("tasks.sweep_stale_on_start", True):
+            # A task left `running` by a process that died is not running: mark it paused.
+            try:
+                getattr(assistant, "store").sweep_stale()
+            except Exception:
+                _log.exception("TASK_SWEEP_FAILED")     # housekeeping must never block voice startup
         health_sink = None
         try:
             state_dir = config.state_dir()

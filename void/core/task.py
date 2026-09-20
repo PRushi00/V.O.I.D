@@ -8,11 +8,19 @@ starting over.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
+
+# A task still `running` this long after its last checkpoint belongs to a process that
+# died (every step re-saves it), so it can no longer be running.
+STALE_RUNNING_AFTER_S = 900.0
+INTERRUPTED_ERROR = "interrupted: process exited"
 
 
 class Status:
@@ -218,6 +226,41 @@ class TaskStore:
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [self._row_to_task(r) for r in rows]
+
+    def sweep_stale(self, *, older_than_s: float = STALE_RUNNING_AFTER_S,
+                    dry_run: bool = False, now: float | None = None) -> list[str]:
+        """Mark tasks stuck ``running`` after their process died as ``paused``.
+
+        Fail-safe by construction: the result is PAUSED (resumable only by the owner via
+        ``resume``), never COMPLETED, and nothing is executed or auto-resumed. Only
+        ``running`` rows whose ``updated_at`` is older than ``older_than_s`` are touched;
+        anything a live process checkpointed recently, and every other status, is left
+        exactly as it was. ``updated_at`` is preserved so history stays honest. Selection
+        and update happen in one write transaction, so a concurrent checkpoint cannot be
+        clobbered. Returns the affected ids (would-be ids when ``dry_run``)."""
+        cutoff = (time.time() if now is None else now) - older_than_s
+        conn = sqlite3.connect(self.db_path, timeout=10.0, isolation_level=None)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            ids = [r[0] for r in conn.execute(
+                "SELECT id FROM tasks WHERE status=? AND updated_at < ? ORDER BY updated_at",
+                (Status.RUNNING, cutoff))]
+            if ids and not dry_run:
+                conn.executemany(
+                    "UPDATE tasks SET status=?, error=? WHERE id=? AND status=? AND updated_at < ?",
+                    [(Status.PAUSED, INTERRUPTED_ERROR, i, Status.RUNNING, cutoff) for i in ids])
+            conn.execute("COMMIT")
+        except BaseException:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+        if ids:
+            _log.info("TASK_SWEEP %s count=%d", "would_pause" if dry_run else "paused", len(ids))
+        return ids
 
     def resumable(self) -> list[Task]:
         """Tasks that were interrupted and can be resumed."""

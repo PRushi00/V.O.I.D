@@ -293,8 +293,14 @@ def cmd_set_pin() -> int:
     return 0
 
 
-def cmd_tasks() -> int:
+def cmd_tasks(dry_run: bool = False) -> int:
     assistant = Assistant()
+    # Tasks whose process died are still `running` in the store; correct that first so
+    # the listing is truthful. --dry-run only reports what would change.
+    swept = assistant.store.sweep_stale(dry_run=dry_run)
+    if swept:
+        verb = "would be marked paused" if dry_run else "marked paused (process exited; resume to continue)"
+        print(f"{len(swept)} stale task(s) {verb}: {', '.join(swept)}")
     tasks = assistant.store.list()
     if not tasks:
         print("No tasks yet.")
@@ -814,7 +820,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_rm.add_argument("alias", help="Alias of the additional credential.")
 
     sub.add_parser("set-pin", help="Set the emergency-stop PIN")
-    sub.add_parser("tasks", help="List tasks")
+    p_tasks = sub.add_parser("tasks", help="List tasks (first pauses tasks stranded as running)")
+    p_tasks.add_argument("--dry-run", action="store_true", dest="dry_run",
+                         help="Report stale running tasks without changing them")
 
     p_stop = sub.add_parser("stop", help="Engage the emergency stop")
     p_stop.add_argument("--pin", default=None)
@@ -926,7 +934,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "set-pin":
         return cmd_set_pin()
     if args.command == "tasks":
-        return cmd_tasks()
+        return cmd_tasks(getattr(args, "dry_run", False))
     if args.command == "stop":
         return cmd_stop(args.pin)
     if args.command == "clear-stop":
