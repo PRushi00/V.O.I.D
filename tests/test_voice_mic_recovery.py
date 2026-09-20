@@ -290,3 +290,110 @@ def test_recovery_attempt_that_raises_is_treated_as_a_failure():
     assert "mic_recovering" in states
     assert ctrl._mic_healthy is False
     assert ctrl._mic_backoff > _MIC_RECOVERY_INITIAL_BACKOFF_S   # already backed off
+
+
+# --- D-01 (T0.3): recovery must survive failed restarts -----------------------
+#
+# V1 stopped supervising after ONE failed restart: broker.start() raising left
+# broker.running False, and the health check returned on `not running` forever.
+# The earlier test above stops after the first failure and never asserts that a
+# SECOND attempt happens - which is how this went unnoticed. These assert
+# liveness: the Nth attempt happens, backoff is capped, and shutdown ends it.
+
+class FlakyStartBackend(FakeBackend):
+    """start() raises on every call number in ``fail_on`` (1-indexed); records the
+    (injected-clock) time of every start attempt."""
+
+    def __init__(self, fail_on):
+        super().__init__()
+        self._fail_on = set(fail_on)
+        self._call = 0
+        self.clock = None
+        self.attempt_times = []
+
+    def start(self, on_frame):
+        self._call += 1
+        if self.clock is not None:
+            self.attempt_times.append(self.clock())
+        if self._call in self._fail_on:
+            raise RuntimeError("device still unavailable")
+        super().start(on_frame)
+
+
+def _silent_rig(fail_on):
+    backend = FlakyStartBackend(fail_on)
+    ctrl, broker, backend, session, states, clock = _rig(backend=backend)
+    backend.clock = clock
+    broker.start()                       # call #1 succeeds
+    backend.emit()
+    broker.drain()
+    clock.advance(_MIC_SILENCE_TIMEOUT_S + 0.1)
+    return ctrl, broker, backend, session, clock
+
+
+def _tick(ctrl, backend, clock, seconds, *, emit=True, stop_when_healthy=False):
+    for _ in range(int(seconds)):
+        clock.advance(1.0)
+        ctrl.poll_once()
+        if emit:
+            backend.emit()
+        if stop_when_healthy and ctrl._mic_healthy:
+            return True
+    return ctrl._mic_healthy
+
+
+def test_first_failed_restart_is_observable_in_the_health_snapshot():
+    ctrl, broker, backend, _s, clock = _silent_rig(fail_on={2})
+    ctrl.poll_once()                                  # restart attempt #1 raises
+    snap = ctrl.mic_health_snapshot()
+    assert backend._call == 2
+    assert snap["supervised"] is True
+    assert snap["healthy"] is False
+    assert snap["broker_running"] is False            # the D-01 state...
+    assert snap["broker_closed"] is False             # ...which is NOT "closed"
+    assert snap["recovery_attempts"] == 1
+
+
+def test_second_and_nth_failures_keep_retrying_until_success():
+    ctrl, broker, backend, _s, clock = _silent_rig(fail_on={2, 3, 4, 5, 6})   # 5 failures, then success
+    ctrl.poll_once()
+    assert _tick(ctrl, backend, clock, 900, stop_when_healthy=True) is True
+    assert backend._call >= 7                         # attempts 2..6 failed, #7 succeeded
+    snap = ctrl.mic_health_snapshot()
+    assert snap["healthy"] is True and snap["broker_running"] is True
+    assert snap["recovery_attempts"] == 0             # reset after success
+
+
+def test_backoff_is_capped_and_attempts_never_stop():
+    ctrl, broker, backend, _s, clock = _silent_rig(fail_on=set(range(2, 10_000)))
+    ctrl.poll_once()
+    _tick(ctrl, backend, clock, 3600, emit=False)     # one simulated hour, device never returns
+    times = backend.attempt_times[1:]                 # drop the initial start
+    gaps = [b - a for a, b in zip(times, times[1:])]
+    assert len(times) >= 40, f"only {len(times)} attempts in an hour"
+    assert max(gaps) <= _MIC_RECOVERY_MAX_BACKOFF_S + 2.5, f"backoff exceeded the cap: {max(gaps)}"
+    assert gaps[0] < gaps[-1]                         # it did back off first
+    assert ctrl.mic_health_snapshot()["healthy"] is False
+
+
+def test_recovery_is_not_attempted_during_an_active_capture_but_resumes_after():
+    ctrl, broker, backend, session, clock = _silent_rig(fail_on={2, 3})
+    ctrl.poll_once()                                  # attempt #1 (call 2) fails
+    session.on_ptt_press()                            # owner starts talking
+    assert session.state == VoiceState.LISTENING
+    _tick(ctrl, backend, clock, 300, emit=False)
+    assert backend._call == 2, "the stream was restarted out from under an active capture"
+    session.on_ptt_release()                          # capture ends -> IDLE
+    assert session.state == VoiceState.IDLE
+    assert _tick(ctrl, backend, clock, 300, stop_when_healthy=True) is True
+    assert backend._call >= 4
+
+
+def test_owner_shutdown_ends_recovery_for_good():
+    ctrl, broker, backend, _s, clock = _silent_rig(fail_on=set(range(2, 10_000)))
+    ctrl.poll_once()
+    assert backend._call == 2
+    ctrl.shutdown()
+    assert broker.closed is True
+    _tick(ctrl, backend, clock, 600, emit=False)
+    assert backend._call == 2, "the supervisor restarted the mic after the owner shut it down"

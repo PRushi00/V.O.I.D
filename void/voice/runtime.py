@@ -486,12 +486,25 @@ class VoiceController:
     # never allowed to interrupt an in-progress capture.
 
     def _check_mic_health(self) -> None:
-        if self._broker is None or not self._broker.running:
-            return
+        broker = self._broker
+        if broker is None or getattr(broker, "closed", False):
+            return                       # no mic, or the owner shut it down: never restart
+        # "Meant to be running": start() was requested and the broker is not closed.
+        # Fakes without the attribute fall back to V1's `running` test.
+        if not getattr(broker, "start_requested", broker.running):
+            return                       # never started: nothing to supervise yet
         now = self._now()
-        silence = self._broker.seconds_since_last_frame()
-        if silence is None:
-            return  # nothing delivered yet since start(); nothing to judge
+        if broker.running:
+            silence = broker.seconds_since_last_frame()
+            if silence is None:
+                return  # nothing delivered yet since start(); nothing to judge
+        else:
+            # D-01: a restart whose backend.start() raised leaves the broker NOT
+            # running but NOT closed. V1 returned here forever, abandoning recovery
+            # for the life of the process. That state is unhealthy by definition:
+            # treat it as infinitely silent so the existing capped-backoff retry
+            # machinery below keeps running until the device returns.
+            silence = float("inf")
 
         if self._mic_restart_pending_since is not None:
             if silence < _MIC_RECOVERY_CONFIRM_S:
@@ -522,6 +535,24 @@ class VoiceController:
         if self._session.state != VoiceState.IDLE:
             return   # never restart the stream out from under an active capture
         self._attempt_mic_recovery(now)
+
+    def mic_health_snapshot(self) -> dict:
+        """Read-only view of the mic supervisor's state (used by the health
+        heartbeat and ``void doctor``). Counts, flags and timings only."""
+        b = self._broker
+        if b is None:
+            return {"supervised": False}
+        running = bool(b.running)
+        return {
+            "supervised": True,
+            "healthy": self._mic_healthy,
+            "broker_running": running,
+            "broker_closed": bool(getattr(b, "closed", False)),
+            "seconds_since_frame": b.seconds_since_last_frame() if running else None,
+            "recovery_attempts": self._mic_recovery_attempts,
+            "restart_pending": self._mic_restart_pending_since is not None,
+            "backoff_s": self._mic_backoff,
+        }
 
     def _attempt_mic_recovery(self, now: float) -> None:
         self._mic_recovery_attempts += 1

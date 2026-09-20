@@ -251,6 +251,11 @@ class AudioCaptureBroker:
         self._pump: threading.Thread | None = None
         self._running = False
         self._closed = False
+        # True once start() has been asked for (and the broker is not closed):
+        # "this broker is MEANT to be running". A restart whose backend.start()
+        # raises leaves _running False but this True, which is what lets the mic
+        # supervisor tell "failed to restart" (retry!) from "never started" (D-01).
+        self._start_requested = False
 
         # Health-marker only (a count, never audio content or its shape/level):
         # proves whether the backend is actually delivering frames at all, and
@@ -275,6 +280,12 @@ class AudioCaptureBroker:
     def closed(self) -> bool:
         with self._lock:
             return self._closed
+
+    @property
+    def start_requested(self) -> bool:
+        """True once start() has been requested and the broker is not closed."""
+        with self._lock:
+            return self._start_requested and not self._closed
 
     @property
     def frame_bytes(self) -> int:
@@ -323,6 +334,7 @@ class AudioCaptureBroker:
         with self._lock:
             if self._closed:
                 raise AudioBrokerError("broker is closed; construct a new one")
+            self._start_requested = True
             if self._running:
                 return                    # idempotent: no second backend / pump
             if self._backend is None:

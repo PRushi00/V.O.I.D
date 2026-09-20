@@ -71,8 +71,7 @@ def test_d01_harness_first_restart_failure_is_reached():
     assert ctrl._mic_healthy is False                 # supervisor noticed the silence
 
 
-@_xfail("D-01", "supervisor never retries after one failed restart (broker.running stays False)")
-def test_d01_supervisor_keeps_retrying_after_a_failed_restart():
+def test_d01_supervisor_keeps_retrying_after_a_failed_restart():          # fixed by T0.3
     ctrl, broker, backend, clock = _silent_then_failed_first_restart()
     for _ in range(600):                              # 10 simulated minutes of monitor ticks
         clock.advance(1.0)
@@ -82,8 +81,7 @@ def test_d01_supervisor_keeps_retrying_after_a_failed_restart():
         f"broker.running={broker.running}")
 
 
-@_xfail("D-01", "mic never recovers although the device returned")
-def test_d01_mic_eventually_recovers_when_device_returns():
+def test_d01_mic_eventually_recovers_when_device_returns():               # fixed by T0.3
     ctrl, broker, backend, clock = _silent_then_failed_first_restart()
     recovered = False
     for _ in range(600):
