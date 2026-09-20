@@ -57,6 +57,25 @@ def test_state_dir_creation_touches_only_the_sandbox(real_home):
     assert Path(real_home, ".void").exists() == before   # unchanged by the test
 
 
-@pytest.mark.real_keyring
-def test_real_keyring_marker_is_skipped_by_default():
-    raise AssertionError("a real_keyring test must never run in the default suite")
+class _FakeItem:
+    def __init__(self, keywords):
+        self.keywords = dict.fromkeys(keywords, True)
+        self.markers = []
+
+    def add_marker(self, marker):
+        self.markers.append(marker)
+
+
+def test_real_keyring_marker_is_skipped_by_default_and_only_opt_in_runs_it(monkeypatch):
+    """The hook is exercised on stand-in items so the suite itself carries no skipped test."""
+    from tests.conftest import pytest_collection_modifyitems
+
+    monkeypatch.delenv("VOID_ALLOW_REAL_KEYRING", raising=False)
+    risky, safe = _FakeItem(["real_keyring"]), _FakeItem(["real_socket"])
+    pytest_collection_modifyitems(None, [risky, safe])
+    assert [m.name for m in risky.markers] == ["skip"] and safe.markers == []
+
+    monkeypatch.setenv("VOID_ALLOW_REAL_KEYRING", "1")
+    opted_in = _FakeItem(["real_keyring"])
+    pytest_collection_modifyitems(None, [opted_in])
+    assert opted_in.markers == []
