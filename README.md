@@ -100,6 +100,22 @@ the allowed roots, or to require a stop PIN.
 
 Run the suite: `python -m pytest`
 
+**Reproducible environment (V2.0).** The suite is validated with CPython 3.14 and the exact
+package versions in `requirements.lock` (a read-only freeze of the tested environment;
+`requirements.txt` stays the minimum-version source of truth):
+
+    python -m venv .venv
+    .venv\Scripts\python.exe -m pip install -r requirements.lock
+    .venv\Scripts\python.exe -m pytest --junitxml=junit.xml
+    .venv\Scripts\python.exe scripts/check_test_guard.py --junit junit.xml
+
+The tests are hermetic (in-memory keyring, sandboxed home directory, no network, no model
+download, no microphone), so they never touch your real `~/.void` or Credential Manager.
+`scripts/check_test_guard.py` fails if any of the 883 V1 baseline tests stops being
+collected, if the test count drops, or if skips/xfails exceed the ceilings in
+`tests/guard_limits.json`. CI (`.github/workflows/tests.yml`) runs the same steps on
+`windows-latest`; it has not yet run on GitHub.
+
 **Covered by automated tests (platform-agnostic, 56 tests passing):**
 file search/read/write/confinement, delete-to-trash, risk gate, task
 checkpoint/recovery, kill switch (incl. cross-process file + PIN auth),
