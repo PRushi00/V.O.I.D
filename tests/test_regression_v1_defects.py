@@ -165,8 +165,7 @@ def test_d03_harness_legit_request_works_without_an_attacker(tmp_path):
 
 
 @pytest.mark.real_socket
-@_xfail("D-03", "the TLS handshake runs inside the single accept loop, so one idle TCP connection blocks everyone")
-def test_d03_idle_tcp_connection_does_not_block_legitimate_clients(tmp_path):
+def test_d03_idle_tcp_connection_does_not_block_legitimate_clients(tmp_path):   # fixed by T0.5
     gw = _make_gateway(tmp_path)
     idle = socket.create_connection(("127.0.0.1", gw.port))     # connects, sends nothing
     try:
@@ -277,8 +276,7 @@ def test_d09_harness_unauthenticated_request_is_rejected_401(tmp_path):
     assert status == 401
 
 
-@_xfail("D-09", "the request limiter keeps one key per unauthenticated device_id forever")
-def test_d09_limiter_state_is_bounded_under_unauthenticated_load(tmp_path):
+def test_d09_limiter_state_is_bounded_under_unauthenticated_load(tmp_path):      # fixed by T0.5
     gw = _make_gateway(tmp_path, start=False)
     for i in range(3000):
         gw.handle_request(_unauthenticated_body(i), "sig", "203.0.113.9")
@@ -286,8 +284,7 @@ def test_d09_limiter_state_is_bounded_under_unauthenticated_load(tmp_path):
     assert keys <= 2048, f"limiter holds {keys} keys after 3000 unauthenticated requests"
 
 
-@_xfail("D-09", "every unauthenticated rejection writes its own WARNING (non-rotating log flood)")
-def test_d09_rejection_logging_is_sampled(tmp_path, caplog):
+def test_d09_rejection_logging_is_sampled(tmp_path, caplog):                      # fixed by T0.5
     gw = _make_gateway(tmp_path, start=False)
     with caplog.at_level(logging.WARNING, logger="void.device.gateway"):
         for i in range(2000):

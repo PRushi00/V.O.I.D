@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import hmac
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 from hashlib import sha256
 
 SIGNATURE_HEADER = "X-Void-Signature"
@@ -74,17 +74,31 @@ class ReplayGuard:
 
 class RateLimiter:
     """Fixed-window-free sliding counter per key (device id, or client IP
-    for pre-auth pairing attempts). Simple and dependency-free; sized for a
-    single personal gateway, not for defending a public endpoint."""
+    for pre-auth attempts). Simple and dependency-free; sized for a single
+    personal gateway, not for defending a public endpoint.
 
-    def __init__(self, max_events: int, per_seconds: float):
+    The number of distinct keys is BOUNDED (``max_keys``, least-recently-used
+    eviction): keys can come from unauthenticated input (an attacker-chosen
+    ``device_id``), and V1 kept one entry per key forever (D-09). Evicting the
+    LRU key only ever RESETS that key's counter, so it can weaken limiting for an
+    evicted key but never blocks anyone."""
+
+    def __init__(self, max_events: int, per_seconds: float, max_keys: int | None = 1024):
         self._max = max_events
         self._per = per_seconds
-        self._events: dict[str, deque] = defaultdict(deque)
+        self._max_keys = max_keys
+        self._events: "OrderedDict[str, deque]" = OrderedDict()
 
     def allow(self, key: str, now: float | None = None) -> bool:
         now = time.time() if now is None else now
-        q = self._events[key]
+        q = self._events.get(key)
+        if q is None:
+            q = self._events[key] = deque()
+            if self._max_keys is not None:
+                while len(self._events) > self._max_keys:
+                    self._events.popitem(last=False)      # evict least-recently-used
+        else:
+            self._events.move_to_end(key)
         cutoff = now - self._per
         while q and q[0] < cutoff:
             q.popleft()

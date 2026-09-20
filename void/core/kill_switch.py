@@ -18,6 +18,7 @@ the right guarantee for V1's action set.
 """
 from __future__ import annotations
 
+import hmac
 import threading
 from pathlib import Path
 
@@ -77,7 +78,11 @@ class KillSwitch:
             # Fail safe: if a PIN is required but none is configured, allow the
             # stop. Halting is always safer than refusing to halt.
             return True
-        return bool(pin) and pin == stored
+        if not pin:
+            return False
+        # Constant-time comparison (D-09): '==' leaks the matching prefix length
+        # through timing. compare_digest needs bytes for non-ASCII str.
+        return hmac.compare_digest(str(pin).encode("utf-8"), str(stored).encode("utf-8"))
 
     def engage(self, reason: str = "manual stop", pin: str | None = None) -> bool:
         """Engage the stop. Returns True on success, False if auth failed."""

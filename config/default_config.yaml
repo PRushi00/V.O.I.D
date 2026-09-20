@@ -125,3 +125,10 @@ device:
                          # module docstring for the full authorization chain.
   port: 8765
   pairing_window_seconds: 300   # how long a `device pair-start` token is valid
+  # Availability limits (V2.0 T0.5). None of these relax TLS / pinning / HMAC /
+  # replay protection / the capability allow-list; they only bound resource use.
+  connection_timeout_s: 10      # per-connection I/O timeout; also bounds a stalled TLS handshake
+  max_connections: 32           # concurrent handler threads (excess connections are dropped)
+  max_connections_per_ip: 4     # concurrent connections per source address
+  ip_rate_per_minute: 120       # pre-auth requests per source address per minute
+  limiter_max_keys: 1024        # cap on distinct rate-limiter keys (LRU eviction)
