@@ -168,6 +168,10 @@ class MainActivity : Activity() {
     // stops the client from accidentally submitting the same token twice.
     private val pairingInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
 
+    // Forget Pairing is destructive and unrecoverable from the phone (see
+    // ConfirmGate), so it takes two deliberate taps within 5 seconds.
+    private val forgetGate = ConfirmGate(5_000L) { android.os.SystemClock.elapsedRealtime() }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val layout = LinearLayout(this)
@@ -215,9 +219,13 @@ class MainActivity : Activity() {
         layout.addView(launchButton)
 
         val forgetButton = Button(this)
-        forgetButton.text = "Forget Pairing"
+        forgetButton.text = "Forget Pairing (needs a NEW token to re-pair)"
         forgetButton.setOnClickListener { forgetPairing(prefs) }
-        layout.addView(forgetButton)
+        // Keep the destructive button well away from the everyday buttons.
+        val gap = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        gap.topMargin = (48 * resources.displayMetrics.density).toInt()
+        layout.addView(forgetButton, gap)
 
         statusView = TextView(this)
         statusView.text = pairingStatusText(prefs)
@@ -232,7 +240,7 @@ class MainActivity : Activity() {
     private fun pairingStatusText(prefs: android.content.SharedPreferences): String {
         val deviceId = prefs.getString("device_id", null)
         return if (deviceId != null) "Paired (device_id=$deviceId)."
-        else "Not paired yet - enter a pairing token and tap Pair."
+        else notPairedMessage(prefs.getString("host", null) != null)
     }
 
     private fun labeledField(parent: LinearLayout, hint: String, default: String = ""): EditText {
@@ -254,6 +262,7 @@ class MainActivity : Activity() {
     }
 
     private fun pair(prefs: android.content.SharedPreferences) {
+        forgetGate.disarm()
         if (!pairingInFlight.compareAndSet(false, true)) {
             show("Already pairing - please wait for that request to finish.")
             return
@@ -286,7 +295,7 @@ class MainActivity : Activity() {
                         .apply()
                     show("Paired. device_id=${result.getString("device_id")}")
                 } else {
-                    show("Pairing failed: ${response.optJSONObject("error")}")
+                    show(describePairingRejection(response.optJSONObject("error")?.optString("code")))
                 }
             } catch (e: Exception) {
                 show("Pairing error: ${describeFailure(e, host, port)}")
@@ -306,6 +315,7 @@ class MainActivity : Activity() {
      * the laptop's certificate ever genuinely changes, this is also where
      * the new fingerprint gets entered. */
     private fun updateConnection(prefs: android.content.SharedPreferences) {
+        forgetGate.disarm()
         val host = hostField.text.toString().trim()
         val port = portField.text.toString().trim().toIntOrNull() ?: 8765
         val fingerprint = fingerprintField.text.toString().trim()
@@ -333,6 +343,12 @@ class MainActivity : Activity() {
      * fields (host/port/fingerprint/name) are left alone since they are not
      * secrets and re-typing them for the next Pair is just friction. */
     private fun forgetPairing(prefs: android.content.SharedPreferences) {
+        if (!forgetGate.tap()) {
+            show("Forget Pairing removes this phone's device identity and secret. You " +
+                "will need a NEW pairing token to use it again. Tap Forget Pairing " +
+                "again within 5 seconds to confirm - or tap anything else to cancel.")
+            return
+        }
         prefs.edit()
             .remove("device_id")
             .remove("shared_secret")
@@ -348,8 +364,9 @@ class MainActivity : Activity() {
         val fingerprint = prefs.getString("fingerprint", null)
         val deviceId = prefs.getString("device_id", null)
         val secret = prefs.getString("shared_secret", null)
+        forgetGate.disarm()
         if (host == null || fingerprint == null || deviceId == null || secret == null) {
-            show("Not paired yet - tap Pair first.")
+            show(notPairedMessage(host != null))
             return
         }
 

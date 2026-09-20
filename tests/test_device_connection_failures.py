@@ -246,3 +246,49 @@ def test_updating_the_endpoint_reuses_the_same_identity_and_failed_attempts_chan
         assert set(devices_after) == set(json.loads(devices_before))
     finally:
         second.stop()
+
+
+# --- field report: phone lost its credentials, then hammered /pair ----------
+
+def test_repeated_pair_attempts_with_no_open_window_leave_a_registered_device_untouched(gw, tmp_path):
+    """Field evidence: after the phone's app dropped its saved credentials, it
+    sent six /pair requests with no pairing window open. The gateway must
+    reject each one (invalid_pairing_token) WITHOUT altering the registry - the
+    device stays registered with the same capabilities and its existing
+    credentials keep working - and without ever pairing anyone."""
+    device_id, secret = _pair_over_tls(gw)
+    gw.registry.grant(device_id, "launch_app")
+    before = json.loads((tmp_path / "devices.json").read_text())
+
+    for _ in range(6):
+        conn = _pinned_connect("127.0.0.1", gw.port, gw.fingerprint)
+        status, payload = _post(conn, PAIR_PATH,
+                                {"protocol": 1, "token": "stale-token", "name": "My Android Phone"})
+        assert status != 200 and payload["ok"] is False
+        assert payload["error"]["code"] == "invalid_pairing_token"
+
+    after = json.loads((tmp_path / "devices.json").read_text())
+    assert set(after) == set(before)                       # nothing added or removed
+    assert after[device_id]["capabilities"] == before[device_id]["capabilities"]
+    status, payload = _get_status("127.0.0.1", gw.port, gw.fingerprint, device_id, secret)
+    assert status == 200 and payload["ok"] is True         # old identity still works
+
+
+def test_repeated_authenticated_launches_never_trip_replay_or_drop_the_device(gw):
+    """Five launch requests in a row (a fresh request_id each, as the app does
+    with a UUID) all succeed, and the device is still valid afterwards."""
+    device_id, secret = _pair_over_tls(gw)
+    gw.registry.grant(device_id, "launch_app")
+    for _ in range(5):
+        body = {"protocol": 1, "request_id": f"uuid-{time.time_ns()}", "device_id": device_id,
+                "operation": "launch_app", "parameters": {"name": "notepad"},
+                "timestamp": time.time()}
+        raw = json.dumps(body).encode()
+        conn = _pinned_connect("127.0.0.1", gw.port, gw.fingerprint)
+        conn.request("POST", REQUEST_PATH, body=raw,
+                     headers={"Content-Type": "application/json",
+                              auth.SIGNATURE_HEADER: auth.sign(secret, raw)})
+        resp = conn.getresponse()
+        payload = json.loads(resp.read().decode())
+        assert resp.status == 200 and payload["ok"] is True
+    assert gw.registry.get(device_id) is not None

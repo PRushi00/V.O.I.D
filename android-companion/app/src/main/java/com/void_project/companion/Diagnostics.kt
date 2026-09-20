@@ -105,3 +105,61 @@ internal fun describeFailure(e: Throwable, host: String, port: Int): String {
     }
     return "Request to $target failed ($name): ${e.message}"
 }
+
+/**
+ * Two-step confirmation for a destructive action (Forget Pairing).
+ *
+ * Field evidence for why this exists: on the real phone the saved device_id +
+ * shared_secret vanished ONE SECOND after the last successful Launch Notepad
+ * (prefs file mtime vs gateway log), the only code path that removes them is
+ * Forget Pairing, and that button sat directly under Launch Notepad with no
+ * confirmation. Losing them is not recoverable from the phone - the secret
+ * exists nowhere else - and the only way back is a brand-new pairing token, so
+ * a single stray tap must not be able to do it.
+ *
+ * First tap ARMS and returns false; a second tap within [windowMs] returns
+ * true (proceed) and disarms. A late second tap just re-arms. [disarm] cancels
+ * (call it when the user does anything else). `now` is injectable for tests.
+ */
+internal class ConfirmGate(private val windowMs: Long, private val now: () -> Long) {
+    private var armedAt: Long? = null
+
+    fun tap(): Boolean {
+        val t = now()
+        val armed = armedAt
+        return if (armed != null && t - armed in 0..windowMs) {
+            armedAt = null
+            true
+        } else {
+            armedAt = t
+            false
+        }
+    }
+
+    fun disarm() { armedAt = null }
+}
+
+/** Shown when a request is attempted without saved credentials. Says WHY and
+ * WHAT TO DO instead of just "tap Pair": a phone that once paired but has
+ * lost its credentials (e.g. Forget Pairing was tapped) still has a valid
+ * registry entry on the laptop that this phone can no longer use. */
+internal fun notPairedMessage(hasSavedEndpoint: Boolean): String =
+    if (hasSavedEndpoint)
+        "This phone has no saved device credentials (never paired, or Forget Pairing " +
+            "was used). It is NOT a network problem. Run 'python -m void device " +
+            "pair-start' on the laptop, enter the new token, and tap Pair."
+    else
+        "Not paired yet - enter the laptop address, port, fingerprint and a pairing " +
+            "token from 'python -m void device pair-start', then tap Pair."
+
+/** Pairing was refused BY the gateway (it was reached and TLS/pin passed).
+ * The gateway deliberately answers every bad-token case with the same code so
+ * it cannot be used to probe which case applies; the fix is the same for all. */
+internal fun describePairingRejection(errorCode: String?): String =
+    if (errorCode == "invalid_pairing_token")
+        "Pairing refused by the laptop ($errorCode): the token is wrong, expired, " +
+            "already used, or no pairing window is open. The laptop was reached and TLS " +
+            "is fine. Run 'python -m void device pair-start' for a fresh token " +
+            "(each works once, for a few minutes)."
+    else
+        "Pairing refused by the laptop (${errorCode ?: "unknown error"})."

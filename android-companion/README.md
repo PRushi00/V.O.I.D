@@ -154,6 +154,26 @@ The app names the failure class and the endpoint it actually used:
 | JSON reply `unknown_device` | network + TLS fine, laptop has no such device (e.g. it was `device forget`-ed or its `devices.json` was deleted) | re-pair: `device pair-start`, then **Pair** with the new token |
 | `NOTE: on-screen address/fingerprint differ from the saved connection` | requests use the SAVED endpoint, not the text boxes | tap **Update Connection** |
 
+### USB is not part of the connection, and what "Forget Pairing" does
+
+The phone talks to the laptop over the hotspot/Wi-Fi only. Plugging or
+unplugging USB does not touch the connection or the app's saved state (the
+app has no USB, lifecycle or connectivity hooks; a field test confirmed Launch
+Notepad kept working with the cable removed).
+
+The phone's saved `device_id` + `shared_secret` are removed in exactly one
+place: **Forget Pairing**. Nothing else - a timeout, refusal, TLS failure, USB
+or network change, or a capability denial - clears them. Because the secret
+exists nowhere else, losing it is unrecoverable from the phone: the only way
+back is a NEW pairing token (`device pair-start`), which creates a new device
+identity (re-grant `launch_app` for it afterwards). So Forget Pairing now needs
+two taps within 5 seconds and sits apart from the everyday buttons.
+
+If the app says "no saved device credentials": the laptop probably still lists
+the old identity (`python -m void device list`). Re-pair, then tidy up the old
+entry with `python -m void device forget <old-device-id>` - only once you are
+sure that identity is no longer used, since forgetting revokes it.
+
 ### Running the Android unit tests
 
 `./gradlew test` (JDK 17) runs the pure-JVM tests in `app/src/test`, which
