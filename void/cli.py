@@ -23,6 +23,7 @@ import re
 import sys
 import threading
 import time
+from pathlib import Path
 
 from void.app import Assistant
 from void.core.task import Status
@@ -733,6 +734,48 @@ def cmd_device_serve(host: str | None, port: int | None) -> int:
 
 # --- argument parsing --------------------------------------------------
 
+def _readonly_state_dir(override: str | None):
+    """The state directory for READ-ONLY tools: never created, never migrated."""
+    from void.config import Config
+    if override:
+        return Path(override)
+    return Config.load().peek_state_dir()
+
+
+def cmd_perf_report(state_dir: str | None, legacy: str, as_json: bool) -> int:
+    """Latency/reliability tables from the perf stream (and, for history, the legacy
+    void.log markers). Read-only."""
+    import json as _json
+    from void.perf import report
+
+    root = _readonly_state_dir(state_dir)
+    events = report.load_events(root / "perf")
+    if legacy == "always" or (legacy == "auto" and not events):
+        events = report.parse_legacy_log(root / "void.log") + events
+        note = "(using legacy void.log markers)"
+    else:
+        note = ""
+    if not events:
+        print(f"No performance data found under {root}.")
+        return 1
+    data = report.build_report(events)
+    print(_json.dumps(data, indent=2, default=str) if as_json else report.format_report(data))
+    if note and not as_json:
+        print(note)
+    return 0
+
+
+def cmd_doctor(state_dir: str | None, no_probe: bool) -> int:
+    """Read-only health report: heartbeat, microphone, wake word, gateway, task store,
+    storage. Exit code 0 = ok, 1 = warnings, 2 = failures. It repairs nothing."""
+    from void.perf import doctor
+
+    root = _readonly_state_dir(state_dir)
+    checks = doctor.run_doctor(root, probe_gateway=not no_probe)
+    print(doctor.format_checks(checks))
+    return doctor.exit_code(checks)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="void", description="V.O.I.D V1")
     sub = parser.add_subparsers(dest="command")
@@ -834,6 +877,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--host", default=None)
     p_serve.add_argument("--port", type=int, default=None)
 
+    p_perf = sub.add_parser("perf", help="Performance telemetry tools (read-only)")
+    perf_sub = p_perf.add_subparsers(dest="perf_action")
+    p_report = perf_sub.add_parser("report", help="Latency tables (p50/p95; p99 only if n>=300)")
+    p_report.add_argument("--state-dir", default=None, help="Read a different state directory")
+    p_report.add_argument("--legacy", choices=["auto", "always", "never"], default="auto",
+                          help="Also parse pre-V2.0 void.log markers (auto: only if no perf data)")
+    p_report.add_argument("--json", action="store_true", dest="as_json")
+
+    p_doctor = sub.add_parser("doctor", help="Read-only health report (never repairs anything)")
+    p_doctor.add_argument("--state-dir", default=None, help="Inspect a different state directory")
+    p_doctor.add_argument("--no-probe", action="store_true",
+                          help="Skip the loopback TLS probe of a running gateway")
+
     return parser
 
 
@@ -844,7 +900,7 @@ def main(argv: list[str] | None = None) -> int:
     known = {"run", "resume", "clarify", "approve", "deny", "set-key",
              "list-keys", "remove-key", "set-pin", "tasks", "stop",
              "clear-stop", "ui", "voice", "app", "singularity", "autostart",
-             "roots", "protect", "device", "-h", "--help"}
+             "roots", "protect", "device", "perf", "doctor", "-h", "--help"}
     if argv and argv[0] not in known:
         return cmd_run(" ".join(argv))
 
@@ -889,6 +945,13 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_roots(args.action, args.path)
     if args.command == "protect":
         return cmd_protect(args.action, args.path)
+    if args.command == "perf":
+        if args.perf_action == "report":
+            return cmd_perf_report(args.state_dir, args.legacy, args.as_json)
+        print("Usage: python -m void perf report [--state-dir DIR] [--legacy auto|always|never] [--json]")
+        return 1
+    if args.command == "doctor":
+        return cmd_doctor(args.state_dir, args.no_probe)
     if args.command == "device":
         if args.device_action == "pair-start":
             return cmd_device_pair_start(args.name, args.minutes)

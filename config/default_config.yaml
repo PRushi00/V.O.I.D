@@ -139,3 +139,4 @@ device:
   max_connections_per_ip: 4     # concurrent connections per source address
   ip_rate_per_minute: 120       # pre-auth requests per source address per minute
   limiter_max_keys: 1024        # cap on distinct rate-limiter keys (LRU eviction)
+  stats_period_s: 60            # aggregate gateway counters to the perf stream (0 = off)

@@ -27,6 +27,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from void import perf
 from void.actions.registry import ToolRegistry
 from void.config import Config
 from void.core.kill_switch import KillSwitch
@@ -292,6 +293,9 @@ class DeviceGateway:
         self._sampler = _LogSampler(1.0)
         self._stats: "collections.Counter[str]" = collections.Counter()
         self._stats_lock = threading.Lock()
+        self.stats_period_s = float(config.get("device.stats_period_s", 60.0))
+        self._stats_stop = threading.Event()
+        self._stats_thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._ctx = GatewayContext(config=config, tools=tools, risk_gate=risk_gate,
                                    kill_switch=kill_switch)
@@ -327,6 +331,7 @@ class DeviceGateway:
         self._server = server
         self.port = server.server_address[1]
         self._write_address_file()
+        self._start_stats_loop()
         _log.info("DEVICE_GATEWAY_STARTED host=%s port=%s fingerprint=%s",
                   self.host, self.port, self.fingerprint)
 
@@ -343,6 +348,10 @@ class DeviceGateway:
         self._thread.start()
 
     def stop(self) -> None:
+        self._stats_stop.set()
+        if self._stats_thread is not None:
+            self._stats_thread.join(timeout=2)
+            self._stats_thread = None
         # BaseServer.shutdown() blocks waiting for serve_forever()'s loop to
         # acknowledge the stop request; calling it when serve_forever() was
         # NEVER entered would hang forever (nothing would ever acknowledge
@@ -384,6 +393,34 @@ class DeviceGateway:
         """Counts only (no identifiers, no content) - for health/perf reporting."""
         with self._stats_lock:
             return dict(self._stats)
+
+    def _start_stats_loop(self) -> None:
+        """Emit aggregate counters (never identifiers) to the perf stream every
+        ``stats_period_s`` while the gateway runs; silent when nothing happened."""
+        if self.stats_period_s <= 0:
+            return
+        self._stats_stop.clear()
+        self._stats_thread = threading.Thread(target=self._stats_loop, name="void-gw-stats", daemon=True)
+        self._stats_thread.start()
+
+    def _stats_loop(self) -> None:
+        last: dict = {}
+        while not self._stats_stop.wait(self.stats_period_s):
+            snap = self.stats_snapshot()
+            delta = {k: v - last.get(k, 0) for k, v in snap.items()}
+            last = snap
+
+            def total(*prefixes: str) -> int:
+                return sum(v for k, v in delta.items() if k.startswith(prefixes))
+
+            agg = {"ok": delta.get("DEVICE_REQUEST_OK", 0),
+                   "rejected": total("DEVICE_REQUEST_REJECTED", "DEVICE_PAIR_REJECTED", "DEVICE_REQUEST_DENIED"),
+                   "rate_limited": total("DEVICE_REQUEST_RATE_LIMITED", "DEVICE_PAIR_RATE_LIMITED"),
+                   "paired": delta.get("DEVICE_PAIRED", 0),
+                   "dropped": total("connections_dropped"),
+                   "conn_errors": total("connection_error")}
+            if any(agg.values()):
+                perf.emit("gateway", period_s=self.stats_period_s, **agg)
 
     def _sampled_log(self, level: int, template: str, *args, key: str | None = None) -> None:
         """``key`` must be FINITE (never an id/IP): it bounds sampler memory and is

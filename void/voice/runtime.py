@@ -30,6 +30,8 @@ from typing import Callable
 # audio or transcript text - only stage, counts, durations, and reasons.
 _log = logging.getLogger("void.voice.runtime")
 
+from void import perf
+from void.perf import health as perf_health
 from void.voice.adapters import (
     BrokerCapture, FasterWhisperSTT, PTTActivation,
 )
@@ -60,6 +62,7 @@ _MIC_RECOVERY_CONFIRM_S = 2.0       # a frame this fresh after a restart attempt
 _MIC_RECOVERY_GRACE_S = 3.0         # how long to wait for that fresh frame before retrying
 _MIC_RECOVERY_INITIAL_BACKOFF_S = 2.0
 _MIC_RECOVERY_MAX_BACKOFF_S = 60.0  # never faster than this between attempts - no busy loop
+_HEALTH_INTERVAL_S = 5.0            # heartbeat cadence (void.perf.health)
 
 
 class _SerialVoiceWorker:
@@ -222,7 +225,8 @@ class VoiceController:
                  wake=None, wake_policy: _WakePolicy | None = None,
                  on_message: Callable[[str], None] | None = None,
                  on_state: Callable[[str], None] | None = None,
-                 now: Callable[[], float] | None = None):
+                 now: Callable[[], float] | None = None,
+                 health_sink: Callable[[dict], object] | None = None):
         self._session = session
         self._activation = activation
         self._poll_interval = poll_interval
@@ -238,6 +242,10 @@ class VoiceController:
         # without touching the session's lifecycle state machine at all.
         self._on_state = on_state or (lambda _s: None)
         self._now = now or time.monotonic
+        # Health heartbeat (V2.0 T0.8): a sink taking a small dict, called at most
+        # every _HEALTH_INTERVAL_S from the monitor tick. Observation only.
+        self._health_sink = health_sink
+        self._health_next = 0.0
 
         # --- mic-health supervision state (broker-based runtimes only) ---
         self._mic_healthy = True
@@ -303,10 +311,17 @@ class VoiceController:
         )
         wake = cls._build_wake(config)
         worker = _SerialVoiceWorker()
+        health_sink = None
+        try:
+            state_dir = config.state_dir()
+            health_sink = lambda payload, d=state_dir: perf_health.write_health(d, payload)
+        except Exception:          # no usable state dir: no heartbeat; voice is unaffected
+            pass
         controller = cls(session, None, poll_interval=poll_interval,
                          worker=worker, broker=broker, wake=wake,
                          wake_policy=_WakePolicy.from_config(config),
-                         on_message=on_message, on_state=on_state)
+                         on_message=on_message, on_state=on_state,
+                         health_sink=health_sink)
         # PTT edges go through the controller: press is quick (mic open / barge-
         # in) and runs inline on the hook thread; release runs the blocking
         # STT/Assistant/TTS chain on the serial worker so the hook thread stays
@@ -397,6 +412,7 @@ class VoiceController:
         self._session.poll()
         self._reconcile_wake()
         self._check_mic_health()
+        self._maybe_write_health()
 
     def _run_monitor(self) -> None:
         # Cadence only; all decisions live in poll_once()'s own methods. A
@@ -514,6 +530,7 @@ class VoiceController:
                 self._mic_restart_pending_since = None
                 _log.warning("MIC_RECOVERY_FAILED attempt=%d (no frames resumed)",
                             self._mic_recovery_attempts)
+                perf.emit("mic", state="recovery_failed", attempts=self._mic_recovery_attempts)
                 self._schedule_next_retry(now)
             return
 
@@ -528,6 +545,10 @@ class VoiceController:
             self._mic_backoff = _MIC_RECOVERY_INITIAL_BACKOFF_S
             self._mic_next_retry_at = now   # try to recover right away
             _log.warning("MIC_UNAVAILABLE_DETECTED silence_s=%.1f", silence)
+            if silence == float("inf"):
+                perf.emit("mic", state="unavailable")
+            else:
+                perf.emit("mic", state="unavailable", silence_s=round(silence, 1))
             self._msg("(voice) microphone appears unavailable; attempting recovery...")
             self._emit_mic_status("mic_unavailable")
 
@@ -536,6 +557,29 @@ class VoiceController:
         if self._session.state != VoiceState.IDLE:
             return   # never restart the stream out from under an active capture
         self._attempt_mic_recovery(now)
+
+    def health_snapshot(self) -> dict:
+        """Counts/flags for the heartbeat file. No audio, no transcript, no paths."""
+        return {
+            "state": str(getattr(self._session.state, "value", self._session.state)),
+            "mic": self.mic_health_snapshot(),
+            "wake": {"configured": self._wake is not None,
+                     "armed": bool(self._wake_armed),
+                     "broken": bool(self._wake_broken),
+                     "capture_active": bool(self._wake_capture_active)},
+        }
+
+    def _maybe_write_health(self) -> None:
+        if self._health_sink is None:
+            return
+        now = self._now()
+        if now < self._health_next:
+            return
+        self._health_next = now + _HEALTH_INTERVAL_S
+        try:
+            self._health_sink(self.health_snapshot())
+        except Exception:          # the heartbeat must never disturb voice
+            pass
 
     def mic_health_snapshot(self) -> dict:
         """Read-only view of the mic supervisor's state (used by the health
@@ -558,6 +602,7 @@ class VoiceController:
     def _attempt_mic_recovery(self, now: float) -> None:
         self._mic_recovery_attempts += 1
         _log.info("MIC_RECOVERY_ATTEMPT attempt=%d", self._mic_recovery_attempts)
+        perf.emit("mic", state="recovery_attempt", attempts=self._mic_recovery_attempts)
         self._emit_mic_status("mic_recovering")
         try:
             self._broker.stop()
@@ -583,6 +628,7 @@ class VoiceController:
         self._mic_recovery_attempts = 0
         self._mic_backoff = _MIC_RECOVERY_INITIAL_BACKOFF_S
         _log.info("MIC_RECOVERY_SUCCEEDED")
+        perf.emit("mic", state="recovered")
         self._msg("(voice) microphone recovered.")
         self._emit_mic_status(self._session.state)   # snap the tray back to reality
 

@@ -97,6 +97,13 @@ class Config:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def peek_state_dir(self) -> Path:
+        """Like :meth:`state_dir` but NEVER creates anything - for strictly
+        read-only tools (``void doctor``, ``void perf report``) that must not
+        leave a trace on a machine where V.O.I.D has never run."""
+        rel = self.get("app.state_dir", ".void")
+        return Path(os.path.expanduser("~")) / rel
+
     def allowed_roots(self) -> list[Path]:
         roots = self.get("security.allowed_roots", ["~"]) or []
         return [Path(os.path.expanduser(r)).resolve() for r in roots]
