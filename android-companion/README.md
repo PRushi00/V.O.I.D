@@ -127,8 +127,39 @@ New-NetFirewallRule -DisplayName "V.O.I.D Device Gateway" `
 
 `-Profile Private` only (not Public/Domain) and `-Program` scoped to the
 exact interpreter - not a blanket "allow this port from anywhere" rule.
-Windows classifies a phone-hotspot connection as Private by default; verify
-under Settings -> Network & Internet if unsure.
+Windows may classify a phone-hotspot connection as Private OR Public - it was
+**Public** when this was checked on the development laptop, in which case a
+Private-only rule does not apply. Check with `Get-NetConnectionProfile`
+(NetworkCategory) and scope the rule to the profile actually in use, rather
+than widening it to "all profiles" by reflex.
+
+**`ping` from the phone failing does NOT mean the gateway is unreachable.**
+Windows drops inbound ICMP echo by default (no echo-request allow rule), so a
+phone-side `ping <laptop-ip>` shows 100% loss while TCP 8765 works fine. To
+test what actually matters, from the phone (e.g. `adb shell`):
+`nc -w 3 <laptop-ip> 8765` - connects immediately if the gateway is running
+and the firewall allows it; `nc: Timeout` if not.
+
+### Reading the app's connection errors
+
+The app names the failure class and the endpoint it actually used:
+
+| Message starts with | Meaning | Usual fix |
+|---|---|---|
+| `TIMEOUT: nothing answered at host:port` | packets silently dropped | gateway not running (`python -m void device serve`), wrong/changed laptop IP (`ipconfig`, then **Update Connection**), different networks, firewall profile |
+| `REFUSED: ... reachable but nothing is listening` | laptop answered, nothing on that port | gateway not running, or wrong port |
+| `UNREACHABLE: no route to ...` | no path to that address | hotspot off / different network / laptop address changed |
+| `TLS: certificate fingerprint MISMATCH` | connected, but not to the pinned certificate | wrong fingerprint typed, or the laptop's certificate really changed - **never** work around it; re-read the fingerprint from `device pair-start` |
+| `TLS failure ...` | handshake failed for another reason | see the class name in parentheses |
+| JSON reply `unknown_device` | network + TLS fine, laptop has no such device (e.g. it was `device forget`-ed or its `devices.json` was deleted) | re-pair: `device pair-start`, then **Pair** with the new token |
+| `NOTE: on-screen address/fingerprint differ from the saved connection` | requests use the SAVED endpoint, not the text boxes | tap **Update Connection** |
+
+### Running the Android unit tests
+
+`./gradlew test` (JDK 17) runs the pure-JVM tests in `app/src/test`, which
+cover the fingerprint normalization and failure classification in
+`Diagnostics.kt`. JUnit is a `testImplementation` dependency only and is not
+part of the APK.
 
 ## What was actually validated in this task (no real phone available here)
 

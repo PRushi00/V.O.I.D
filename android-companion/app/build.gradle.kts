@@ -31,7 +31,14 @@ android {
     }
 }
 
-// Deliberately NO dependencies block: MainActivity.kt uses only the Android
+dependencies {
+    // TEST-ONLY: JUnit runs the pure-JVM unit tests in app/src/test against
+    // Diagnostics.kt. `testImplementation` never enters the APK - the shipped
+    // app remains dependency-free, as explained below.
+    testImplementation("junit:junit:4.13.2")
+}
+
+// The APK itself has NO runtime dependencies: MainActivity.kt uses only the Android
 // platform SDK (android.app.Activity, android.widget.*) and the Java
 // standard library (javax.net.ssl, javax.crypto, org.json - org.json ships
 // inside the Android platform itself, not as a Maven artifact). Adding

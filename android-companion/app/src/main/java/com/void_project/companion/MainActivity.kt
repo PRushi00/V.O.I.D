@@ -86,11 +86,17 @@ private class PinnedTrustManager(private val expectedFingerprint: String) : X509
         val cert = chain?.firstOrNull()
             ?: throw java.security.cert.CertificateException("No certificate presented.")
         val digest = MessageDigest.getInstance("SHA-256").digest(cert.encoded)
-        val actual = digest.joinToString(":") { String.format("%02X", it) }
-        if (!actual.equals(expectedFingerprint.trim(), ignoreCase = true)) {
+        // A pin that is not even a well-formed SHA-256 is a configuration
+        // error, not a mismatch - say so, still refusing the connection.
+        if (normalizeFingerprint(expectedFingerprint) == null) {
+            throw java.security.cert.CertificateException(
+                "Pinned fingerprint is not a valid SHA-256 (need 64 hex digits) - " +
+                "refusing to connect.")
+        }
+        if (!fingerprintMatches(expectedFingerprint, digest)) {
             throw java.security.cert.CertificateException(
                 "Certificate fingerprint mismatch - refusing to connect. " +
-                "expected=$expectedFingerprint actual=$actual")
+                "expected=${expectedFingerprint.trim()} actual=${formatFingerprint(digest)}")
         }
     }
 
@@ -123,6 +129,11 @@ private fun postJsonBytes(host: String, port: Int, path: String, fingerprint: St
     val conn = url.openConnection() as HttpsURLConnection
     conn.sslSocketFactory = pinnedSslContext(fingerprint).socketFactory
     conn.hostnameVerifier = javax.net.ssl.HostnameVerifier { _: String?, _: SSLSession? -> true }
+    // Explicit, bounded timeouts: a dead/unreachable address must fail in a
+    // predictable few seconds with a TIMEOUT diagnosis, not depend on
+    // whichever default the platform HTTP stack happens to have.
+    conn.connectTimeout = 8_000
+    conn.readTimeout = 10_000
     conn.requestMethod = "POST"
     conn.doOutput = true
     conn.setRequestProperty("Content-Type", "application/json")
@@ -130,7 +141,9 @@ private fun postJsonBytes(host: String, port: Int, path: String, fingerprint: St
         conn.setRequestProperty("X-Void-Signature", signature)
     }
     conn.outputStream.use { it.write(raw) }
-    val stream = if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream
+    val code = conn.responseCode
+    val stream = (if (code in 200..299) conn.inputStream else conn.errorStream)
+        ?: throw java.io.IOException("Empty response body (HTTP $code)")
     val text = stream.bufferedReader().use { it.readText() }
     return JSONObject(text)
 }
@@ -276,7 +289,7 @@ class MainActivity : Activity() {
                     show("Pairing failed: ${response.optJSONObject("error")}")
                 }
             } catch (e: Exception) {
-                show("Pairing error: ${e.message}")
+                show("Pairing error: ${describeFailure(e, host, port)}")
             } finally {
                 pairingInFlight.set(false)
                 runOnUiThread { pairButton.isEnabled = true }
@@ -298,6 +311,10 @@ class MainActivity : Activity() {
         val fingerprint = fingerprintField.text.toString().trim()
         if (host.isEmpty() || fingerprint.isEmpty()) {
             show("Enter both an address and a certificate fingerprint first.")
+            return
+        }
+        if (normalizeFingerprint(fingerprint) == null) {
+            show("That is not a valid SHA-256 fingerprint (64 hex digits, colons optional).")
             return
         }
         prefs.edit()
@@ -336,6 +353,18 @@ class MainActivity : Activity() {
             return
         }
 
+        // Requests always go to the SAVED endpoint (only Pair / Update
+        // Connection change it). If the fields on screen say something
+        // different, tell the user instead of silently using the old address
+        // while the screen shows the new one.
+        val differs = endpointDiffers(
+            hostField.text.toString(), portField.text.toString().trim().toIntOrNull() ?: 8765,
+            fingerprintField.text.toString(), host, port, fingerprint)
+        val prefix = if (differs)
+            "NOTE: on-screen address/fingerprint differ from the saved connection " +
+            "- using SAVED $host:$port. Tap Update Connection to change it.\n"
+        else ""
+
         thread {
             try {
                 val requestId = java.util.UUID.randomUUID().toString()
@@ -349,9 +378,9 @@ class MainActivity : Activity() {
                 val raw = body.toString().toByteArray(Charsets.UTF_8)
                 val signature = hmacSha256Hex(secret, raw)
                 val response = postJsonBytes(host, port, "/void/v1/request", fingerprint, raw, signature)
-                show(response.toString())
+                show("$prefix[$host:$port] $response")
             } catch (e: Exception) {
-                show("Request error: ${e.message}")
+                show("$prefix${describeFailure(e, host, port)}")
             }
         }
     }
