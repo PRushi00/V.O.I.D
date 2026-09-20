@@ -18,6 +18,10 @@ config/local_config.yaml
 .env
 *.key
 secrets.*
+# ...except void/security/secrets.py: source code (a thin wrapper over the OS
+# keyring; it holds no secret values). It is imported by config, the kill
+# switch and the device gateway, so a clone without it cannot run.
+!void/security/secrets.py
 
 # OS / editor
 .DS_Store
