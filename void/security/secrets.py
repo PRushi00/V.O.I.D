@@ -61,3 +61,4 @@ def delete_secret(key: str) -> bool:
 # Well-known secret keys used across the app.
 GEMINI_API_KEY = "gemini_api_key"
 STOP_PIN = "stop_pin"
+MEMORY_KEY = "memory_key"     # 32-byte AES key for void.memory (base64); never leaves the OS store

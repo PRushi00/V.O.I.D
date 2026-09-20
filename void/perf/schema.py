@@ -63,6 +63,7 @@ EVENTS: dict[str, dict[str, object]] = {
     "complete": {"status": _STATUS, "total_s": _float, "steps": _int},
     "mic": {"state": _enum("unavailable", "recovery_attempt", "recovery_failed", "recovered"),
             "silence_s": _float, "attempts": _int},
+    "memory": {"op": _enum("write", "retrieve", "context"), "n": _int, "duration_s": _float},
     "gateway": {"period_s": _float, "ok": _int, "rejected": _int, "rate_limited": _int,
                 "paired": _int, "dropped": _int, "conn_errors": _int},
 }
