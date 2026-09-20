@@ -297,6 +297,20 @@ def test_report_aggregates_stages_status_and_failures(tmp_path):
     assert "llm.duration_s" in text and "p99 shown only when n >= 300" in text
 
 
+def test_report_separates_real_commands_from_keystroke_noise_and_counts_endpoints():
+    evts = [{"event": "stt", "ts": i, "decode_s": 0.01, "audio_s": 0.0, "empty": True} for i in range(50)]
+    evts += [{"event": "stt", "ts": 100 + i, "decode_s": d, "audio_s": 3.0, "empty": False}
+             for i, d in enumerate((1.17, 2.56, 7.83))]
+    evts += [{"event": "endpoint", "ts": 200, "reason": "no_speech"}, {"event": "endpoint", "ts": 201, "reason": "silence"},
+             {"event": "endpoint", "ts": 202, "reason": "silence"}]
+    data = report.build_report(evts)
+    assert data["stages"]["stt.decode_s"]["n"] == 53
+    assert data["stages"]["stt.decode_s[transcribed]"]["n"] == 3
+    assert data["stages"]["stt.decode_s[transcribed]"]["p50"] == pytest.approx(2.56)
+    assert data["endpoints"] == {"no_speech": 1, "silence": 2}
+    assert "endpoints: no_speech=1, silence=2" in report.format_report(data)
+
+
 def test_report_loads_rotated_backups_oldest_first_and_skips_garbage(tmp_path):
     d = tmp_path / "perf"
     _write_events(d, [{"event": "mic", "ts": 3, "state": "c"}], "perf.jsonl")

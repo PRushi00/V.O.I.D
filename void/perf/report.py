@@ -143,6 +143,7 @@ def build_report(events: list[dict]) -> dict:
     stages: dict[str, list[float]] = defaultdict(list)
     tools: dict[str, list[float]] = defaultdict(list)
     activations, statuses, mic, llm_fail = Counter(), Counter(), Counter(), Counter()
+    endpoints = Counter()
     stt = Counter()
     ids = set()
     for e in events:
@@ -155,10 +156,14 @@ def build_report(events: list[dict]) -> dict:
             stt["zero_audio"] += (e.get("audio_s", 1) == 0)
             if "decode_s" in e:
                 stages["stt.decode_s"].append(e["decode_s"])
+                if not e.get("empty"):           # a real command; the rest is keystroke/no-speech noise (D-02)
+                    stages["stt.decode_s[transcribed]"].append(e["decode_s"])
             if "audio_s" in e and e["audio_s"] > 0:
                 stages["stt.audio_s"].append(e["audio_s"])
-        elif kind == "endpoint" and "capture_s" in e:
-            stages["endpoint.capture_s"].append(e["capture_s"])
+        elif kind == "endpoint":
+            endpoints[e.get("reason", "?")] += 1
+            if "capture_s" in e:
+                stages["endpoint.capture_s"].append(e["capture_s"])
         elif kind == "llm":
             if e.get("ok") and "duration_s" in e:
                 stages["llm.duration_s"].append(e["duration_s"])
@@ -182,6 +187,7 @@ def build_report(events: list[dict]) -> dict:
         "events": len(events),
         "interactions": len(ids),
         "activations": dict(activations),
+        "endpoints": dict(endpoints),
         "stages": {k: summarize(v) for k, v in sorted(stages.items())},
         "tools": {k: summarize(v) for k, v in sorted(tools.items())},
         "llm_failures": dict(llm_fail),
@@ -195,6 +201,8 @@ def format_report(report: dict) -> str:
     lines = [f"events: {report['events']}   interactions (with id): {report['interactions']}"]
     if report["activations"]:
         lines.append("activations: " + ", ".join(f"{k}={v}" for k, v in sorted(report["activations"].items())))
+    if report.get("endpoints"):
+        lines.append("endpoints: " + ", ".join(f"{k}={v}" for k, v in sorted(report["endpoints"].items())))
     if report["stt"]:
         s = report["stt"]
         lines.append(f"stt runs: {s.get('total', 0)} (empty {s.get('empty', 0)}, zero-audio {s.get('zero_audio', 0)})")

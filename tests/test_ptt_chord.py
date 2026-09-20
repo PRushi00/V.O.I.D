@@ -150,3 +150,41 @@ def test_controller_reads_the_strict_chord_switch_from_config():
     fake_assistant = types.SimpleNamespace(config=cfg, kill_switch=types.SimpleNamespace(engaged=False))
     ctrl = VoiceController.from_assistant(fake_assistant, cfg)
     assert ctrl._activation._strict_chord is False
+
+
+def test_an_hour_of_typing_starts_no_sessions_and_every_chord_starts_exactly_one():
+    """Seeded simulation of ~1 h of typing at ~5 keystrokes/s (18 000 events): words with
+    spaces, held spaces with OS auto-repeat, ctrl-shortcuts. V1 started a session on every one
+    of those spaces (723 of 809 STT starts in the real log were 0-sample). Now only real
+    Ctrl+Space chords count."""
+    import random
+
+    rng = random.Random(20260921)
+    held = set()
+    ptt, presses, releases = _ptt(held)
+    chords = 0
+    for _ in range(18_000):
+        roll = rng.random()
+        if roll < 0.70:                                   # ordinary letter: not the hotkey, never reaches it
+            continue
+        if roll < 0.93:                                   # a word-separating space, maybe held with auto-repeat
+            held.add("space")
+            for _rep in range(rng.choice([1, 1, 1, 3, 8])):
+                ptt._handle_key_down()
+            held.discard("space")
+            ptt._handle_key_up()
+        elif roll < 0.98:                                 # other Ctrl shortcuts (ctrl+c etc.): no space involved
+            held.add("ctrl")
+            held.discard("ctrl")
+        else:                                             # a deliberate Ctrl+Space press-and-release
+            held.update({"ctrl", "space"})
+            for _rep in range(rng.choice([1, 1, 4])):
+                ptt._handle_key_down()
+            held.discard("space")
+            ptt._handle_key_up()
+            held.discard("ctrl")
+            chords += 1
+    assert chords > 100                                   # the simulation really did exercise chords
+    assert len(presses) == chords, f"{len(presses)} sessions from {chords} deliberate chords"
+    assert len(releases) == chords
+

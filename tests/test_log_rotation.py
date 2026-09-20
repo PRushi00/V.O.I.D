@@ -4,7 +4,6 @@ import logging
 import os
 import sys
 import types
-from pathlib import Path
 
 from void.perf.rotate import CopyTruncateRotatingHandler
 from void.runtime import diagnostics
