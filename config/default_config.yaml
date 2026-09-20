@@ -59,6 +59,13 @@ security:
   # Deletes go to the Recycle Bin, never a hard unlink, in V1.
   delete_to_recycle_bin: true
 
+# Diagnostic log + privacy-safe performance stream (V2.0). Both are size-bounded.
+logging:
+  max_bytes: 5242880            # per file; ~6 files kept (live + backups) => ~30 MB ceiling
+  backup_count: 5
+perf:
+  enabled: true                 # <state_dir>/perf/perf.jsonl: numbers/ids/enums only, never content
+
 kill_switch:
   # The exact phrase that triggers an emergency stop.
   phrase: "VOID, STOP EVERYTHING"

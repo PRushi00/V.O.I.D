@@ -101,6 +101,10 @@ def _hermetic_environment(monkeypatch, tmp_path_factory):
     # sandbox (observed while validating T0.1). Tests must never use the network.
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     yield sandbox
+    # The perf sink is process-global; detach it so one test's telemetry can never
+    # bleed into (or write under) another test's sandbox.
+    from void import perf
+    perf.shutdown()
 
 
 @pytest.fixture

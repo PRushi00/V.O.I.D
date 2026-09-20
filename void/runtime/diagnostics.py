@@ -41,8 +41,13 @@ import sys
 import tempfile
 from pathlib import Path
 
+from void import perf
+from void.perf.rotate import CopyTruncateRotatingHandler
+
 _FILE_MARKER = "_void_bg"
 _CONSOLE_MARKER = "_void_console"
+_DEFAULT_MAX_BYTES = 5 * 1024 * 1024      # 5 MB x (1 live + 5 backups) bounds the log
+_DEFAULT_BACKUP_COUNT = 5
 
 
 def _real_production_log_path() -> Path:
@@ -64,26 +69,64 @@ def install_background_logging() -> Path | None:
     root = logging.getLogger()
     if any(getattr(h, _FILE_MARKER, False) for h in root.handlers):
         return None
+    cfg = None
     try:
         from void.config import Config
-        log_path = Config.load().state_dir() / "void.log"
+        cfg = Config.load()
+        log_path = cfg.state_dir() / "void.log"
     except Exception:
         log_path = Path(tempfile.gettempdir()) / "void.log"
+    redirected_for_test = False
     if _running_under_pytest() and log_path == _real_production_log_path():
         # Config was NOT redirected by the caller (see module docstring) -
         # never contaminate the real production log from a test process.
         log_path = Path(tempfile.gettempdir()) / "void-test-session.log"
+        redirected_for_test = True
+    max_bytes, backup_count = _log_limits(cfg)
     try:
-        handler = logging.FileHandler(log_path, encoding="utf-8")
+        # Bounded (D-10). Copy-truncate rotation, not rename: several processes
+        # (runtime, `device serve`, CLI) append to this file and Windows refuses to
+        # rename a file another process holds open.
+        handler = CopyTruncateRotatingHandler(
+            log_path, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
         setattr(handler, _FILE_MARKER, True)
         handler.setFormatter(logging.Formatter(
             "%(asctime)s %(levelname)s %(name)s: %(message)s"))
         root.addHandler(handler)
         root.setLevel(logging.WARNING)          # quiet by default (third-party)
         logging.getLogger("void").setLevel(logging.INFO)   # our own lifecycle
+        _install_perf(cfg, log_path, redirected_for_test, max_bytes, backup_count)
         return log_path
     except Exception:
         return None
+
+
+def _log_limits(cfg) -> tuple[int, int]:
+    """(max_bytes, backup_count) from ``logging.*`` config, tolerating a config
+    object without ``get`` (tests stand in a minimal fake)."""
+    max_bytes, backups = _DEFAULT_MAX_BYTES, _DEFAULT_BACKUP_COUNT
+    getter = getattr(cfg, "get", None)
+    if callable(getter):
+        try:
+            max_bytes = int(getter("logging.max_bytes", max_bytes))
+            backups = int(getter("logging.backup_count", backups))
+        except (TypeError, ValueError):
+            pass
+    return max(64 * 1024, max_bytes), max(1, backups)
+
+
+def _install_perf(cfg, log_path: Path, redirected_for_test: bool,
+                  max_bytes: int, backup_count: int) -> None:
+    """Start the privacy-safe performance stream next to the log. Never raises."""
+    try:
+        getter = getattr(cfg, "get", None)
+        if callable(getter) and not getter("perf.enabled", True):
+            return
+        directory = (Path(tempfile.gettempdir()) / "void-test-session-perf"
+                     if redirected_for_test else log_path.parent / "perf")
+        perf.configure(directory, max_bytes=max_bytes, backup_count=backup_count)
+    except Exception:
+        pass
 
 
 def install_console_diagnostics() -> None:
