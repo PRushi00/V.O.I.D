@@ -44,6 +44,82 @@ def test_pair_start_prints_a_token_and_opens_a_window(state_dir, capsys):
     assert mgr.redeem(out.split("Pairing token:")[1].splitlines()[0].strip()) == "My Phone"
 
 
+def _pair_start_fields(capsys, monkeypatch, ip_hint="10.192.243.47", name="My Android Phone"):
+    """Run pair-start and parse each printed field's VALUE (not just its
+    label - a label-only check passes even when the value after it is
+    blank). Returns a dict; the token is returned so tests can test it, but
+    no assertion below ever puts it in a failure message."""
+    monkeypatch.setattr(cli, "_local_ip_hint", lambda: ip_hint)
+    assert cli.cmd_device_pair_start(name, 5.0) == 0
+    out = capsys.readouterr().out
+    fields = {}
+    for line in out.splitlines():
+        for label, key in (("Pairing token:", "token"), ("Port:", "port"),
+                          ("Certificate fingerprint:", "fingerprint"),
+                          ("Device name:", "name"),
+                          ("This laptop's address (best guess):", "address")):
+            if line.strip().startswith(label):
+                fields[key] = line.strip()[len(label):].strip()
+    return fields
+
+
+def test_pair_start_prints_a_nonblank_value_for_every_field(state_dir, capsys, monkeypatch):
+    fields = _pair_start_fields(capsys, monkeypatch)
+    # Booleans only: pytest echoes the operands of a failed `==`, which would
+    # leak the pairing token into test output.
+    assert bool(fields.get("token")), "pairing token value is blank"
+    assert len(fields["token"].split()) == 1, "token line should hold exactly one value"
+    assert bool(fields.get("fingerprint")), "fingerprint value is blank"
+    assert bool(fields.get("port")), "port value is blank"
+    assert fields["name"] == "My Android Phone"
+    assert fields["address"] == "10.192.243.47"
+
+
+def test_pair_start_fingerprint_is_the_real_certificates_sha256(state_dir, capsys, monkeypatch):
+    import re
+
+    from void.device import cert
+    fields = _pair_start_fields(capsys, monkeypatch)
+    printed = fields["fingerprint"]
+    assert re.fullmatch(r"([0-9A-F]{2}:){31}[0-9A-F]{2}", printed) is not None
+    # The very certificate the gateway will serve from this state dir.
+    assert (printed == cert.fingerprint(state_dir / "device_cert.pem")) is True
+
+
+def test_pair_start_token_is_the_one_stored_in_the_pairing_window(state_dir, capsys, monkeypatch):
+    import json
+    fields = _pair_start_fields(capsys, monkeypatch)
+    stored = json.loads((state_dir / "pairing_window.json").read_text())["token"]
+    assert len(fields["token"]) >= 8
+    assert (fields["token"] == stored) is True
+
+
+def test_pair_start_reports_the_running_gateways_actual_port(state_dir, capsys, monkeypatch):
+    (state_dir / "gateway_address.json").write_text('{"port": 9123}')
+    fields = _pair_start_fields(capsys, monkeypatch)
+    assert fields["port"] == "9123"
+
+
+def test_pair_start_falls_back_to_the_configured_port_when_no_gateway(state_dir, capsys, monkeypatch):
+    fields = _pair_start_fields(capsys, monkeypatch)
+    assert fields["port"].split()[0] == "8765"
+
+
+def test_pair_start_without_an_address_guess_says_so_instead_of_blank(state_dir, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "_local_ip_hint", lambda: None)
+    assert cli.cmd_device_pair_start("P", 5.0) == 0
+    assert "Could not guess this laptop's address" in capsys.readouterr().out
+
+
+def test_pair_start_never_touches_an_existing_device_registry(state_dir, capsys, monkeypatch):
+    reg = DeviceRegistry(state_dir / "devices.json")
+    device, _ = reg.pair(name="Existing Phone")
+    before = (state_dir / "devices.json").read_bytes()
+    _pair_start_fields(capsys, monkeypatch)
+    assert (state_dir / "devices.json").read_bytes() == before
+    assert reg.get(device.device_id) is not None
+
+
 def test_list_reports_no_devices_initially(state_dir, capsys):
     rc = cli.cmd_device_list()
     assert rc == 0
