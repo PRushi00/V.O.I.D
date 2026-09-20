@@ -15,6 +15,7 @@ from typing import Callable
 from void import perf
 from void.actions.registry import ToolRegistry
 from void.memory import scope as memory_scope
+from void.memory.intent import RECALL_NO_ANSWER
 from void.core.kill_switch import KillSwitch, StopRequested
 from void.core.task import CorruptedTaskState, Status, Task, TaskStore
 from void.providers.base import LLMProvider, ProviderUnavailable
@@ -125,6 +126,7 @@ class Agent:
         on_event: OnEvent | None = None,
         defer_confirmation: bool = False,
         memory_context: Callable[[str], list[dict]] | None = None,
+        recall_only: bool = False,
     ):
         self.provider = provider
         self.tools = tools
@@ -145,6 +147,10 @@ class Agent:
         # task.messages, so decrypted memory is never persisted into tasks.sqlite. Memory
         # is data: nothing about it reaches RiskGate or any authorization decision.
         self._memory_context = memory_context
+        # Memory-first turn (V2.0): the owner asked what V.O.I.D remembers and the memory has the
+        # answer, so this turn offers NO tools. It can only reduce capability - a tool call a model
+        # hallucinates anyway is dropped, never executed.
+        self.recall_only = recall_only
         self._memory_msgs: list[dict] | None = None
         self._memory_goal = ""
         self._scope = memory_scope.RunScope()
@@ -175,7 +181,7 @@ class Agent:
         return [*messages[:head], *self._memory_msgs, *messages[head:]]
 
     def _generate_with_retry(self, messages: list[dict]):
-        specs = self.tools.specs()
+        specs = None if self.recall_only else self.tools.specs()
         messages = self._with_memory(messages)
         last_exc: Exception | None = None
         for attempt in range(self.max_retries + 1):
@@ -823,6 +829,9 @@ class Agent:
                 self.kill_switch.raise_if_engaged()
 
                 response = self._generate_with_retry(task.messages)
+                if self.recall_only and response.has_tool_calls:
+                    response.tool_calls = []          # memory-first: nothing may execute
+                    response.text = response.text or RECALL_NO_ANSWER
 
                 if response.has_tool_calls:
                     outcome = self._commit_step(task, response)

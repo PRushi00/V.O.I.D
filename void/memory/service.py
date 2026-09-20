@@ -272,6 +272,11 @@ class MemoryService:
     def pending(self) -> list[MemoryItem]:
         return self._store.list(("proposed", "quarantined"))
 
+    def pending_matches(self, query: str) -> int:
+        """How many awaiting-review items share a content word with ``query`` (a count only)."""
+        qt = set(tokenize(query))
+        return sum(1 for it in self._store.list(("proposed",)) if it.readable and qt & set(tokenize(it.text)))
+
     def show(self, item_id: str) -> tuple[MemoryItem, list[tuple]] | None:
         it = self._store.load(item_id)
         return (it, self._store.events(item_id)) if it else None

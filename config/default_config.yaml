@@ -155,3 +155,4 @@ memory:
   proposal_ttl_days: 30         # unreviewed proposals/quarantined items expire
   episode_ttl_days: 90          # episodic notes expire unless pinned
   max_proposals_per_task: 3
+  recall_routing: true          # memory questions ("what project am I building?") are answered from memory with no tools

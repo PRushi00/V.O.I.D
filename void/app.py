@@ -92,7 +92,7 @@ class Assistant:
         # Providers
         self.providers = ProviderRegistry.from_config(self.config)
 
-    def _agent(self) -> Agent:
+    def _agent(self, memory_first: bool = False) -> Agent:
         provider = self.providers.select()  # raises if none available
         perf.emit("route", provider=getattr(provider, "name", "unknown"), reason="select")
         return Agent(
@@ -105,10 +105,11 @@ class Assistant:
             max_retries=self.config.get("agent.max_retries", 2),
             on_event=self.on_event,
             defer_confirmation=self._confirm_fn is None,
-            memory_context=self._memory_context_fn(provider),
+            memory_context=self._memory_context_fn(provider, memory_first=memory_first),
+            recall_only=memory_first,
         )
 
-    def _memory_context_fn(self, provider):
+    def _memory_context_fn(self, provider, memory_first: bool = False):
         """Goal -> [context messages]. Sensitive / non-cloud memory is withheld whenever the
         selected provider is not the local one (unknown providers count as cloud)."""
         if self.memory is None:
@@ -120,7 +121,9 @@ class Assistant:
                 block = self.memory.build_context(goal, for_cloud=for_cloud)
             except MemoryUnavailable as exc:
                 _log.warning("MEMORY_UNAVAILABLE code=%s", exc.code)   # the run proceeds without memory
-                return []
+                return [memory_intent.recall_context_message(None)] if memory_first else []
+            if memory_first:
+                return [memory_intent.recall_context_message(block)]
             return [block.as_message()] if block else []
 
         return fn
@@ -147,11 +150,43 @@ class Assistant:
         task = Task(goal="[memory command]", id="(memory)", status=Status.COMPLETED, result=reply)
         return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0)
 
+    def _recall_route(self, goal: str) -> "AgentResult | bool":
+        """Memory questions are answered from memory, not by searching the machine.
+
+        Returns True for a memory-first turn (the agent is given the retrieved memory and NO tools),
+        an ``AgentResult`` when the owner asked what V.O.I.D remembers and nothing is stored (answered
+        deterministically, no model and no tools), or False for the normal agent. Only a *narrower*
+        set of capabilities is ever granted here; authorization is untouched."""
+        if (self.memory is None or not self.config.get("memory.recall_routing", True)
+                or self.kill_switch.engaged):
+            return False
+        kind = memory_intent.classify_recall(goal)
+        if kind is None:
+            return False
+        t0 = time.perf_counter()
+        try:
+            hit = bool(self.memory.retrieve(goal, for_cloud=False, limit=1))
+            pending = 0 if hit or kind != "explicit" else self.memory.pending_matches(goal)
+        except MemoryUnavailable as exc:
+            _log.warning("MEMORY_UNAVAILABLE code=%s", exc.code)
+            return False
+        perf.emit("memory", op="route", n=int(hit), duration_s=round(time.perf_counter() - t0, 6))
+        if hit:
+            return True
+        if kind == "explicit":                     # asked what I remember; I remember nothing relevant
+            reply = memory_intent.RECALL_PENDING if pending else memory_intent.RECALL_NOTHING
+            task = Task(goal="[memory recall]", id="(memory)", status=Status.COMPLETED, result=reply)
+            return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0)
+        return False                               # personal-looking question with no memory: use the agent
+
     def run(self, goal: str) -> AgentResult:
         handled = self._memory_command(goal)
         if handled is not None:
             return handled
-        return self._measured(lambda: self._agent().run(goal))
+        route = self._recall_route(goal)
+        if isinstance(route, AgentResult):
+            return route
+        return self._measured(lambda: self._agent(memory_first=route).run(goal))
 
     def resume(self, task_id: str) -> AgentResult:
         task = self.store.load(task_id)

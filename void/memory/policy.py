@@ -7,7 +7,7 @@ Two questions are answered for every candidate memory, in code (not config, not 
 
     owner typed it (CLI / UI)                        -> active   (owner_stated)
     owner spoke it (voice transcript)                -> proposed (voice_stated)   [opt-in auto-accept
-                                                        for non-sensitive preferences, default off]
+                                                        for non-sensitive, non-authority text; default off]
     the model proposed it (propose_memory)           -> proposed (agent_proposed)
     ... during a run that has read tool output       -> quarantined (agent_proposed)
     ... or whose text reads like an authority claim  -> quarantined
@@ -109,7 +109,8 @@ def decide_owner(raw_text: str, *, channel: str, kind: str | None = None,
         return Decision(True, status="active", origin="owner_stated", kind=kind, sensitivity=sens,
                         cloud_ok=cloud_ok, text=text)
     # A speech transcript is not proof of the owner's intent: it lands for review.
-    auto = voice_auto_accept and sens == "normal" and kind == "preference"
+    # Opt-in only (default off). Never for sensitive text or text that reads like a permission claim.
+    auto = voice_auto_accept and sens == "normal" and not reads_like_authority(text)
     return Decision(True, status="active" if auto else "proposed", origin="voice_stated", kind=kind,
                     sensitivity=sens, cloud_ok=cloud_ok, text=text)
 

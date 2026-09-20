@@ -74,6 +74,22 @@ def main():
         out = {"status": res.status, "result": res.result, "provider_calls": provider.calls,
                "first_call": provider.seen_messages[0] if provider.seen_messages else None,
                "pid": __import__("os").getpid()}
+    if spec["op"] == "recall":
+        from tests.memory_helpers import EagerToolProvider, seed_project
+        from void.app import Assistant
+        from void.providers.registry import ProviderRegistry
+
+        cfg2 = Config({"app": {"state_dir": spec["state_dir"]}, "security": {"allowed_roots": [spec["work_dir"]]}})
+        a = Assistant(config=cfg2)
+        proj = seed_project(spec["work_dir"])
+        provider = EagerToolProvider(proj)
+        a.providers = ProviderRegistry({"fake": provider}, ["fake"])
+        executed = []
+        real = a.tools.execute
+        a.tools.execute = lambda name, args: (executed.append(name), real(name, args))[1]
+        res = a.run(spec["goal"])
+        out = {"status": res.status, "result": res.result, "calls": provider.calls, "tools_executed": executed,
+               "pid": __import__("os").getpid()}
     print("RESULT" + json.dumps(out))
 
 
