@@ -268,6 +268,36 @@ def test_forget_matching_deletes_a_clear_match_and_refuses_ambiguity(tmp_path):
     assert len(svc.list()) == 2
 
 
+@pytest.mark.parametrize("tainted,status", [(False, "proposed"), (True, "quarantined")])
+def test_forget_matching_also_removes_a_pending_copy_of_the_forgotten_fact(tmp_path, tainted, status):
+    """Found by live validation: the owner corrected a fact, the model had ALSO proposed it, and
+    'forget that ...' deleted the active item but left the pending proposal (Jaccard 0.83, just under
+    the 0.85 duplicate threshold) - which the owner could later accept, resurrecting the fact."""
+    svc = make_service(tmp_path)
+    svc.remember("my V.O.I.D test project is called Nova", channel="cli")
+    pend = svc.propose("Owner's V.O.I.D test project is called Nova", tainted=tainted).item
+    assert pend.status == status
+    assert svc.forget_matching("my V.O.I.D test project is called Nova").deleted == 2
+    assert svc.list() == [] and svc.pending() == []
+
+
+def test_forget_matching_keeps_unrelated_pending_proposals(tmp_path):
+    svc = make_service(tmp_path)
+    svc.remember("my V.O.I.D test project is called Nova", channel="cli")
+    other = svc.propose("Owner prefers dark mode in every editor").item
+    assert svc.forget_matching("my V.O.I.D test project is called Nova").deleted == 1
+    assert [i.id for i in svc.pending()] == [other.id]
+
+
+def test_forgetting_an_ambiguous_request_leaves_pending_proposals_alone(tmp_path):
+    svc = make_service(tmp_path)
+    svc.remember("I prefer dark mode", channel="cli")
+    svc.remember("I prefer tea", channel="cli")
+    svc.propose("Owner prefers tea")
+    assert svc.forget_matching("I prefer").deleted == 0
+    assert len(svc.pending()) == 1 and len(svc.list()) == 3
+
+
 # ------------------------------------------------------------------ malformed input
 @pytest.mark.parametrize("bad", [None, 42, b"bytes", ["list"], {"a": 1}])
 def test_malformed_input_is_rejected_cleanly(tmp_path, bad):

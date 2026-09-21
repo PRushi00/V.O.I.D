@@ -31,6 +31,7 @@ SMALL_STORE = 5             # at most this many recallable items: a lexical miss
 _RECALL_META = frozenset(tokenize("remember remind recall recalled know knew tell told say said ask asked mention mentioned "
                                   "store stored save saved note noted memory memories anything something everything"))
 AMBIGUITY = 0.85           # a runner-up scoring above this fraction of the best is "not clearly one item"
+PENDING_FORGET_SIMILARITY = 0.5   # a pending proposal at least this similar to a forgotten fact is forgotten with it
 
 
 @dataclass(frozen=True)
@@ -260,7 +261,17 @@ class MemoryService:
             return ForgetOutcome(0, tuple(ambiguous))
         if ambiguous:
             return ForgetOutcome(0, tuple([target.id, *ambiguous]))
-        return ForgetOutcome(self.forget(target.id))
+        return ForgetOutcome(self.forget(target.id) + self._forget_pending_copies(target))
+
+    def _forget_pending_copies(self, target: MemoryItem) -> int:
+        """'Forget that X' also drops any still-unreviewed proposal of the same fact: otherwise the owner
+        could later accept it and resurrect what they just asked to be forgotten. Only pending items that
+        closely resemble the forgotten one go; unrelated proposals are untouched."""
+        n = 0
+        for it in self._pending_or_active(("proposed", "quarantined")):
+            if policy.similarity(target.text, it.text) >= PENDING_FORGET_SIMILARITY:
+                n += self.forget(it.id)
+        return n
 
     # ------------------------------------------------------------------ reads
     def verify_state(self) -> str:
