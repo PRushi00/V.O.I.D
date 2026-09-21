@@ -89,3 +89,13 @@ def test_limits_validation_rejects_garbage(tmp_path):
         p.write_text(json.dumps(bad), encoding="utf-8")
         with pytest.raises(ValueError):
             guard.read_limits(p)
+
+
+def test_pytest_is_scoped_to_this_repositorys_own_tests():
+    """Bare `pytest` from the repository root once collected the untracked wakeword-training/tests package, whose
+    `tests` name collides with ours, and aborted the whole run. Collection must stay scoped to tests/."""
+    import configparser
+
+    cfg = configparser.ConfigParser()
+    cfg.read(ROOT / "pytest.ini", encoding="utf-8")
+    assert cfg["pytest"]["testpaths"].strip() == "tests"
