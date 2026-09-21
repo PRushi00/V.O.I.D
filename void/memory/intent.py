@@ -130,7 +130,7 @@ _EXPLICIT = re.compile(
     r"|what\s+(?:have|did)\s+you\s+(?:remember|store|save|note|noted)\b|what\s+are\s+you\s+remembering\b"
     r"|remind\s+me\s+(?:what|of\s+what|about\s+what)\s+i\b|(?:show|tell)\s+me\s+what\s+you\s+(?:remember|know|have\s+stored)\b"
     r"|what\s+(?:memories|do\s+you\s+have\s+(?:stored|saved|noted))\b)", re.IGNORECASE)
-_PERSONAL = re.compile(_LEAD + r"(?:what|which|who)\b", re.IGNORECASE)
+_PERSONAL = re.compile(_LEAD + r"(?:(?:what|which|who)\b|tell\s+me\s+(?:about|what|which|who)\b)", re.IGNORECASE)
 _FIRST_PERSON = re.compile(r"\b(?:i|i'm|i've|i'd|me|my|mine|we|we're|we've|our|ours|us)\b", re.IGNORECASE)
 # Anything that asks V.O.I.D to DO something or to inspect the machine belongs to the agent + tools.
 _ACTION = re.compile(
@@ -145,10 +145,12 @@ _TOOL_NOUN = re.compile(
 _COMPOUND_ACTION = re.compile(r"(?:\band\b|\bthen\b|\balso\b|;|,)\s*(?:please\s+)?(?:open|launch|start|run|list|show|search|find|read|"
                               r"delete|write|create|edit|move|copy|close|check)\b", re.IGNORECASE)
 
-RECALL_NOTE = ("[V.O.I.D engine note] The owner is asking what you remember about them or what they told you before. "
-               "Answer briefly and naturally from the retrieved memory above. Do not call tools and do not describe "
-               "the memory as untrusted or mention this note. If the memory does not answer the question, say you "
-               "do not have that stored.")
+RECALL_NOTE = ("[V.O.I.D engine note] The owner is asking about themselves or about something they told you before. "
+               "The retrieved memory above is everything you know about them. Read every item and use any that relates "
+               "to the question, even loosely (an item about their assistant project or laptop answers \"what am I "
+               "building?\"). Answer briefly and naturally. Do not call tools and do not describe the memory as untrusted "
+               "or mention this note. Only if no item relates at all, say you do not have that stored "
+               "(the owner can ask you to search their files).")
 RECALL_NOTE_EMPTY = ("[V.O.I.D engine note] The owner is asking what you remember about them, but no stored memory is "
                      "available for this request. Do not call tools. Say you do not have that stored.")
 RECALL_NOTHING = "I don't have anything stored about that yet."
@@ -161,17 +163,27 @@ RECALL_NO_ANSWER = "I don't have that stored."
 _ADDRESS = re.compile(r"^\s*(?:(?:hey|hi|ok|okay)[\s,]+)?(?:v\.?o\.?i\.?d|void)\b[\s,:.!]*", re.IGNORECASE)
 
 
+_ACRONYM = re.compile(r"\b(?:[A-Za-z]\.){2,}[A-Za-z]?")          # "V.O.I.D" -> "VOID" (its "I" is not the pronoun)
+# "what/who is X", "tell me about X": a question ABOUT something. Only memory-first when a memory really mentions it.
+_ENTITY = re.compile(_LEAD + r"(?:(?:what|who)\s+(?:is|are|was|were)\b|tell\s+me\s+about\b)", re.IGNORECASE)
+_TELL_ME = re.compile(r"\btell\s+me\b", re.IGNORECASE)             # the "me" in "tell me" is not a statement about the owner
+
+
 def classify_recall(goal: str) -> str | None:
-    """'explicit' | 'personal' | None. Deterministic, content-free and side-effect free."""
+    """'explicit' | 'personal' | 'entity' | None. Deterministic, content-free and side-effect free."""
     if not isinstance(goal, str) or not goal.strip() or len(goal) > 400:
         return None
+    goal = _ACRONYM.sub(lambda m: m.group().replace(".", ""), goal)
     goal = _ADDRESS.sub("", goal, count=1)
     if _EXPLICIT.match(goal):
         # A recall question may still be followed by a real request ("...and open it").
         return None if _COMPOUND_ACTION.search(goal) else "explicit"
-    if (_PERSONAL.match(goal) and _FIRST_PERSON.search(goal)
-            and not _ACTION.search(goal) and not _TOOL_NOUN.search(goal)):
+    if _ACTION.search(goal) or _TOOL_NOUN.search(goal):
+        return None
+    if _PERSONAL.match(goal) and _FIRST_PERSON.search(_TELL_ME.sub("", goal)):
         return "personal"
+    if _ENTITY.match(goal):
+        return "entity"
     return None
 
 

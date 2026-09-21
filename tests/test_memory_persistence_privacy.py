@@ -153,7 +153,8 @@ def test_with_no_memory_at_all_nothing_is_redacted(tmp_path):
 def test_a_memory_first_turn_without_a_stored_match_is_not_redacted(tmp_path):
     """No memory reached the model, so there is nothing to protect: the answer is stored normally."""
     a, p, _ = sandbox(tmp_path)
-    a.run("Remember that I prefer dark mode")
+    for i in range(6):                                                                   # more than the small-store limit
+        a.run(f"Remember that unrelated note number {i} mentions topic{i}")
     res = a.run("What did I tell you about my medication?")                              # explicit recall, no hit
     assert res.result == intent.RECALL_NOTHING and a.store.list() == []                  # deterministic; no task at all
 

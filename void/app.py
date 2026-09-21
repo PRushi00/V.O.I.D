@@ -93,7 +93,7 @@ class Assistant:
         # Providers
         self.providers = ProviderRegistry.from_config(self.config)
 
-    def _agent(self, memory_first: bool = False) -> Agent:
+    def _agent(self, memory_first: "bool | str" = False) -> Agent:
         provider = self.providers.select()  # raises if none available
         perf.emit("route", provider=getattr(provider, "name", "unknown"), reason="select")
         return Agent(
@@ -107,10 +107,10 @@ class Assistant:
             on_event=self.on_event,
             defer_confirmation=self._confirm_fn is None,
             memory_context=self._memory_context_fn(provider, memory_first=memory_first),
-            recall_only=memory_first,
+            recall_only=bool(memory_first),
         )
 
-    def _memory_context_fn(self, provider, memory_first: bool = False):
+    def _memory_context_fn(self, provider, memory_first: "bool | str" = False):
         """Goal -> [context messages]. Sensitive / non-cloud memory is withheld whenever the
         selected provider is not the local one (unknown providers count as cloud)."""
         if self.memory is None:
@@ -119,7 +119,7 @@ class Assistant:
 
         def fn(goal: str) -> Injection:
             try:
-                block = self.memory.build_context(goal, for_cloud=for_cloud)
+                block = self.memory.build_context(goal, for_cloud=for_cloud, recent_fallback=memory_first in ("personal", "explicit"))
             except MemoryUnavailable as exc:
                 _log.warning("MEMORY_UNAVAILABLE code=%s", exc.code)   # the run proceeds without memory
                 block = None
@@ -155,10 +155,10 @@ class Assistant:
         task = Task(goal="[memory command]", id="(memory)", status=Status.COMPLETED, result=reply)
         return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0)
 
-    def _recall_route(self, goal: str) -> "AgentResult | bool":
+    def _recall_route(self, goal: str) -> "AgentResult | str | bool":
         """Memory questions are answered from memory, not by searching the machine.
 
-        Returns True for a memory-first turn (the agent is given the retrieved memory and NO tools),
+        Returns the recall kind (truthy) for a memory-first turn (the agent gets the retrieved memory and NO tools),
         an ``AgentResult`` when the owner asked what V.O.I.D remembers and nothing is stored (answered
         deterministically, no model and no tools), or False for the normal agent. Only a *narrower*
         set of capabilities is ever granted here; authorization is untouched."""
@@ -170,14 +170,14 @@ class Assistant:
             return False
         t0 = time.perf_counter()
         try:
-            hit = bool(self.memory.retrieve(goal, for_cloud=False, limit=1))
+            hit = bool(self.memory.retrieve(goal, for_cloud=False, limit=1, recent_fallback=kind != "entity"))
             pending = 0 if hit or kind != "explicit" else self.memory.pending_matches(goal)
         except MemoryUnavailable as exc:
             _log.warning("MEMORY_UNAVAILABLE code=%s", exc.code)
             return False
         perf.emit("memory", op="route", n=int(hit), duration_s=round(time.perf_counter() - t0, 6))
         if hit:
-            return True
+            return kind                             # truthy: memory-first (personal | explicit | entity)
         if kind == "explicit":                     # asked what I remember; I remember nothing relevant
             reply = memory_intent.RECALL_PENDING if pending else memory_intent.RECALL_NOTHING
             task = Task(goal="[memory recall]", id="(memory)", status=Status.COMPLETED, result=reply)

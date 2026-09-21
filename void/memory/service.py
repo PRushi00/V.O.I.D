@@ -26,7 +26,11 @@ from void.memory.store import MemoryItem, MemoryStore
 _log = logging.getLogger(__name__)
 
 DAY = 86400.0
-AMBIGUITY = 0.85            # a runner-up scoring above this fraction of the best is "not clearly one item"
+SMALL_STORE = 5             # at most this many recallable items: a lexical miss falls back to the whole store
+# Words that only say "recall" ("what do you REMEMBER about me", "what did I TELL you"): no content to match.
+_RECALL_META = frozenset(tokenize("remember remind recall recalled know knew tell told say said ask asked mention mentioned "
+                                  "store stored save saved note noted memory memories anything something everything"))
+AMBIGUITY = 0.85           # a runner-up scoring above this fraction of the best is "not clearly one item"
 
 
 @dataclass(frozen=True)
@@ -275,7 +279,8 @@ class MemoryService:
     def pending_matches(self, query: str) -> int:
         """How many awaiting-review items share a content word with ``query`` (a count only)."""
         qt = set(tokenize(query))
-        return sum(1 for it in self._store.list(("proposed",)) if it.readable and qt & set(tokenize(it.text)))
+        generic = all(t in _RECALL_META for t in qt)          # "what do you remember about me?": any pending item counts
+        return sum(1 for it in self._store.list(("proposed",)) if it.readable and (generic or qt & set(tokenize(it.text))))
 
     def show(self, item_id: str) -> tuple[MemoryItem, list[tuple]] | None:
         it = self._store.load(item_id)
@@ -289,21 +294,38 @@ class MemoryService:
             self._cache = (gen, index, items)
         return self._cache[1], self._cache[2]
 
-    def _ranked(self, query: str, *, for_cloud: bool = False) -> list[tuple[float, MemoryItem]]:
+    def _ranked(self, query: str, *, for_cloud: bool = False,
+                recent_fallback: bool = False) -> list[tuple[float, MemoryItem]]:
         qt = tokenize(query)
-        if not qt or self._store.verify() == "absent":
+        if (not qt and not recent_fallback) or self._store.verify() == "absent":
             return []
         index, items = self._active_index()
         now = self._now()
         out = []
-        for iid, s in index.score(qt).items():
+        for iid, s in (index.score(qt).items() if qt else ()):
             it = items[iid]
             if s <= self.settings.score_floor or (for_cloud and not it.cloud_ok):
                 continue
             recency = math.exp(-max(0.0, now - it.updated_at) / (180 * DAY))
             out.append((s * (1.0 + 0.1 * recency + 0.02 * min(it.use_count, 10)), it))
         out.sort(key=lambda p: (-p[0], -p[1].updated_at, p[1].id))
+        if not out and recent_fallback:
+            return self._recent_candidates(qt, items, for_cloud)
         return out
+
+    def _recent_candidates(self, qt, items, for_cloud) -> list[tuple[float, MemoryItem]]:
+        """When nothing matches lexically for a MEMORY question (opt-in, memory-first route only):
+
+        * a generic recall ("what do you remember about me?", "what did I tell you?") has no content word
+          to match, so it is answered with the most recent memories;
+        * in a tiny store (the MVP owner has a handful of memories) the whole store IS the candidate set and
+          fits the budget, so a paraphrase with no shared word ("what project am I building?" vs "...an
+          assistant for my laptop") still finds it. The model then judges relevance.
+        Ranking is untouched; this is bounded by the same 5-item / 400-token caps."""
+        pool = sorted((it for it in items.values() if not (for_cloud and not it.cloud_ok)),
+                      key=lambda it: (-it.updated_at, it.id))
+        generic = all(t in _RECALL_META for t in qt)
+        return [(0.0, it) for it in pool] if (generic or len(pool) <= SMALL_STORE) else []
 
     def _best_match(self, text: str):
         ranked = self._ranked(text)
@@ -318,17 +340,20 @@ class MemoryService:
                  if s > AMBIGUITY * top_score or (query & set(tokenize(it.text))) == top_terms]
         return top, close
 
-    def retrieve(self, query: str, *, for_cloud: bool = False, limit: int | None = None) -> list[MemoryItem]:
+    def retrieve(self, query: str, *, for_cloud: bool = False, limit: int | None = None,
+                 recent_fallback: bool = False) -> list[MemoryItem]:
         t0 = time.perf_counter()
         self._maybe_purge()
-        hits = [it for _s, it in self._ranked(query, for_cloud=for_cloud)][: min(limit or self.settings.max_items, self.settings.max_items)]
+        hits = [it for _s, it in self._ranked(query, for_cloud=for_cloud, recent_fallback=recent_fallback)][
+            : min(limit or self.settings.max_items, self.settings.max_items)]
         self._measure("retrieve", t0, len(hits))
         return hits
 
-    def build_context(self, query: str, *, for_cloud: bool = False) -> ctx.MemoryContext | None:
+    def build_context(self, query: str, *, for_cloud: bool = False,
+                      recent_fallback: bool = False) -> ctx.MemoryContext | None:
         t0 = time.perf_counter()
         self._maybe_purge()
-        hits = [it for _s, it in self._ranked(query, for_cloud=for_cloud)]
+        hits = [it for _s, it in self._ranked(query, for_cloud=for_cloud, recent_fallback=recent_fallback)]
         block = ctx.render(hits, max_items=self.settings.max_items, max_tokens=self.settings.max_tokens)
         if block is not None:
             self._store.touch_used(list(block.ids))
