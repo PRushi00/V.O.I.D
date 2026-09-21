@@ -32,6 +32,7 @@ from typing import Callable
 from void import perf
 
 from void.memory import scope as memory_scope
+from void.voice import audio_guard
 from void.voice.adapters import STTError, TTSError
 from void.voice.status_phrases import phrase_for
 from void.voice.state import VoiceCommand, VoiceEvent, VoiceState, reduce_voice
@@ -48,6 +49,7 @@ class VoiceSession:
                  on_message: Callable[[str], None] | None = None,
                  speak_response: bool = True,
                  speak_grace_seconds: float = 0.5,
+                 min_speech_ms: float = audio_guard.DEFAULT_MIN_SPEECH_MS,
                  now: Callable[[], float] | None = None):
         self._assistant = assistant
         self._ks = kill_switch
@@ -58,6 +60,7 @@ class VoiceSession:
         self._on_transcript = on_transcript or (lambda _t: None)
         self._msg = on_message or (lambda _m: None)
         self._speak_response = speak_response
+        self._min_speech_ms = min_speech_ms      # captures with less speech than this never reach STT
         self._lock = threading.RLock()
         self._state = VoiceState.IDLE
         self._generation = 0     # bumped on new session / invalidation
@@ -282,6 +285,13 @@ class VoiceSession:
         except Exception:
             n = -1
         _log.info("STT_STARTED (audio_samples=%s)", n)
+        if not audio_guard.has_enough_speech(audio, self._min_speech_ms):
+            # A sliver of speech (a clipped wake-word tail, a tap) makes Whisper invent words that would then be
+            # dispatched to the agent as a command. Treat it as "nothing was said"; return to idle.
+            _log.info("STT_SKIPPED reason=too_little_speech min_speech_ms=%s", self._min_speech_ms)
+            self._perf("stt", decode_s=0.0, empty=True, backend="audio_guard", audio_s=round(max(n, 0) / 16000.0, 3))
+            self._apply(VoiceEvent.STT_EMPTY, gen=gen)
+            return
         t0 = time.monotonic()
         try:
             transcript = self._stt.transcribe(audio)

@@ -210,8 +210,10 @@ def _rig(*, wake=None, policy=None, worker=None, stt=None, assistant=None,
     asst = assistant or FakeAssistant()
     ks = kill_switch or KillSwitch()
     cap = BrokerCapture(broker)
+    # These tests drive wake/PTT plumbing with 6-8 frame (180-240 ms) synthetic "commands" and assert exact frame
+    # counts; the pre-STT minimum-speech guard has its own tests (test_audio_guard.py), so it is off here.
     session = VoiceSession(asst, ks, capture=cap, stt=stt, tts=tts,
-                           speak_response=speak_response)
+                           speak_response=speak_response, min_speech_ms=0)
     wk = wake or ScriptedWake()
     ctrl = VoiceController(session, None, poll_interval=poll_interval,
                            worker=worker, broker=broker, wake=wk,

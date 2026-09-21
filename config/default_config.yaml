@@ -107,6 +107,8 @@ voice:
   wake_no_speech_timeout: 4.0    # seconds to wait for any speech after wake
   wake_silence_timeout: 0.8      # seconds of trailing silence that ends an utterance (snappier)
   wake_max_capture_seconds: 15.0 # hard cap on one wake-initiated capture
+  min_speech_ms: 250             # a capture with less speech than this (a clipped wake-word tail, a tap) never
+                                 # reaches STT/the agent: Whisper invents words from slivers. 0 disables the guard
   wake_rearm_delay_ms: 500       # settle time (post TTS/command) before re-arming wake
   wake_energy_threshold: 500     # int16 RMS at/above which a frame counts as speech
   wake_lead_grace_s: 0.4         # after wake, keep the command window open this long before

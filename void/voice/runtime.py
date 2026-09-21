@@ -32,6 +32,7 @@ _log = logging.getLogger("void.voice.runtime")
 
 from void import perf
 from void.perf import health as perf_health
+from void.voice import audio_guard
 from void.voice.adapters import (
     BrokerCapture, FasterWhisperSTT, PTTActivation,
 )
@@ -149,6 +150,14 @@ class _WakePolicy:
             energy_threshold=_num("voice.wake_energy_threshold", 500.0, 0.0),
             lead_grace_s=_num("voice.wake_lead_grace_s", 0.4, 0.0),
         )
+
+
+def _min_speech_ms(config) -> float:
+    """``voice.min_speech_ms`` (0 disables the pre-STT guard); a bad value keeps the safe default."""
+    try:
+        return max(0.0, float(config.get("voice.min_speech_ms", audio_guard.DEFAULT_MIN_SPEECH_MS)))
+    except (TypeError, ValueError):
+        return float(audio_guard.DEFAULT_MIN_SPEECH_MS)
 
 
 def _rms_int16(frame: bytes) -> float:
@@ -308,6 +317,7 @@ class VoiceController:
             on_state=on_state, on_transcript=on_transcript,
             on_message=on_message,
             speak_response=config.get("voice.speak_responses", True),
+            min_speech_ms=_min_speech_ms(config),
         )
         wake = cls._build_wake(config)
         worker = _SerialVoiceWorker()
