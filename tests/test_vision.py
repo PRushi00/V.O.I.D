@@ -537,15 +537,25 @@ def test_a_look_reports_the_frame_and_that_nothing_was_sent(clock, audit, monkey
     assert "640x480" in out.summary
 
 
-def test_a_look_never_claims_to_know_what_is_in_the_picture(clock, audit, monkeypatch):
-    """The honesty requirement for this domain: no local vision model exists, so no description is given."""
+def test_a_look_never_invents_a_description(clock, audit, monkeypatch):
+    """The honesty requirement for this domain, restated now that cloud analysis exists.
+
+    This test used to assert the summary said "needs a vision model" whether or not cloud analysis was
+    permitted, because no vision model was wired up at all. That is no longer true: with
+    ``allow_cloud_analysis`` on and a vision provider reachable, V.O.I.D really does describe the picture.
+    What must NEVER change is the part this test is actually for - when no analysis happened, for any
+    reason, no description is produced and the reason is stated. Both paths below have no provider, so
+    neither may describe anything.
+    """
     monkeypatch.setattr(camera_backend, "_cv2", lambda: FakeCv2())
     for cloud in (False, True):
-        actions = _actions(clock, audit, allow_cloud_analysis=cloud)
+        actions = _actions(clock, audit, allow_cloud_analysis=cloud)   # no providers wired
         actions.enable_camera()
         out = actions.look()
-        assert "needs a vision model" in out.summary, cloud
         assert out.data["sent_to_cloud"] is False, cloud
+        assert "description" not in out.data, f"a description appeared with no provider ({cloud})"
+        assert ("needs a vision model" in out.summary
+                or "could not describe it" in out.summary), out.summary
 
 
 def test_a_look_with_egress_switched_off_says_why_it_cannot_describe(clock, audit, monkeypatch):

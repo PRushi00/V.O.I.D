@@ -52,8 +52,32 @@ class ProviderUnavailable(RuntimeError):
     """Raised when a provider cannot serve a request (no key, offline, ...)."""
 
 
+class VisionUnsupported(ProviderUnavailable):
+    """Raised when a provider is asked to look at an image and cannot.
+
+    A subclass of :class:`ProviderUnavailable` on purpose: every caller that already handles "this provider
+    cannot serve this request" handles this too, without a new failure path.
+    """
+
+
+class VisionBusy(ProviderUnavailable):
+    """The vision model was reachable but temporarily overloaded. Asking again later may well work.
+
+    Distinct from :class:`VisionUnsupported` (which never works) and from a bare failure (which may be
+    anything) because the two deserve different things said to the owner: "this cannot be done" against
+    "the service is busy, try again in a moment". Measured during development: Gemini returns 503
+    UNAVAILABLE with "experiencing high demand" for exactly this, intermittently, on requests whose format
+    is otherwise accepted.
+    """
+
+
 class LLMProvider(ABC):
     name: str = "base"
+
+    #: Whether this provider can be asked to describe an image. False by default, so a provider is
+    #: text-only until it says otherwise - adding vision to the interface must not quietly imply that
+    #: every existing provider has it. Nothing infers this from a model name: it is declared in code.
+    supports_vision: bool = False
 
     @abstractmethod
     def available(self) -> bool:
@@ -66,3 +90,17 @@ class LLMProvider(ABC):
         tools: list[ToolSpec] | None = None,
     ) -> LLMResponse:
         """Produce the next assistant turn (text and/or tool calls)."""
+
+    def describe_image(self, image: bytes, mime_type: str, prompt: str) -> LLMResponse:
+        """Describe one image in words. Optional: a text-only provider raises.
+
+        Deliberately NOT abstract. Making it abstract would force every provider - OpenAI, Ollama,
+        AgentRouter - to implement or stub a capability it may not have, which is a lot of change for one
+        feature and invites a stub that silently drops the image and describes nothing. A provider that
+        does not override this declares ``supports_vision = False`` and raises here, and the caller is
+        expected to check the flag rather than discover it from an exception.
+
+        This is a one-shot request with no conversation and no tools: an image description must not be
+        able to ask for an action. Implementations pass no tool declarations.
+        """
+        raise VisionUnsupported(f"The '{self.name}' provider cannot analyse images.")

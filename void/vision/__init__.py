@@ -118,6 +118,7 @@ class CameraGate:
         self._audit = on_audit or (lambda line: _log.info("CAMERA %s", line))
         self._active_until: float | None = None
         self._captures = 0
+        self._cloud_calls = 0
 
     @property
     def policy(self) -> CameraPolicy:
@@ -200,6 +201,27 @@ class CameraGate:
         self._audit(f"CAPTURE #{self._captures}"
                     + (f" ({remaining:.0f}s left in session)" if remaining is not None else ""))
 
+    def note_cloud_analysis(self, sent_bytes: int, *, ok: bool) -> None:
+        """Record that one frame left this machine for a cloud vision model.
+
+        The single most privacy-significant thing the camera can do, so it gets its own audit line and its
+        own telemetry event rather than being folded into the capture. Called by the capability layer after
+        the bytes have actually gone, so the record describes what happened and not what was intended -
+        ``ok`` says whether an answer came back, but the egress is recorded either way.
+
+        Counts only: the number of bytes and whether it worked. There is no field here that could carry the
+        image, the description, or what the owner asked about it.
+        """
+        self._cloud_calls += 1
+        perf.emit("camera", op="cloud_analysis", state=self.state, captures=self._captures,
+                  cloud=True, bytes_sent=int(sent_bytes))
+        self._audit(f"CLOUD_ANALYSIS #{self._cloud_calls} sent={int(sent_bytes)}B answered={bool(ok)}")
+
+    @property
+    def cloud_calls(self) -> int:
+        """How many frames have been sent to a cloud vision model through this gate."""
+        return self._cloud_calls
+
     def status(self) -> dict:
         """A description of the gate for the owner: state, time left, and what is permitted."""
         return {"state": self.state,
@@ -208,4 +230,5 @@ class CameraGate:
                                       if self.seconds_remaining is not None else None),
                 "session_timeout_s": self._policy.session_timeout_s,
                 "cloud_analysis_allowed": self._policy.allow_cloud_analysis,
-                "captures_this_session": self._captures}
+                "captures_this_session": self._captures,
+                "cloud_analyses_this_session": self._cloud_calls}

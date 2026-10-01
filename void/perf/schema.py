@@ -88,9 +88,12 @@ EVENTS: dict[str, dict[str, object]] = {
     # V2 camera (domain 5). The audit trail for a device that points at the owner: every activation, every
     # lapse and every frame. ``op`` and ``state`` are enumerations and ``session_s`` is a duration - there
     # is no field here that could carry an image, a description, or what the owner asked about it.
-    "camera": {"op": _enum("activate", "deactivate", "expire", "capture", "denied"),
+    "camera": {"op": _enum("activate", "deactivate", "expire", "capture", "denied", "cloud_analysis"),
                "state": _enum("disabled", "off", "active"), "session_s": _float,
-               "captures": _int, "cloud": _bool},
+               "captures": _int, "cloud": _bool,
+               # How many bytes of image left the machine. A COUNT: the allowlist has no field that could
+               # carry the image itself, the description, or the owner's question about it.
+               "bytes_sent": _int},
     # V2 conversation mode (domain 4). Counts and reasons only, never a transcript: this is how the
     # fast-vs-safe question "do follow-up windows actually get used, or do they mostly lapse?" becomes
     # answerable from real use rather than from an assumption.

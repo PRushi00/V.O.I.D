@@ -108,7 +108,12 @@ class Assistant:
         # Camera (V2 domain 5). Registered always, but the gate is deny-by-default: while
         # camera.enabled is false every one of these tools refuses, so registration grants nothing.
         # See void/vision/__init__.py for the four independent controls.
-        self.vision = VisionActions(config=self.config)
+        # ``providers`` is a callable because the registry is built further down: resolving it lazily keeps
+        # the construction order free and means the camera asks for a vision provider only if an image is
+        # actually about to be sent. It is only ever asked for a VISION-capable one.
+        self.vision = VisionActions(config=self.config,
+                                    providers=lambda: getattr(self, "providers", None),
+                                    kill_switch=self.kill_switch)
         self.tools.register_all(self.vision.tools())
 
         # Persistent memory (V2.0). Lazy: no file and no key exist until the first write.

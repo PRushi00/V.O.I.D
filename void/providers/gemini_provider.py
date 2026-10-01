@@ -24,6 +24,7 @@ from void.providers.base import (
     ProviderUnavailable,
     ToolCall,
     ToolSpec,
+    VisionBusy,
 )
 from void.security import secrets
 from void.security.credentials import (
@@ -266,12 +267,24 @@ def _cooldown_until(now: datetime, base_seconds: int,
 
 class GeminiProvider(LLMProvider):
     name = "gemini"
+    #: Gemini is multimodal, so this provider can be asked to look at an image (see describe_image).
+    #: Declared in code, never inferred from the configured model name.
+    supports_vision = True
 
     def __init__(self, model: str = "gemini-1.5-flash",
                  temperature: float = 0.2, max_output_tokens: int = 2048,
                  credential_pool: CredentialPool | None = None,
-                 timeout_s: float = DEFAULT_TIMEOUT_S, thinking=None):
+                 timeout_s: float = DEFAULT_TIMEOUT_S, thinking=None,
+                 vision_model: str | None = None):
         self.model = model
+        #: The model used for IMAGE requests, which defaults to the text model.
+        #:
+        #: Separate because image requests behave differently from text ones in a way that was measured
+        #: rather than assumed: on this machine's credential, text on the configured model succeeded while
+        #: an image on the same model returned 429 RESOURCE_EXHAUSTED, because an image costs far more
+        #: tokens than a sentence. Pointing vision at its own model lets the camera work without changing
+        #: the owner's text brain. Leave it unset and the text model is used, exactly as before.
+        self.vision_model = vision_model or model
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
         self.timeout_s = normalise_timeout(timeout_s)
@@ -502,6 +515,55 @@ class GeminiProvider(LLMProvider):
         """
         system, contents = self._to_contents(messages)
         config = self._generate_config(system, tools)
+        return self._call(contents, config)
+
+    def describe_image(self, image: bytes, mime_type: str, prompt: str) -> LLMResponse:
+        """Describe one image in words. One request, no conversation, no tools.
+
+        Reuses :meth:`_call`, so an image request gets exactly the same credential rotation, quota
+        cooling, timeout and error classification as a text request - there is no second transport here.
+
+        Three things are deliberately different from :meth:`generate`:
+
+        * **No tool declarations.** ``_generate_config(system, None)`` means the model has nothing to call,
+          so a description cannot become an action however the image or the prompt is phrased.
+        * **Any tool call in the response is dropped.** Belt as well as braces: if a future model returned
+          one unprompted, this must not hand it to the agent.
+        * **The image never appears in an error.** Failures are classified by :meth:`_call` from the
+          exception type, and the bytes are not interpolated into any message.
+        """
+        genai, types = self._sdk()
+        if not isinstance(image, (bytes, bytearray)) or not image:
+            raise ProviderUnavailable("There is no image to describe.")
+        if not isinstance(mime_type, str) or not mime_type.startswith("image/"):
+            raise ProviderUnavailable("That is not an image type Gemini can be asked to look at.")
+        contents = [types.Content(role="user", parts=[
+            types.Part.from_bytes(data=bytes(image), mime_type=mime_type),
+            types.Part(text=str(prompt or "")),
+        ])]
+        try:
+            response = self._call(contents, self._generate_config(None, None),
+                                  model=self.vision_model)
+        except Exception as exc:                                # noqa: BLE001
+            # A text turn leaves 5xx to the agent's bounded retry loop. A camera look is a single tool
+            # call with no such loop, so an overloaded model would otherwise read to the owner as a
+            # broken feature. Classified with the SAME classifier text requests use, not a second one.
+            if classify_failure(exc) == "server":
+                raise VisionBusy(
+                    "the vision model is busy right now - worth asking again in a moment") from exc
+            raise
+        if response.tool_calls:
+            _log.info("GEMINI_VISION_TOOL_CALL_DROPPED n=%d", len(response.tool_calls))
+            response.tool_calls = []
+        return response
+
+    def _call(self, contents, config, model: str | None = None) -> LLMResponse:
+        """One Gemini request, rotating credentials on quota/auth failures.
+
+        Extracted from :meth:`generate` unchanged so that image requests share it. Everything about the
+        rotation, cooling, classification and fail-fast behaviour is the same code path both kinds of
+        request go through; nothing here knows or cares whether ``contents`` holds an image.
+        """
         pool = self._pool()
         last_exc: Exception | None = None
 
@@ -528,7 +590,7 @@ class GeminiProvider(LLMProvider):
 
             try:
                 response = client.models.generate_content(
-                    model=self.model, contents=contents, config=config)
+                    model=model or self.model, contents=contents, config=config)
                 return self._parse(response)
             except Exception as exc:
                 failure = classify_failure(exc)
@@ -540,7 +602,7 @@ class GeminiProvider(LLMProvider):
                         f"Gemini did not answer within {self.timeout_s:g}s.") from exc
                 if failure == "not_found":
                     raise ProviderUnavailable(
-                        f"The Gemini model '{self.model}' was not found.") from exc
+                        f"The Gemini model '{model or self.model}' was not found.") from exc
                 if failure == "invalid_request":
                     raise ProviderUnavailable("Gemini rejected the request as invalid.") from exc
                 if kind == "quota":

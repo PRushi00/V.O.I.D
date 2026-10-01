@@ -48,6 +48,9 @@ class ProviderRegistry:
                 credential_pool=CredentialPool(),
                 timeout_s=cfg.get("llm.gemini.timeout_s", DEFAULT_TIMEOUT_S),
                 thinking=cfg.get("llm.gemini.thinking", None),
+                # Empty/unset means "use llm.gemini.model". See GeminiProvider.vision_model for why
+                # image requests get their own setting.
+                vision_model=cfg.get("llm.gemini.vision_model", None) or None,
             ),
             "local": LocalProvider(
                 base_url=cfg.get("llm.local.base_url", "http://localhost:11434"),
@@ -85,6 +88,31 @@ class ProviderRegistry:
             if provider.available():
                 return configured[i:]
         return []
+
+    def vision(self) -> LLMProvider:
+        """The first available provider that can actually look at an image, in the configured order.
+
+        Separate from :meth:`select` because the ordinary fallback chain is the wrong behaviour here, and
+        dangerously so. ``llm.primary`` defaults to a text-only provider on this machine, and a fallback
+        that quietly accepted an image request would either drop the image and describe nothing, or
+        describe it from the prompt alone - a confident answer about a picture it never saw. So this
+        filters on the declared ``supports_vision`` capability and raises if none of the configured
+        providers has it. It never substitutes a text provider, and it never sends an image to a provider
+        that did not declare it can receive one.
+        """
+        considered: list[str] = []
+        for name in self._order:
+            provider = self._providers.get(name)
+            if provider is None or not getattr(provider, "supports_vision", False):
+                continue
+            considered.append(name)
+            if provider.available():
+                return provider
+        if not considered:
+            raise ProviderUnavailable(
+                "None of the configured providers can analyse an image.")
+        raise ProviderUnavailable(
+            f"No provider that can analyse an image is available. Tried: {', '.join(considered)}.")
 
     def select(self) -> LLMProvider:
         """Return the first available provider in priority order."""

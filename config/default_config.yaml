@@ -33,6 +33,13 @@ llm:
 
   gemini:
     model: "gemini-3.8-flash"
+    # The model used for IMAGE requests (camera.allow_cloud_analysis). Separate from `model` on evidence,
+    # not on principle: measured 2026-10-01 on this machine's credential, a TEXT request to
+    # gemini-3.8-flash succeeded while an IMAGE request to the same model returned 429
+    # RESOURCE_EXHAUSTED, because one photograph costs far more tokens than a sentence. Pointing vision at
+    # its own model lets the camera work without changing the text brain. gemini-3.5-flash was verified to
+    # describe a test image correctly and to have quota headroom. Leave EMPTY to use `model` above.
+    vision_model: "gemini-3.5-flash"
     # API key is NOT stored here. It is read from the OS secret store under
     # service="void", key="gemini_api_key". Set it with:
     #   python -m void set-key gemini
@@ -129,9 +136,17 @@ camera:
   enabled: false                 # master switch. false = V.O.I.D cannot use the camera at all.
   session_timeout_s: 120         # an activation lapses after this; there is no permanent "on".
                                  # Clamped to 5..600s on load.
-  allow_cloud_analysis: false     # a SEPARATE decision from looking locally: may a frame leave this
-                                 # machine for a cloud vision model? Default no. When a frame is ever
-                                 # sent, the spoken answer says so.
+  allow_cloud_analysis: false    # a SEPARATE decision from looking locally: may a frame leave this
+                                 # machine for a cloud vision model? Default NO. Having permission to use
+                                 # the camera does not authorize sending the picture anywhere: every frame
+                                 # re-checks this, the kill switch, and that the session is still valid,
+                                 # immediately before any bytes leave. When a frame IS sent, the spoken
+                                 # answer says so, an audit line records it, and a `camera` telemetry
+                                 # event with op=cloud_analysis records how many bytes went.
+                                 # Only a provider that DECLARES it can analyse images is ever used -
+                                 # there is no fallback to a text-only model with the image dropped.
+                                 # Requires a configured Gemini credential; with none, V.O.I.D says so
+                                 # rather than guessing at the picture.
   device_index: 0                # which camera, when the machine has several
   max_width: 640                 # frames are downscaled to this width before anything looks at them:
                                  # less incidental detail in the background, less to send if sent.
