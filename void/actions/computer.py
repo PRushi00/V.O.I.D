@@ -18,13 +18,23 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import logging
 import os
+import re
 import sys
+import threading
+import time
 import uuid
 from dataclasses import dataclass
 
+from void.actions.app_names import (
+    MIN_SOUND_KEY, canonical_query, is_prefix, normalise, sound_key, tokens, without_publisher,
+    without_qualifier,
+)
 from void.actions.base import Tool, ToolResult
 from void.security.risk import RiskLevel
+
+_log = logging.getLogger("void.apps")
 
 _MAX_RESULTS = 25
 _HARD_MAX = 50
@@ -42,8 +52,25 @@ class ComputerBackendError(RuntimeError):
 
 class WindowsBackend:
     def discover_apps(self) -> list[dict]:
-        """Return launchable apps: [{'name','kind'('exe'|'lnk'),'target'}]."""
+        """Return launchable apps: [{'name','kind'('exe'|'lnk'|'uwp'),'target'}]."""
         raise NotImplementedError
+
+    def discovery_fingerprint(self) -> str | None:
+        """A cheap value that CHANGES when the installed applications may have changed, or None.
+
+        The catalog uses it to avoid a full rediscovery it does not need: rebuilding costs a few hundred
+        milliseconds, reading this costs a few. None means "no cheap signal available", and the catalog then
+        falls back to rebuilding on its ordinary schedule.
+        """
+        return None
+
+    def shortcut_target(self, path: str) -> str | None:
+        """What a Start-Menu shortcut points at, or None when it cannot be determined.
+
+        None means "unknown", never "missing": a backend that cannot read shortcuts must not cause working
+        applications to be refused.
+        """
+        return None
 
     def launch(self, kind: str, target: str) -> None:
         raise NotImplementedError
@@ -140,14 +167,108 @@ class RealWindowsBackend(WindowsBackend):
         apps.extend(self._app_paths())
         apps.extend(self._start_menu())
         apps.extend(self._path_aliases())
+        # Store/UWP apps last, and only under a name no path-based source already claimed: they are the apps the
+        # scans above CANNOT represent (no .exe, no .lnk - "Open WhatsApp" simply found nothing), but a duplicate
+        # name would turn an exact match into an ambiguous one and stop that command fast-pathing.
+        apps.extend(self._store_apps({str(a.get("name", "")).strip().lower() for a in apps}))
         return apps
+
+    @staticmethod
+    def _store_apps(existing_names: set) -> list[dict]:
+        """Store apps from the shell AppsFolder namespace, as {'name','kind':'uwp','target': AppUserModelID}.
+
+        Read-only enumeration through the same pywin32 stack the backend already uses; nothing is installed, changed
+        or downloaded. Entries whose target is a plain path (classic apps, which also appear here) are skipped - the
+        registry/Start-Menu scans already cover those with a real, stat-able target.
+        """
+        try:
+            import pythoncom
+            import win32com.client
+        except ImportError:                                  # pragma: no cover - env dependent
+            return []
+        try:
+            pythoncom.CoInitialize()
+        except Exception:                                    # noqa: BLE001 - already initialised on this thread
+            pass
+        out: list[dict] = []
+        try:
+            folder = win32com.client.Dispatch("Shell.Application").NameSpace("shell:AppsFolder")
+            if folder is None:
+                return []
+            for item in folder.Items():
+                try:
+                    name = str(item.Name or "").strip()
+                    target = str(item.Path or "").strip()
+                except Exception:                            # noqa: BLE001 - one odd shell item must not kill discovery
+                    continue
+                if not name or not is_app_user_model_id(target):
+                    continue
+                if name.lower() in existing_names:
+                    continue
+                existing_names.add(name.lower())
+                out.append({"name": name, "kind": "uwp", "target": target})
+        except Exception:                                    # noqa: BLE001 - discovery is best-effort
+            return out
+        return out
+
+    def shortcut_target(self, path: str) -> str | None:
+        try:
+            import pythoncom            # noqa: F401 - imported for its side effect of initialising COM
+            import win32com.client
+        except ImportError:                                  # pragma: no cover - env dependent
+            return None
+        try:
+            target = win32com.client.Dispatch("WScript.Shell").CreateShortCut(path).Targetpath
+        except Exception:                                    # noqa: BLE001 - unreadable shortcut: simply unknown
+            return None
+        return str(target).strip() or None
+
+    def discovery_fingerprint(self) -> str | None:
+        """Directory mtimes of the Start Menu trees + the App Paths key counts.
+
+        Installing or removing a desktop application writes into one of these, so the pair detects the change
+        without re-reading every shortcut. Measured on the owner's machine: ~7 ms, against ~370 ms for a full
+        rediscovery. Store apps are not covered (they touch neither), which is why a lookup that finds NOTHING
+        also forces a real rebuild - see ``AppCatalog.resolve_name``.
+        """
+        h = hashlib.sha1()
+        try:
+            for d in self._start_menu_dirs():
+                for root, _dirs, files in os.walk(d):
+                    try:
+                        h.update(f"{root}|{os.stat(root).st_mtime_ns}|{len(files)}".encode("utf-8", "replace"))
+                    except OSError:
+                        continue
+            import winreg
+            for hive, sub_key in ((winreg.HKEY_LOCAL_MACHINE, _APP_PATHS_KEY),
+                                  (winreg.HKEY_CURRENT_USER, _APP_PATHS_KEY)):
+                try:
+                    key = winreg.OpenKey(hive, sub_key)
+                except OSError:
+                    continue
+                try:
+                    h.update(f"|{winreg.QueryInfoKey(key)[0]}".encode("ascii"))
+                finally:
+                    winreg.CloseKey(key)
+        except Exception:                                    # noqa: BLE001 - a signal that fails is simply absent
+            return None
+        return h.hexdigest()
+
+    @staticmethod
+    def _start_menu_dirs() -> list[str]:
+        return [d for d in (
+            os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
+                         r"Microsoft\Windows\Start Menu\Programs"),
+            os.path.join(os.environ.get("APPDATA", ""),
+                         r"Microsoft\Windows\Start Menu\Programs"),
+        ) if d and os.path.isdir(d)]
 
     @staticmethod
     def _app_paths() -> list[dict]:
         import winreg
         out: list[dict] = []
-        roots = [(winreg.HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\App Paths"),
-                 (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\App Paths")]
+        roots = [(winreg.HKEY_LOCAL_MACHINE, _APP_PATHS_KEY),
+                 (winreg.HKEY_CURRENT_USER, _APP_PATHS_KEY)]
         for hive, sub in roots:
             try:
                 key = winreg.OpenKey(hive, sub)   # read-only (KEY_READ default)
@@ -177,19 +298,11 @@ class RealWindowsBackend(WindowsBackend):
                 winreg.CloseKey(key)
         return out
 
-    @staticmethod
-    def _start_menu() -> list[dict]:
+    @classmethod
+    def _start_menu(cls) -> list[dict]:
         import glob
-        dirs = [
-            os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
-                         r"Microsoft\Windows\Start Menu\Programs"),
-            os.path.join(os.environ.get("APPDATA", ""),
-                         r"Microsoft\Windows\Start Menu\Programs"),
-        ]
         out: list[dict] = []
-        for d in dirs:
-            if not d or not os.path.isdir(d):
-                continue
+        for d in cls._start_menu_dirs():
             for lnk in glob.glob(os.path.join(d, "**", "*.lnk"), recursive=True):
                 name = os.path.splitext(os.path.basename(lnk))[0]
                 out.append({"name": name, "kind": "lnk", "target": lnk})
@@ -211,6 +324,13 @@ class RealWindowsBackend(WindowsBackend):
     def launch(self, kind: str, target: str) -> None:
         if kind == "lnk":
             os.startfile(target)  # type: ignore[attr-defined]  # Windows resolves
+        elif kind == "uwp":
+            if not is_app_user_model_id(target):             # never reachable from a catalog entry; fail closed anyway
+                raise ComputerBackendError("refusing to launch a malformed application id")
+            import subprocess
+            # The documented way to start a Store app: explorer resolves the AppsFolder item. Two fixed argv
+            # elements, no shell, and the id was format-checked above.
+            subprocess.Popen(["explorer.exe", "shell:AppsFolder\\" + target])
         else:
             import subprocess
             subprocess.Popen([target])   # no shell, resolved exe path
@@ -279,6 +399,9 @@ class RealWindowsBackend(WindowsBackend):
             return False
 
 
+_APP_PATHS_KEY = r"Software\Microsoft\Windows\CurrentVersion\App Paths"
+
+
 def make_backend() -> WindowsBackend:
     return RealWindowsBackend() if sys.platform.startswith("win") else NullBackend()
 
@@ -293,48 +416,245 @@ class AppEntry:
     target: str    # engine-owned validated path; never model-supplied
 
 
+# A Microsoft Store app has no file path: it is launched by AppUserModelID. Only this exact shape is ever accepted,
+# so a target coming out of the shell namespace can never carry a switch, a space-separated second argument, a path
+# separator or a quote into the launcher.
+_AUMID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}![A-Za-z0-9._-]{1,64}$")
+
+
+def is_app_user_model_id(target: object) -> bool:
+    """True for a well-formed Store AppUserModelID (``Publisher.App_hash!Entry``)."""
+    return isinstance(target, str) and bool(_AUMID_RE.match(target))
+
+
 def _make_app_id(kind: str, target: str) -> str:
     h = hashlib.sha1(f"{kind}|{os.path.normcase(target)}".encode("utf-8")).hexdigest()
     return "app-" + h[:16]
 
 
+# How much a launch identity is TRUSTED when the same application was found by several sources. A Start-Menu
+# shortcut is what Windows itself offers the user - it carries the working directory, arguments and icon the
+# publisher intended - so it is preferred over a bare executable found in the registry or on PATH.
+_SOURCE_RANK = {"lnk": 0, "uwp": 1, "exe": 2}
+
+
+def _identity(name: str, kind: str, target: str) -> tuple[str, str]:
+    """What makes two discovered records the SAME installed application.
+
+    Same normalised display name AND same program: for a path that is its filename without extension
+    (``Discord.lnk`` in two Start-Menu folders, ``Excel.lnk`` beside ``EXCEL.EXE``), for a Store app its
+    AppUserModelID. Two different programs that merely share a display name do NOT collapse - they stay a genuine
+    ambiguity that nothing is allowed to guess between.
+    """
+    if kind == "uwp":
+        program = target.strip().lower()
+    else:
+        program = normalise(os.path.splitext(os.path.basename(target))[0])
+    return normalise(name), program
+
+
+def _preference(entry: "AppEntry") -> tuple:
+    """Sort key picking one launch identity out of a group. Fully deterministic, never arbitrary."""
+    t = os.path.normcase(entry.target)
+    # A Startup-folder shortcut is a copy meant for logon (sometimes with extra switches): the ordinary entry wins.
+    startup = 1 if (os.sep + "startup" + os.sep) in t else 0
+    return (_SOURCE_RANK.get(entry.kind, 9), startup, t.count(os.sep), t)
+
+
+@dataclass(frozen=True)
+class NameMatch:
+    """Outcome of resolving a spoken/typed application name against the catalog.
+
+    Exactly one of these is true: ``entry`` is set (one application, safe to launch), or ``candidates`` holds the
+    several applications that matched equally well (the caller must ASK, never pick), or neither (no match).
+    """
+    entry: "AppEntry | None" = None
+    candidates: tuple = ()
+    tier: str = ""            # exact | spacing | prefix | publisher   ("" when nothing matched)
+    reason: str = ""          # "" resolved | ambiguous | unknown
+
+
 class AppCatalog:
     """Engine-owned map of app_id -> validated application metadata.
 
-    Built lazily from the backend's deterministic discovery. The LLM only ever
-    sees/uses ``app_id`` (an opaque token); it cannot supply an executable path
-    as authority.
+    Built from the backend's deterministic discovery and kept fresh automatically: nobody edits a list of
+    applications, and an application installed after V.O.I.D started still resolves. The LLM only ever
+    sees/uses ``app_id`` (an opaque token); it cannot supply an executable path as authority.
     """
 
-    def __init__(self, backend: WindowsBackend):
+    #: How long a built catalog is trusted without even checking for change.
+    DEFAULT_TTL_S = 600.0
+    #: A lookup that matched NOTHING may check the cheap change signal, but not more often than this.
+    MIN_REBUILD_S = 15.0
+    #: ... and may pay for a full rediscovery it has no signal for (a Store install) only this often.
+    MIN_BLIND_REBUILD_S = 300.0
+
+    def __init__(self, backend: WindowsBackend, ttl_s: float = DEFAULT_TTL_S,
+                 clock=time.monotonic):
         self._backend = backend
+        self._ttl_s = float(ttl_s)
+        self._clock = clock
         self._entries: list[AppEntry] | None = None
         self._by_id: dict[str, AppEntry] = {}
+        self._by_norm: dict[str, list[AppEntry]] = {}
+        self._by_squash: dict[str, list[AppEntry]] = {}
+        self._by_publisher: dict[str, list[AppEntry]] = {}
+        self._by_sound: dict[str, list[AppEntry]] = {}
+        self._words: list[tuple[tuple[str, ...], AppEntry]] = []
+        # Discovery is ~1.6 s here and the startup prewarm runs alongside the first command, so a second
+        # caller waits for the build in flight rather than starting its own. Reentrant because _ensure and
+        # _rebuild both take it. READS are never guarded - the fast path is 0.02 ms and stays that way.
+        self._build_lock = threading.RLock()
+        self._built_at = 0.0        # when the content was discovered
+        self._checked_at = 0.0      # when freshness was last confirmed
+        self._fingerprint: str | None = None
+        self.builds = 0                      # observable by tests/telemetry; not used for any decision
 
+    # -- lifecycle ------------------------------------------------------
     def _build(self) -> None:
-        entries: list[AppEntry] = []
+        """Discover, de-duplicate to one entry per installed application, and index for fast lookup."""
         by_id: dict[str, AppEntry] = {}
+        groups: dict[tuple[str, str], list[AppEntry]] = {}
+        order: list[tuple[str, str]] = []
         seen: set = set()
         for r in self._backend.discover_apps():
             kind = r.get("kind", "exe")
             target = r.get("target", "")
             name = r.get("name", "")
-            if not target or not name:
+            if not target or not name or not isinstance(target, str) or not isinstance(name, str):
                 continue
             key = (kind, os.path.normcase(target))
             if key in seen:
                 continue
             seen.add(key)
-            aid = _make_app_id(kind, target)
-            entry = AppEntry(aid, name, kind, target)
-            entries.append(entry)
-            by_id[aid] = entry
-        self._entries = entries
-        self._by_id = by_id
+            entry = AppEntry(_make_app_id(kind, target), name, kind, target)
+            by_id[entry.app_id] = entry     # every discovered record stays resolvable by its own id
+            ident = _identity(name, kind, target)
+            if ident not in groups:
+                groups[ident] = []
+                order.append(ident)
+            groups[ident].append(entry)
 
-    def entries(self) -> list[AppEntry]:
-        if self._entries is None:
+        entries = [min(groups[k], key=_preference) for k in order]
+        # Built into locals and published in one step below. A reader that arrives mid-rebuild must never see a
+        # complete-looking catalog with an empty index: that lookup would miss an installed application, and a
+        # miss is now answered with "I can't find it on this machine" - a wrong answer rather than a slow one.
+        by_norm: dict[str, list[AppEntry]] = {}
+        by_squash: dict[str, list[AppEntry]] = {}
+        by_publisher: dict[str, list[AppEntry]] = {}
+        by_sound: dict[str, list[AppEntry]] = {}
+        words_index: list[tuple[tuple[str, ...], AppEntry]] = []
+        for e in entries:
+            words = tokens(e.name)
+            if not words:
+                continue
+            by_norm.setdefault(" ".join(words), []).append(e)
+            by_squash.setdefault("".join(words), []).append(e)
+            words_index.append((words, e))
+            stripped = without_publisher(words)
+            if stripped:
+                by_publisher.setdefault(" ".join(stripped), []).append(e)
+            key = sound_key(e.name)
+            if len(key) >= MIN_SOUND_KEY:
+                by_sound.setdefault(key, []).append(e)
+        self._by_norm, self._by_squash, self._by_publisher = by_norm, by_squash, by_publisher
+        self._by_sound, self._words = by_sound, words_index
+        self._by_id = by_id
+        self._entries = entries                  # published last: a non-None _entries means "indexes are ready"
+        self._built_at = self._checked_at = self._clock()
+        self.builds += 1
+
+    def _rebuild(self) -> bool:
+        """Rediscover. A failure AFTER a good build keeps the previous catalog (whose entries are revalidated
+        before launch anyway) rather than leaving V.O.I.D with no applications at all."""
+        with self._build_lock:
+            return self._rebuild_locked()
+
+    def _rebuild_locked(self) -> bool:
+        try:
             self._build()
+        except ComputerBackendError:
+            if self._entries is None:
+                raise                        # nothing to fall back to: the caller must see it
+            _log.warning("APP_DISCOVERY_FAILED keeping_previous entries=%d", len(self._entries))
+            self._checked_at = self._clock()   # do not retry on every command
+            return False
+        self._fingerprint = self._safe_fingerprint()
+        return True
+
+    def _safe_fingerprint(self) -> str | None:
+        try:
+            fp = self._backend.discovery_fingerprint()
+        except Exception:                    # noqa: BLE001 - an optional signal never breaks a command
+            return None
+        return fp if isinstance(fp, str) else None
+
+    def _ensure(self, refresh: bool = True) -> None:
+        """Build on first use; afterwards, once the catalog is older than the TTL, rebuild only if the cheap
+        change signal says the installed applications actually moved.
+
+        The first build is serialised: a caller arriving while one is in flight waits for it and uses the result,
+        instead of running a second ~1.6 s discovery of the same machine.
+        """
+        if self._entries is None:
+            with self._build_lock:
+                if self._entries is None:     # another thread may have finished it while we waited
+                    self._rebuild_locked()
+            return
+        if not refresh or self._ttl_s <= 0 or (self._clock() - self._checked_at) < self._ttl_s:
+            return
+        with self._build_lock:
+            if (self._clock() - self._checked_at) < self._ttl_s:
+                return                        # a concurrent caller already refreshed it
+            fp = self._safe_fingerprint()
+            if fp is not None and fp == self._fingerprint:
+                self._checked_at = self._clock()   # unchanged: keep the catalog, restart the TTL only
+                return
+            self._rebuild_locked()
+
+    def invalidate(self) -> None:
+        """Drop the cache; the next lookup rediscovers. The safe, explicit refresh mechanism."""
+        with self._build_lock:
+            self._invalidate_locked()
+
+    def _invalidate_locked(self) -> None:
+        self._entries = None
+        self._by_id, self._by_norm, self._by_squash, self._by_publisher, self._words = {}, {}, {}, {}, []
+        self._by_sound = {}
+        self._fingerprint = None
+        self._built_at = self._checked_at = 0.0
+
+    def _rebuild_for_miss(self) -> bool:
+        """A name nothing matched may belong to an application installed since the catalog was built.
+
+        Misses are COMMON - speech-to-text mishears, and an unrecognised phrase lands here - so this must be cheap.
+        The change signal is consulted first (~6 ms against ~430 ms for a rediscovery) and settles the desktop
+        case. A blind rediscovery, which is the only way to notice a newly installed STORE app, is left to a much
+        slower interval: a just-installed Store app is worth one extra rediscovery every few minutes, not one per
+        misheard word.
+        """
+        if self._entries is None:
+            return False
+        now = self._clock()
+        if (now - self._built_at) >= self.MIN_BLIND_REBUILD_S:
+            return self._rediscover_and_report()     # content is genuinely old: a Store install could be hiding
+        if (now - self._checked_at) < self.MIN_REBUILD_S:
+            return False
+        fp = self._safe_fingerprint()
+        if fp is not None and fp == self._fingerprint:
+            self._checked_at = now                   # nothing changed on disk; do not pay for a rediscovery
+            return False
+        return self._rediscover_and_report()
+
+    def _rediscover_and_report(self) -> bool:
+        before = {e.app_id for e in (self._entries or [])}
+        if not self._rebuild():
+            return False
+        return {e.app_id for e in (self._entries or [])} != before
+
+    # -- reading --------------------------------------------------------
+    def entries(self) -> list[AppEntry]:
+        self._ensure()
         return self._entries or []
 
     def find(self, query: str) -> list[AppEntry]:
@@ -353,15 +673,132 @@ class AppCatalog:
                 out.append(e)
         return out
 
+    def find_name_prefix(self, query: str) -> list[AppEntry]:
+        """Entries whose name STARTS WITH the query's whole words, in order.
+
+        Installed names carry suffixes nobody says out loud: the owner says "Opera GX", the Start Menu entry is
+        "Opera GX Browser", and ``find`` (exact) returns nothing. This matches WHOLE WORDS from the start only -
+        ["opera", "gx"] is a prefix of ["opera", "gx", "browser"] - so it stays deterministic and order-sensitive:
+        never a substring ("code" cannot match "Visual Studio Code"), never a partial word ("oper" cannot match
+        "Opera"), never a reordering. ``find`` keeps its exact/glob contract unchanged; a caller decides what to do
+        with more than one hit, and the deterministic fast path accepts only a unique one.
+        """
+        words = tuple(w for w in re.split(r"\s+", (query or "").strip().lower()) if w)
+        if not words:
+            return []
+        out = []
+        for e in self.entries():
+            name_words = tuple(w for w in re.split(r"\s+", (e.name or "").strip().lower()) if w)
+            if is_prefix(words, name_words):
+                out.append(e)
+        return out
+
+    def resolve_name(self, query: object) -> NameMatch:
+        """Resolve a spoken or typed application name through the deterministic matching hierarchy.
+
+        In order, stopping at the first tier that matches anything at all:
+
+        1. ``exact``     - the normalised display name (case, punctuation and spacing already made comparable),
+                           after the fixed alias table has had its say;
+        2. ``spacing``   - the same name spaced differently ("Whats App" -> "WhatsApp"): an identity comparison,
+                           not a partial one;
+        3. ``prefix``    - the query is the leading WHOLE words of one installed name ("Opera GX" ->
+                           "Opera GX Browser");
+        4. ``publisher`` - a vendor word on either side: the installed name's, dropped by the owner ("teams" ->
+                           "Microsoft Teams"), or one the owner added that the installed name omits
+                           ("windows terminal" -> "Terminal");
+        5. ``sound``     - the query sounds exactly like one installed application ("what's up" -> "WhatsApp",
+                           "not pad" -> "Notepad", "chat gpd" -> "ChatGPT"). Speech-to-text errors on application
+                           names are overwhelmingly of this shape: right sounds, wrong spelling. Still an EQUALITY
+                           on a canonical key, not a similarity - see ``sound_key``.
+
+        A tier that matches MORE THAN ONE application ends the search as ``ambiguous``: falling through to a weaker
+        tier after a strong one was ambiguous would be guessing. Nothing here is fuzzy - there is no edit distance,
+        no substring containment and no scoring - so a name that is merely SIMILAR to an installed one does not
+        resolve, it misses.
+        """
+        words = canonical_query(query)
+        if not words:
+            return NameMatch(reason="unknown")
+        self._ensure()                          # a first-build failure propagates: the caller must see it
+        match = self._lookup(words)
+        if match.reason == "unknown" and self._rebuild_for_miss():
+            match = self._lookup(words)         # the application may have been installed since the last build
+        return match
+
+    def _lookup(self, words: tuple) -> NameMatch:
+        for tier, hits in (("exact", self._by_norm.get(" ".join(words))),
+                           ("spacing", self._by_squash.get("".join(words))),
+                           ("prefix", [e for w, e in self._words if is_prefix(words, w)]),
+                           ("publisher", self._by_publisher.get(" ".join(words))
+                            or self._qualifier_hits(words)),
+                           ("sound", self._sound_hits(words))):
+            if not hits:
+                continue
+            if len(hits) == 1:
+                return NameMatch(entry=hits[0], tier=tier)
+            return NameMatch(candidates=tuple(hits[:_MAX_RESULTS]), tier=tier, reason="ambiguous")
+        return NameMatch(reason="unknown")
+
+    def _sound_hits(self, words: tuple) -> list:
+        """Applications that sound exactly like this query. Last resort, and fail-closed.
+
+        Deliberately narrow: the key must be long enough to identify a program at all (``MIN_SOUND_KEY``), and a
+        key shared by several installed applications ("calc"/"Clock", "Microsoft News"/"Microsoft Teams") returns
+        all of them, so the caller asks instead of guessing.
+        """
+        key = sound_key(" ".join(words))
+        if len(key) < MIN_SOUND_KEY:
+            return []
+        return self._by_sound.get(key) or []
+
+    def _qualifier_hits(self, words: tuple) -> list:
+        """Last resort: the owner named a vendor the installed name does not carry ("windows terminal")."""
+        stripped = without_qualifier(words)
+        if not stripped:
+            return []
+        key = " ".join(stripped)
+        return (self._by_norm.get(key) or self._by_squash.get("".join(stripped))
+                or [e for w, e in self._words if is_prefix(stripped, w)])
+
     def resolve(self, app_id: str) -> AppEntry | None:
-        if self._entries is None:
-            self._build()
+        # No staleness refresh here: this runs between deciding to launch and launching, and must stay instant.
+        self._ensure(refresh=False)
         return self._by_id.get(app_id)
 
     @staticmethod
     def revalidate(entry: AppEntry | None) -> bool:
-        """Re-check the resolved target still exists before launching."""
-        return bool(entry) and os.path.exists(entry.target)
+        """Re-check the resolved target is still launchable before launching.
+
+        A Store app has no filesystem path, so there is nothing to stat: what must still hold is that its target is a
+        well-formed AppUserModelID (an uninstalled app simply fails to start, which launch_app reports).
+        """
+        if not entry:
+            return False
+        if entry.kind == "uwp":
+            return is_app_user_model_id(entry.target)
+        return os.path.exists(entry.target)
+
+    def validate(self, entry: AppEntry | None) -> bool:
+        """``revalidate`` plus, for a Start-Menu shortcut, a check that what it POINTS AT still exists.
+
+        Uninstalling an application often leaves its shortcut behind. Launching one of those makes Windows hunt for
+        the missing program and prompt - on this machine "open Discord" produced a UAC dialog and WinError 1223 for
+        an application that had been removed. Resolving the shortcut costs about 7 ms, which is affordable once per
+        launch but not for all ~110 shortcuts on every rediscovery, so it is done here rather than at build time.
+
+        An unreadable shortcut is UNKNOWN, not missing: the entry is still accepted, exactly as before.
+        """
+        if not self.revalidate(entry):
+            return False
+        if entry.kind != "lnk":
+            return True
+        try:
+            target = self._backend.shortcut_target(entry.target)
+        except Exception:                                    # noqa: BLE001 - introspection never blocks a launch
+            return True
+        target = target.strip() if isinstance(target, str) else ""
+        return True if not target else os.path.exists(target)
 
 
 # --- window tokens + computer actions -----------------------------------
@@ -406,6 +843,12 @@ class ComputerActions:
             return ToolResult.failure("No application query given.")
         try:
             matches = self._catalog.find(q)
+            if not matches:
+                # Exact/glob found nothing. Fall back to the same deterministic hierarchy the fast path uses, so
+                # the model is told about "Opera GX Browser" when it asked for "Opera GX" instead of concluding
+                # the application is not installed. Ambiguity is still reported as ambiguity, never resolved here.
+                match = self._catalog.resolve_name(q)
+                matches = [match.entry] if match.entry is not None else list(match.candidates)
         except ComputerBackendError as exc:
             return ToolResult.failure(str(exc), error=str(exc))
         if not matches:

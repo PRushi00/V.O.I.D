@@ -10,7 +10,8 @@ import pytest
 from void.actions.apps import AppActions
 from void.actions.base import ToolResult
 from void.actions.computer import (
-    AppCatalog, ComputerActions, ComputerBackendError, WindowsBackend,
+    AppCatalog, AppEntry, ComputerActions, ComputerBackendError, WindowsBackend,
+    is_app_user_model_id,
 )
 from void.actions.files import FileActions
 from void.actions.registry import ToolRegistry
@@ -401,3 +402,108 @@ def ca_app_id(catalog, name):
     matches = catalog.find(name)
     assert len(matches) == 1
     return matches[0].app_id
+
+
+# --- AppCatalog.find_name_prefix (whole-word prefix; find() itself is unchanged) ------------------
+
+def _cat(tmp_path, *names):
+    be = FakeBackend(apps=[{"name": n, "kind": "exe", "target": _exe(tmp_path, f"{i}.exe")}
+                           for i, n in enumerate(names)])
+    return AppCatalog(be)
+
+
+def test_find_name_prefix_matches_whole_words_from_the_start(tmp_path):
+    cat = _cat(tmp_path, "Opera GX Browser", "Notepad")
+    assert [e.name for e in cat.find_name_prefix("opera gx")] == ["Opera GX Browser"]
+    assert [e.name for e in cat.find_name_prefix("OPERA")] == ["Opera GX Browser"]
+    assert [e.name for e in cat.find_name_prefix("opera gx browser")] == ["Opera GX Browser"]
+
+
+@pytest.mark.parametrize("query", ["gx", "browser", "gx browser", "oper", "opera g", "operagx",
+                                   "gx opera", "opera browser", "opera gx browser pro", "", "   "])
+def test_find_name_prefix_refuses_substrings_partial_words_and_reorderings(tmp_path, query):
+    assert _cat(tmp_path, "Opera GX Browser").find_name_prefix(query) == []
+
+
+def test_find_name_prefix_returns_every_candidate_so_the_caller_can_refuse_to_guess(tmp_path):
+    cat = _cat(tmp_path, "Opera GX Browser", "Opera GX Developer", "Opera Mail")
+    assert sorted(e.name for e in cat.find_name_prefix("opera gx")) == ["Opera GX Browser", "Opera GX Developer"]
+    assert len(cat.find_name_prefix("opera")) == 3
+
+
+def test_find_is_unchanged_and_still_exact_or_glob_only(tmp_path):
+    cat = _cat(tmp_path, "Opera GX Browser")
+    assert cat.find("opera gx") == []                     # exact contract untouched (find_app still behaves as before)
+    assert [e.name for e in cat.find("opera gx browser")] == ["Opera GX Browser"]
+    assert [e.name for e in cat.find("*opera*")] == ["Opera GX Browser"]
+
+
+# --- Microsoft Store (UWP) apps: discovered by AppUserModelID, launched via the AppsFolder ----------------
+#
+# "Open WhatsApp" failed in the field because a Store app is neither an .exe, a .lnk nor an App Paths entry, so the
+# catalog could not see it at all (51 such apps on the owner's machine) and the command fell through to the model.
+
+WHATSAPP = "5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App"
+
+
+@pytest.mark.parametrize("target, ok", [
+    (WHATSAPP, True),
+    ("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App", True),
+    ("Publisher.App!Entry", True),
+    ("no-bang-here", False),                        # a classic path/target is not an AUMID
+    (r"C:\Windows\System32\cmd.exe", False),
+    ("App!Entry extra", False),                     # no spaces: cannot become a second argument
+    ("App!Entry/../x", False),
+    ("App!Entry\\x", False),
+    ('App!"quoted"', False),
+    ("App!Entry&calc", False),
+    ("!Entry", False),
+    ("App!", False),
+    ("", False), (None, False), (123, False),
+])
+def test_app_user_model_id_shape_is_strict(target, ok):
+    assert is_app_user_model_id(target) is ok
+
+
+def test_store_apps_are_revalidated_by_id_not_by_a_filesystem_path():
+    entry = AppEntry("app-x", "WhatsApp", "uwp", WHATSAPP)
+    assert AppCatalog.revalidate(entry) is True         # nothing to stat; the id is what must hold
+    assert AppCatalog.revalidate(AppEntry("app-y", "Bad", "uwp", "not an aumid")) is False
+
+
+def test_a_store_app_launches_through_explorers_appsfolder_with_no_shell(tmp_path, monkeypatch):
+    import void.actions.apps as apps_mod
+    from void.actions.apps import AppActions
+    from void.actions.files import FileActions
+    seen = {}
+    monkeypatch.setattr(apps_mod.subprocess, "Popen", lambda argv, *a, **k: seen.update(argv=list(argv)))
+    be = FakeBackend(apps=[{"name": "WhatsApp", "kind": "uwp", "target": WHATSAPP}])
+    cat = AppCatalog(be)
+    aa = AppActions(FileActions([tmp_path]), catalog=cat)
+    entry = cat.find("whatsapp")[0]
+    r = aa.launch_app(entry.app_id)
+    assert r.ok and "WhatsApp" in r.summary
+    assert seen["argv"] == ["explorer.exe", "shell:AppsFolder\\" + WHATSAPP]     # two fixed argv items, no shell
+
+
+def test_a_malformed_store_id_is_refused_before_any_launch(tmp_path, monkeypatch):
+    import void.actions.apps as apps_mod
+    from void.actions.apps import AppActions
+    from void.actions.files import FileActions
+    calls = []
+    monkeypatch.setattr(apps_mod.subprocess, "Popen", lambda argv, *a, **k: calls.append(argv))
+    monkeypatch.setattr(apps_mod.os, "startfile", lambda *a, **k: calls.append(a), raising=False)
+    be = FakeBackend(apps=[{"name": "Evil", "kind": "uwp", "target": "App!Entry & calc.exe"}])
+    cat = AppCatalog(be)
+    aa = AppActions(FileActions([tmp_path]), catalog=cat)
+    r = aa.launch_app(cat.find("evil")[0].app_id)
+    assert not r.ok and calls == []                      # nothing was started
+
+
+def test_store_discovery_never_shadows_an_existing_name(tmp_path):
+    """A duplicate name would make an exact match ambiguous and silently stop that command fast-pathing."""
+    from void.actions.computer import RealWindowsBackend
+    existing = {"opera gx browser"}
+    rows = RealWindowsBackend._store_apps(existing)
+    assert all(r["name"].lower() != "opera gx browser" for r in rows)
+    assert all(r["kind"] == "uwp" and is_app_user_model_id(r["target"]) for r in rows)

@@ -5,15 +5,18 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 from typing import Callable
 
 from void import perf
 from void.actions.apps import AppActions
 from void.actions.computer import AppCatalog, ComputerActions, make_backend
-from void.actions.files import FileActions
+from void.actions.files import FileActions, PathNotAllowed
+from void.actions.folders import DEFAULT_DEPTH, FolderCatalog, scan_roots
 from void.actions.registry import ToolRegistry
 from void.config import Config
 from void.core.agent import Agent, AgentResult
+from void.core.fast_path import FastPath
 from void.core.kill_switch import KillSwitch
 from void.core.task import Status, Task, TaskStore
 from void.memory import intent as memory_intent
@@ -22,13 +25,27 @@ from void.memory.crypto import MemoryUnavailable
 from void.memory.persist import Injection
 from void.memory.service import MemoryService
 from void.memory.tool import make_tool as make_memory_tool
+from void.providers.base import LLMProvider, ProviderUnavailable
 from void.providers.registry import ProviderRegistry
+from void.security.protected import EngineProtected
 from void.security.risk import RiskGate
 
 _log = logging.getLogger(__name__)
 
 ConfirmFn = Callable[[str], bool]
 OnEvent = Callable[[str], None]
+
+
+class _NoProvider(LLMProvider):
+    """The provider of a run that must make NO model call (the deterministic fast path). Any attempt to use it is a
+    bug, so it refuses loudly instead of silently reaching a real model."""
+    name = "none"
+
+    def available(self) -> bool:
+        return False
+
+    def generate(self, messages, tools=None):
+        raise ProviderUnavailable("This run is deterministic and makes no model call.")
 
 
 class Assistant:
@@ -68,6 +85,7 @@ class Assistant:
             delete_to_recycle_bin=self.config.get(
                 "security.delete_to_recycle_bin", True),
             protected_roots=self.config.protected_roots(),
+            engine_protected=EngineProtected.default(state_dir=state_dir),
         )
         # Windows application/window control (Phase 8A). The backend is lazy:
         # nothing Windows-specific is imported until a computer tool is used.
@@ -92,12 +110,44 @@ class Assistant:
 
         # Providers
         self.providers = ProviderRegistry.from_config(self.config)
+        # Deterministic fast path for plain "open <known app>" commands (no model call). Off switch: fast_path.enabled.
+        self._fast = (FastPath(catalog,
+                               answer_unknown=self.config.get("fast_path.answer_unknown_apps", True),
+                               folders=self._folder_catalog(file_actions))
+                      if self.config.get("fast_path.enabled", True) else None)
+
+    def _folder_catalog(self, file_actions):
+        """A shallow index of the owner's folder names, or None when folder resolution is off.
+
+        It is handed the FILE LAYER's confinement check rather than the configuration: allowed roots, protected
+        roots and the engine's own protected locations are evaluated in exactly one place, and the resulting path is
+        confined a second time by ``open_path`` when it runs.
+        """
+        if not self.config.get("fast_path.resolve_folders", True):
+            return None
+
+        def confine(path):
+            try:
+                return file_actions._confine(path)
+            except PathNotAllowed:
+                return None
+            except OSError:
+                return None
+
+        return FolderCatalog(
+            roots=scan_roots(Path.home(), [str(r) for r in self.config.allowed_roots()]),
+            confine=confine,
+            depth=int(self.config.get("fast_path.folder_depth", DEFAULT_DEPTH)),
+            ttl_s=float(self.config.get("fast_path.folder_ttl_s", 600.0)))
 
     def _agent(self, memory_first: "bool | str" = False) -> Agent:
-        provider = self.providers.select()  # raises if none available
+        order = getattr(self.providers, "available_order", None)
+        chain = list(order()) if callable(order) else []
+        provider = chain[0] if chain else self.providers.select()   # select() raises if none available
         perf.emit("route", provider=getattr(provider, "name", "unknown"), reason="select")
         return Agent(
             provider=provider,
+            fallbacks=chain[1:],
             tools=self.tools,
             risk_gate=self.risk_gate,
             kill_switch=self.kill_switch,
@@ -106,16 +156,22 @@ class Assistant:
             max_retries=self.config.get("agent.max_retries", 2),
             on_event=self.on_event,
             defer_confirmation=self._confirm_fn is None,
-            memory_context=self._memory_context_fn(provider, memory_first=memory_first),
+            memory_context=self._memory_context_fn(chain or [provider], memory_first=memory_first),
             recall_only=bool(memory_first),
         )
 
-    def _memory_context_fn(self, provider, memory_first: "bool | str" = False):
+    def _memory_context_fn(self, chain, memory_first: "bool | str" = False):
         """Goal -> [context messages]. Sensitive / non-cloud memory is withheld whenever the
-        selected provider is not the local one (unknown providers count as cloud)."""
+        selected provider is not the local one (unknown providers count as cloud).
+
+        ``chain`` is every provider this run might use, not just the first: a run that could hand over to a cloud
+        provider must be built under cloud rules from the start, or failing over would send it memory that was
+        only ever cleared for the local model.
+        """
         if self.memory is None:
             return None
-        for_cloud = getattr(provider, "name", "") != "local"
+        providers = list(chain) if isinstance(chain, (list, tuple)) else [chain]
+        for_cloud = any(getattr(p, "name", "") != "local" for p in providers)
 
         def fn(goal: str) -> Injection:
             try:
@@ -132,6 +188,44 @@ class Assistant:
                              carries_memory=block is not None)
 
         return fn
+
+    def _fast_route(self, goal: str) -> AgentResult | None:
+        """A plain "open <known app>" command, executed with NO model call (void/core/fast_path.py).
+
+        The fast path only decides WHAT to call; the call still runs through ``Agent._run_call`` (kill switch, risk
+        level, ``RiskGate.authorize``, telemetry). Anything it does not recognise, cannot resolve to exactly one
+        application, or that fails returns None and the ordinary agent handles the goal exactly as before."""
+        if self._fast is None or self.kill_switch.engaged:
+            return None
+        decision = self._fast.decide(goal)
+        if decision.plan is None:
+            if decision.matched:
+                perf.emit("route", provider="none", reason="fast_path_miss", why=decision.why, llm_calls=0)
+            if decision.reply:
+                # Several installed applications match the name. Answering the question here is deterministic and
+                # instant, and is the only answer available at all when no model can be reached; NOTHING is
+                # launched, no tool runs, and the next command is unaffected.
+                kind = "not_found" if decision.why == "unknown" else "clarify"
+                perf.emit("route", provider="none", reason="fast_path", kind=kind, llm_calls=0)
+                task = Task(goal="[app clarification]", id="(apps)", status=Status.COMPLETED,
+                            result=decision.reply)
+                return AgentResult(task=task, status=Status.COMPLETED, result=decision.reply, steps=0)
+            return None
+        t0 = time.monotonic()
+        with perf.ensure_interaction("cli"):
+            agent = Agent(provider=_NoProvider(), tools=self.tools, risk_gate=self.risk_gate,
+                          kill_switch=self.kill_switch, store=self.store, on_event=self.on_event,
+                          defer_confirmation=self._confirm_fn is None)
+            result = agent.run_direct_targets(
+                goal, [(t.label, t.alternatives) for t in decision.plan.targets],
+                failures=decision.failures)
+            if result is None:
+                perf.emit("route", provider="none", reason="fast_path_miss", why="failed", llm_calls=0)
+                return None
+            perf.emit("route", provider="none", reason="fast_path", kind=decision.plan.kind,
+                      targets=len(decision.plan.targets), missing=len(decision.failures), llm_calls=0)
+            perf.emit("complete", status=result.status, total_s=round(time.monotonic() - t0, 3), steps=result.steps)
+            return result
 
     def _measured(self, fn) -> AgentResult:
         """Run one agent operation inside a telemetry interaction (joining the
@@ -188,6 +282,9 @@ class Assistant:
         handled = self._memory_command(goal)
         if handled is not None:
             return handled
+        fast = self._fast_route(goal)
+        if fast is not None:
+            return fast
         route = self._recall_route(goal)
         if isinstance(route, AgentResult):
             return route

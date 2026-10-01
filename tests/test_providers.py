@@ -386,12 +386,12 @@ class _FakeHTTPResponse:
 # --- available(): A) server reachable -----------------------------------
 
 def test_local_available_true_when_tags_returns_200(monkeypatch):
-    lp = LocalProvider()
+    lp = LocalProvider(model="llama3.1:8b")
     calls = []
 
     def fake_get(url, timeout=None):
         calls.append((url, timeout))
-        return _FakeHTTPResponse(status_code=200)
+        return _FakeHTTPResponse(status_code=200, json_data={"models": [{"name": "llama3.1:8b"}]})
 
     monkeypatch.setattr(requests, "get", fake_get)
     assert lp.available() is True
@@ -419,50 +419,61 @@ def test_local_available_false_on_non_200(monkeypatch):
     assert lp.available() is False
 
 
-# --- available(): D) response body is never inspected ---------------------
+# The next two tests keep the names of two V1-baseline tests (tests/baseline_v1_test_ids.txt is immutable and every id must
+# stay collected). Their behaviour was intentionally reversed - see the comment below - so their names describe the OLD
+# behaviour; the docstrings say what they pin now.
 
 def test_local_available_ignores_response_body_entirely(monkeypatch):
-    # available() never calls resp.json() - only resp.status_code. A response
-    # whose body would fail to parse (or means anything at all) must not
-    # affect the result. json() is wired to raise if it is ever called, which
-    # proves the body is never read rather than merely asserting the outcome.
-    lp = LocalProvider()
+    """(V1 name kept.) available() used to ignore the body. It now reads ONLY ``models[].name`` from /api/tags and
+    ignores every other field, so an unrelated or hostile body cannot make it answer True."""
+    lp = LocalProvider(model="qwen3:8b")
+    body = {"models": [{"name": "qwen3:8b", "details": {"note": "ignored"}}], "junk": ["x"] * 3}
+    monkeypatch.setattr(requests, "get", lambda url, timeout=None: _FakeHTTPResponse(200, json_data=body))
+    assert lp.available() is True
+    monkeypatch.setattr(requests, "get", lambda url, timeout=None: _FakeHTTPResponse(200, json_data={"qwen3:8b": True}))
+    assert lp.available() is False
 
-    def _boom():
-        raise AssertionError("available() must never call resp.json()")
 
-    resp = _FakeHTTPResponse(status_code=200)
-    resp.json = _boom
-    monkeypatch.setattr(requests, "get", lambda url, timeout=None: resp)
+def test_local_available_does_not_verify_configured_model_is_present(monkeypatch):
+    """(V1 name kept; it documented a known gap that is now FIXED.) available() now DOES verify that the configured model
+    is installed, by reading /api/tags (read-only; nothing is pulled)."""
+    lp = LocalProvider(model="qwen3:8b")
+    monkeypatch.setattr(requests, "get", lambda url, timeout=None: _FakeHTTPResponse(200, json_data={"models": []}))
+    assert lp.available() is False
+
+
+# --- available(): D) the configured model must be installed -----------------
+#
+# (Previously a documented, accepted gap: available() answered True for any 200 without reading the model list. It now
+# reads /api/tags - read-only, never pulls - so a missing model falls through to the next provider.)
+
+def _tags(*names):
+    return _FakeHTTPResponse(status_code=200, json_data={"models": [{"name": n} for n in names]})
+
+
+def test_local_available_false_when_configured_model_not_installed(monkeypatch):
+    lp = LocalProvider(model="qwen3:8b")
+    monkeypatch.setattr(requests, "get", lambda url, timeout=None: _tags("llama3.1:8b"))
+    assert lp.available() is False
+
+
+def test_local_available_true_when_configured_model_installed(monkeypatch):
+    lp = LocalProvider(model="qwen3:8b")
+    monkeypatch.setattr(requests, "get", lambda url, timeout=None: _tags("llama3.1:8b", "qwen3:8b"))
     assert lp.available() is True
 
 
-# --- configured-model presence: KNOWN, ACCEPTED non-blocking gap --------
+def test_local_available_untagged_name_matches_latest(monkeypatch):
+    lp = LocalProvider(model="mymodel")
+    monkeypatch.setattr(requests, "get", lambda url, timeout=None: _tags("mymodel:latest"))
+    assert lp.available() is True
 
-def test_local_available_does_not_verify_configured_model_is_present(monkeypatch):
-    """Documents a known, non-blocking robustness gap identified in the
-    provider audit: available() checks only server reachability (HTTP 200 on
-    /api/tags) and never whether the CONFIGURED model (self.model) actually
-    appears in the returned model list - it never reads the list at all. This
-    test shows the CURRENT behavior (True, even with the model absent/
-    unverifiable), not an assumed or ideal one. Not a security defect:
-    generate() still fails safely (raises ProviderUnavailable, see the
-    model-not-found case below) if the model turns out to be missing; this is
-    an inaccurate-but-fail-safe availability signal, never a bypass.
-    """
+
+def test_local_available_false_on_unreadable_tag_list(monkeypatch):
     lp = LocalProvider(model="qwen3:8b")
-
-    def _boom():
-        raise AssertionError(
-            "available() would need to read the model list to answer this "
-            "question - if this executes, the known gap has been fixed "
-            "without updating this test.")
-
-    resp = _FakeHTTPResponse(status_code=200)
-    resp.json = _boom
+    resp = _FakeHTTPResponse(status_code=200, json_exc=ValueError("not json"))
     monkeypatch.setattr(requests, "get", lambda url, timeout=None: resp)
-
-    assert lp.available() is True   # <-- current, inaccurate-but-safe behavior
+    assert lp.available() is False
 
 
 # --- generate(): A) successful text response ------------------------------
@@ -483,7 +494,9 @@ def test_local_generate_success_parses_text(monkeypatch):
 
     assert resp.text == "The answer is 4."
     assert resp.tool_calls == []
-    assert captured["url"] == "http://localhost:11434/api/chat"
+    # 127.0.0.1, not localhost: "localhost" resolves to IPv6 ::1 first here and Ollama listens on IPv4,
+    # which cost ~2 s per call (see tests/test_fallback_speed.py).
+    assert captured["url"] == "http://127.0.0.1:11434/api/chat"
     assert captured["json"]["model"] == "qwen3:8b"
     assert captured["json"]["stream"] is False
 
@@ -704,8 +717,9 @@ class _FakeGenai:
         self._behavior_by_key = behavior_by_key
         self.built_keys: list[str] = []
 
-    def Client(self, api_key):
+    def Client(self, api_key, http_options=None):
         self.built_keys.append(api_key)
+        self.http_options = http_options
         return _FakeClient(self._behavior_by_key[api_key])
 
 
@@ -836,7 +850,8 @@ def test_rotation_all_auth_raises_provider_unavailable():
 def test_non_quota_error_is_reraised_not_rotated():
     provider, pool, fg = _build(
         [PRIMARY, "gemini_02"], {PRIMARY: K1, "gemini_02": K2},
-        {K1: lambda: (_ for _ in ()).throw(_err_other()), K2: _never})
+        {K1: lambda: (_ for _ in ()).throw(_FakeAPIError(code=503, status="UNAVAILABLE", message="overloaded")),
+         K2: _never})
     with pytest.raises(_FakeAPIError):
         provider.generate(_MSG)
     assert fg.built_keys == [K1]                   # not rotated

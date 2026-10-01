@@ -30,6 +30,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import math
 import os
 import secrets as _pysecrets
 import time
@@ -40,6 +41,7 @@ _log = logging.getLogger("void.device.pairing")
 
 DEFAULT_WINDOW_SECONDS = 300  # 5 minutes
 _FILENAME = "pairing_window.json"
+_CLOCK_SLACK_S = 30       # tolerated clock adjustment between begin() and redeem()
 
 # Distinguishes WHY a token was rejected, for diagnostics only - never
 # changes the response the caller gets (still always "invalid_pairing_token"
@@ -86,8 +88,10 @@ class PairingManager:
             return None
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
-            return PairingToken(token=str(data["token"]), name=str(data["name"]),
-                               expires_at=float(data["expires_at"]))
+            expires_at = float(data["expires_at"])
+            if not math.isfinite(expires_at):
+                raise ValueError("non-finite expiry")      # NaN/inf would make the window never expire
+            return PairingToken(token=str(data["token"]), name=str(data["name"]), expires_at=expires_at)
         except (ValueError, KeyError, TypeError):
             # The file exists but its CONTENT is unusable (corrupt/partial
             # JSON, missing field) - genuinely equivalent to "no window", but
@@ -147,7 +151,9 @@ class PairingManager:
         active = self._read()
         if active is None:
             raise PairingError("No pairing window is open.", reason=NO_WINDOW)
-        if now > active.expires_at:
+        # ``begin()`` never issues a window longer than ``self._window``; one that claims to be longer was not written
+        # by this code (a planted or corrupted file), so it is treated as expired and discarded rather than honoured.
+        if now > active.expires_at or active.expires_at - now > self._window + _CLOCK_SLACK_S:
             self._write(None)
             raise PairingError("Pairing window has expired.", reason=EXPIRED)
         if not token or not hmac.compare_digest(token, active.token):

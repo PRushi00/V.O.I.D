@@ -49,12 +49,27 @@ _STATUS = _enum("pending", "running", "paused", "awaiting_confirmation", "blocke
 # event -> {field: validator}.  ``interaction_id`` is accepted on every event.
 EVENTS: dict[str, dict[str, object]] = {
     "activation": {"source": _enum("wake", "ptt", "cli", "device")},
+    # ``budget_s`` is the ADAPTIVE trailing-silence budget that ended the capture (seconds). A number, so the
+    # fast-vs-safe split over real use is readable from this stream; nothing decides anything from it.
     "endpoint": {"reason": _enum("silence", "no_speech", "max_duration", "ptt_release"),
-                 "capture_s": _float},
-    "stt": {"audio_s": _float, "decode_s": _float, "empty": _bool, "backend": _name},
-    "route": {"provider": _name, "reason": _enum("select", "failover", "fallback")},
+                 "capture_s": _float, "budget_s": _float},
+    # ``chars``/``segments`` are COUNTS, never text: what a slow decode produced is the one fact that separates
+    # "the machine was busy" from "Whisper worked harder on this audio", and the tail investigation had neither.
+    "stt": {"audio_s": _float, "decode_s": _float, "empty": _bool, "backend": _name,
+            "chars": _int, "segments": _int},
+    "route": {"provider": _name, "reason": _enum("select", "failover", "fallback", "fast_path", "fast_path_miss"),
+              "why": _enum("unknown", "ambiguous", "excluded", "discovery", "failed", "refused"),
+              "llm_calls": _int, "kind": _enum("alias", "catalog", "clarify", "not_found", "multi"),
+              # How many applications one sentence asked for, and how many of them resolved to nothing. Counts
+              # only: a NAME would be dropped by the allowlist, and is not needed to see a partial success.
+              "targets": _int, "missing": _int},
     "llm": {"attempt": _int, "duration_s": _float, "ok": _bool, "tool_calls": _int,
             "error_class": _name, "provider": _name},
+    "provider_call": {"provider": _name, "model": _name, "slot": _name, "attempt": _int, "duration_s": _float,
+                      "ok": _bool,
+                      "category": _enum("auth", "forbidden", "quota", "rate_limit", "timeout", "network",
+                                        "invalid_request", "unsupported_model", "server", "malformed_response",
+                                        "other")},
     "tool": {"name": _name, "risk": _enum("LOW", "MEDIUM", "HIGH"),
              "duration_s": _float, "ok": _bool},
     "verify": {"ok": _bool, "name": _name},

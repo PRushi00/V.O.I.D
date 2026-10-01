@@ -1,0 +1,1002 @@
+[
+  {
+    "index": 0,
+    "filename": "stage2_confound_val_0000.wav",
+    "phrase": "void",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 1,
+    "filename": "stage2_confound_val_0001.wav",
+    "phrase": "lloyd",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 2,
+    "filename": "stage2_confound_val_0002.wav",
+    "phrase": "boyd",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 3,
+    "filename": "stage2_confound_val_0003.wav",
+    "phrase": "avoid",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 4,
+    "filename": "stage2_confound_val_0004.wav",
+    "phrase": "devoid",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 5,
+    "filename": "stage2_confound_val_0005.wav",
+    "phrase": "annoyed",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 6,
+    "filename": "stage2_confound_val_0006.wav",
+    "phrase": "employed",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 7,
+    "filename": "stage2_confound_val_0007.wav",
+    "phrase": "destroyed",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 8,
+    "filename": "stage2_confound_val_0008.wav",
+    "phrase": "paranoid",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 9,
+    "filename": "stage2_confound_val_0009.wav",
+    "phrase": "android",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 10,
+    "filename": "stage2_confound_val_0010.wav",
+    "phrase": "tabloid",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 11,
+    "filename": "stage2_confound_val_0011.wav",
+    "phrase": "asteroid",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 12,
+    "filename": "stage2_confound_val_0012.wav",
+    "phrase": "hey voice",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 13,
+    "filename": "stage2_confound_val_0013.wav",
+    "phrase": "hey boy",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 14,
+    "filename": "stage2_confound_val_0014.wav",
+    "phrase": "hey world",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 15,
+    "filename": "stage2_confound_val_0015.wav",
+    "phrase": "hey voided",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 16,
+    "filename": "stage2_confound_val_0016.wav",
+    "phrase": "hey voiced",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 17,
+    "filename": "stage2_confound_val_0017.wav",
+    "phrase": "hey boyd",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 18,
+    "filename": "stage2_confound_val_0018.wav",
+    "phrase": "hey void id",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 19,
+    "filename": "stage2_confound_val_0019.wav",
+    "phrase": "hey v",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 20,
+    "filename": "stage2_confound_val_0020.wav",
+    "phrase": "hey voidy",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 21,
+    "filename": "stage2_confound_val_0021.wav",
+    "phrase": "hey avoid",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 22,
+    "filename": "stage2_confound_val_0022.wav",
+    "phrase": "hey lloyd",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 23,
+    "filename": "stage2_confound_val_0023.wav",
+    "phrase": "hey annoyed",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 24,
+    "filename": "stage2_confound_val_0024.wav",
+    "phrase": "hey android",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 25,
+    "filename": "stage2_confound_val_0025.wav",
+    "phrase": "hey devoid",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 26,
+    "filename": "stage2_confound_val_0026.wav",
+    "phrase": "hey paranoid",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 27,
+    "filename": "stage2_confound_val_0027.wav",
+    "phrase": "void",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 28,
+    "filename": "stage2_confound_val_0028.wav",
+    "phrase": "lloyd",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 29,
+    "filename": "stage2_confound_val_0029.wav",
+    "phrase": "boyd",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 30,
+    "filename": "stage2_confound_val_0030.wav",
+    "phrase": "avoid",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 31,
+    "filename": "stage2_confound_val_0031.wav",
+    "phrase": "devoid",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 32,
+    "filename": "stage2_confound_val_0032.wav",
+    "phrase": "annoyed",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 33,
+    "filename": "stage2_confound_val_0033.wav",
+    "phrase": "employed",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 34,
+    "filename": "stage2_confound_val_0034.wav",
+    "phrase": "destroyed",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 35,
+    "filename": "stage2_confound_val_0035.wav",
+    "phrase": "paranoid",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 36,
+    "filename": "stage2_confound_val_0036.wav",
+    "phrase": "android",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 37,
+    "filename": "stage2_confound_val_0037.wav",
+    "phrase": "tabloid",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 38,
+    "filename": "stage2_confound_val_0038.wav",
+    "phrase": "asteroid",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 39,
+    "filename": "stage2_confound_val_0039.wav",
+    "phrase": "hey voice",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 40,
+    "filename": "stage2_confound_val_0040.wav",
+    "phrase": "hey boy",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 41,
+    "filename": "stage2_confound_val_0041.wav",
+    "phrase": "hey world",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 42,
+    "filename": "stage2_confound_val_0042.wav",
+    "phrase": "hey voided",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 43,
+    "filename": "stage2_confound_val_0043.wav",
+    "phrase": "hey voiced",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 44,
+    "filename": "stage2_confound_val_0044.wav",
+    "phrase": "hey boyd",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 45,
+    "filename": "stage2_confound_val_0045.wav",
+    "phrase": "hey void id",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 46,
+    "filename": "stage2_confound_val_0046.wav",
+    "phrase": "hey v",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 47,
+    "filename": "stage2_confound_val_0047.wav",
+    "phrase": "hey voidy",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 48,
+    "filename": "stage2_confound_val_0048.wav",
+    "phrase": "hey avoid",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 49,
+    "filename": "stage2_confound_val_0049.wav",
+    "phrase": "hey lloyd",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 50,
+    "filename": "stage2_confound_val_0050.wav",
+    "phrase": "hey annoyed",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 51,
+    "filename": "stage2_confound_val_0051.wav",
+    "phrase": "hey android",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 52,
+    "filename": "stage2_confound_val_0052.wav",
+    "phrase": "hey devoid",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 53,
+    "filename": "stage2_confound_val_0053.wav",
+    "phrase": "hey paranoid",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 54,
+    "filename": "stage2_confound_val_0054.wav",
+    "phrase": "void",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 55,
+    "filename": "stage2_confound_val_0055.wav",
+    "phrase": "lloyd",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 56,
+    "filename": "stage2_confound_val_0056.wav",
+    "phrase": "boyd",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 57,
+    "filename": "stage2_confound_val_0057.wav",
+    "phrase": "avoid",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 58,
+    "filename": "stage2_confound_val_0058.wav",
+    "phrase": "devoid",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 59,
+    "filename": "stage2_confound_val_0059.wav",
+    "phrase": "annoyed",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 60,
+    "filename": "stage2_confound_val_0060.wav",
+    "phrase": "employed",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 61,
+    "filename": "stage2_confound_val_0061.wav",
+    "phrase": "destroyed",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 62,
+    "filename": "stage2_confound_val_0062.wav",
+    "phrase": "paranoid",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 63,
+    "filename": "stage2_confound_val_0063.wav",
+    "phrase": "android",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 64,
+    "filename": "stage2_confound_val_0064.wav",
+    "phrase": "tabloid",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 65,
+    "filename": "stage2_confound_val_0065.wav",
+    "phrase": "asteroid",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 66,
+    "filename": "stage2_confound_val_0066.wav",
+    "phrase": "hey voice",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 67,
+    "filename": "stage2_confound_val_0067.wav",
+    "phrase": "hey boy",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 68,
+    "filename": "stage2_confound_val_0068.wav",
+    "phrase": "hey world",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 69,
+    "filename": "stage2_confound_val_0069.wav",
+    "phrase": "hey voided",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 70,
+    "filename": "stage2_confound_val_0070.wav",
+    "phrase": "hey voiced",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 71,
+    "filename": "stage2_confound_val_0071.wav",
+    "phrase": "hey boyd",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 72,
+    "filename": "stage2_confound_val_0072.wav",
+    "phrase": "hey void id",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 73,
+    "filename": "stage2_confound_val_0073.wav",
+    "phrase": "hey v",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 74,
+    "filename": "stage2_confound_val_0074.wav",
+    "phrase": "hey voidy",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 75,
+    "filename": "stage2_confound_val_0075.wav",
+    "phrase": "hey avoid",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 76,
+    "filename": "stage2_confound_val_0076.wav",
+    "phrase": "hey lloyd",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 77,
+    "filename": "stage2_confound_val_0077.wav",
+    "phrase": "hey annoyed",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 78,
+    "filename": "stage2_confound_val_0078.wav",
+    "phrase": "hey android",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 79,
+    "filename": "stage2_confound_val_0079.wav",
+    "phrase": "hey devoid",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 80,
+    "filename": "stage2_confound_val_0080.wav",
+    "phrase": "hey paranoid",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 81,
+    "filename": "stage2_confound_val_0081.wav",
+    "phrase": "void",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 82,
+    "filename": "stage2_confound_val_0082.wav",
+    "phrase": "lloyd",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 83,
+    "filename": "stage2_confound_val_0083.wav",
+    "phrase": "boyd",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 84,
+    "filename": "stage2_confound_val_0084.wav",
+    "phrase": "avoid",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 85,
+    "filename": "stage2_confound_val_0085.wav",
+    "phrase": "devoid",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 86,
+    "filename": "stage2_confound_val_0086.wav",
+    "phrase": "annoyed",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 87,
+    "filename": "stage2_confound_val_0087.wav",
+    "phrase": "employed",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 88,
+    "filename": "stage2_confound_val_0088.wav",
+    "phrase": "destroyed",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 89,
+    "filename": "stage2_confound_val_0089.wav",
+    "phrase": "paranoid",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 90,
+    "filename": "stage2_confound_val_0090.wav",
+    "phrase": "android",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 91,
+    "filename": "stage2_confound_val_0091.wav",
+    "phrase": "tabloid",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 92,
+    "filename": "stage2_confound_val_0092.wav",
+    "phrase": "asteroid",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 93,
+    "filename": "stage2_confound_val_0093.wav",
+    "phrase": "hey voice",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 94,
+    "filename": "stage2_confound_val_0094.wav",
+    "phrase": "hey boy",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 95,
+    "filename": "stage2_confound_val_0095.wav",
+    "phrase": "hey world",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 96,
+    "filename": "stage2_confound_val_0096.wav",
+    "phrase": "hey voided",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 97,
+    "filename": "stage2_confound_val_0097.wav",
+    "phrase": "hey voiced",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 98,
+    "filename": "stage2_confound_val_0098.wav",
+    "phrase": "hey boyd",
+    "voice": "David",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  },
+  {
+    "index": 99,
+    "filename": "stage2_confound_val_0099.wav",
+    "phrase": "hey void id",
+    "voice": "Zira",
+    "category": "stage2_confound",
+    "split": "val",
+    "seed": 1234,
+    "source": "sapi_tts"
+  }
+]

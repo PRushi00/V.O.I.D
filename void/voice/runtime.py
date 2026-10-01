@@ -122,10 +122,26 @@ class _WakePolicy:
     on one of three bounded conditions - never "listen forever".
     """
     no_speech_s: float = 4.0
-    silence_s: float = 0.8          # trailing silence that ends an utterance (snappier endpoint)
+    silence_s: float = 0.8          # the SAFE trailing-silence budget: the maximum, and the fallback
     max_capture_s: float = 15.0
     rearm_delay_ms: int = 500
     energy_threshold: float = 500.0
+    # Adaptive trailing silence. Measured over 95 recordings of the owner's voice, the longest silence INSIDE an
+    # utterance is a function of how much speech has already been heard: 0.51 s max before 0.30 s of speech, and
+    # 0.30 s max after it. So the full budget is paid only while the utterance could still be at that fragile
+    # beginning; once it is clearly under way, ``fast_silence_s`` ends it sooner. A value >= silence_s disables
+    # this entirely and restores the single fixed budget.
+    fast_silence_s: float = 0.4
+    #: Accumulated VOICED seconds after which the fast budget may apply.
+    fast_after_speech_s: float = 0.3
+    #: ...and before which it still may. Beyond this the owner is speaking a SENTENCE, not a command: measured, the
+    #: long clause breaks all arrive late in long speech (a 0.45 s break after 2.58 s of speech in the TCP/UDP
+    #: question) while every short command finishes inside 1.65 s with no gap above 0.06 s. It costs nothing to be
+    #: patient there, because an informational request is followed by a model call of several seconds anyway.
+    fast_until_speech_s: float = 1.8
+    #: A survived internal gap at least this long is evidence THIS utterance has pauses in it: the full budget is
+    #: restored for the remainder, so one hesitation buys back the safe behaviour. 0 disables the latch.
+    pause_evidence_s: float = 0.2
     # Lead-in grace: for this long after a wake-initiated capture opens, an
     # utterance may NOT be finalized by the silence/no-speech rules (the hard
     # max_capture cap still applies). This guarantees the command window stays
@@ -149,6 +165,10 @@ class _WakePolicy:
             rearm_delay_ms=int(_num("voice.wake_rearm_delay_ms", 500.0, 0.0)),
             energy_threshold=_num("voice.wake_energy_threshold", 500.0, 0.0),
             lead_grace_s=_num("voice.wake_lead_grace_s", 0.4, 0.0),
+            fast_silence_s=_num("voice.wake_fast_silence_timeout", 0.4, 0.1),
+            fast_after_speech_s=_num("voice.wake_fast_after_speech", 0.3, 0.0),
+            fast_until_speech_s=_num("voice.wake_fast_until_speech", 1.8, 0.1),
+            pause_evidence_s=_num("voice.wake_pause_evidence", 0.2, 0.0),
         )
 
 
@@ -158,6 +178,22 @@ def _min_speech_ms(config) -> float:
         return max(0.0, float(config.get("voice.min_speech_ms", audio_guard.DEFAULT_MIN_SPEECH_MS)))
     except (TypeError, ValueError):
         return float(audio_guard.DEFAULT_MIN_SPEECH_MS)
+
+
+def _stt_temperature(config):
+    """``voice.stt_temperature``: a number pins one deterministic decode, null restores Whisper's retry.
+
+    Measured (docs/STT_AND_MULTI_APP_2026-09-28.md): the retry is free on audio Whisper decodes confidently and
+    2.0x-7.2x slower on audio it does not, where it also produces a different transcript every run. A malformed
+    value falls back to the default rather than leaving the owner unable to speak.
+    """
+    raw = config.get("voice.stt_temperature", 0.0)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _rms_int16(frame: bytes) -> float:
@@ -180,11 +216,29 @@ class _WakeEndpointer:
     calls ``on_finalize(reason)`` exactly once. Elapsed time is derived from
     frame durations (deterministic; no wall clock). Bounded exits:
       * no voiced frame within ``no_speech_s``            -> 'no_speech'
-      * >= ``silence_s`` trailing silence after speech    -> 'silence'
+      * trailing silence past the current budget          -> 'silence'
       * >= ``max_capture_s`` total                        -> 'max_duration'
     "Voiced" is a plain RMS-energy gate (``energy_threshold``), not speaker or
     language classification; a richer local VAD can replace it later without
     touching the broker or the session.
+
+    The trailing-silence budget ADAPTS, because measurement showed the long
+    silences inside an utterance all happen near its start (see ``_WakePolicy``):
+
+      * until ``fast_after_speech_s`` of voiced audio has accumulated, the full
+        ``silence_s`` is required - the utterance may still be at the fragile
+        beginning where a 0.5 s gap is normal;
+      * between that and ``fast_until_speech_s``, ``fast_silence_s`` is enough -
+        this is the length a deterministic local command occupies, and the only
+        case where endpointing is the whole wait;
+      * past ``fast_until_speech_s`` the owner is speaking a sentence, whose
+        clause breaks are long, and which is followed by a model call of several
+        seconds in any case: the safe budget returns;
+      * and at any point an internal gap of ``pause_evidence_s`` or more that was
+        SURVIVED restores ``silence_s`` for the rest of the capture.
+
+    The budget is never longer than ``silence_s``, so this can only end a capture
+    EARLIER than the fixed rule it replaces, never later.
     """
 
     def __init__(self, policy: _WakePolicy, on_finalize: Callable[[str], None],
@@ -196,6 +250,11 @@ class _WakeEndpointer:
         self._trailing_silence = 0.0
         self._speech = False
         self._done = False
+        self._speech_s = 0.0             # accumulated VOICED seconds in this capture
+        self._saw_pause = False          # a survived internal gap: this utterance has pauses in it
+        #: The budget that actually ended this capture, for telemetry. None until it fires, and left None for the
+        #: 'no_speech' / 'max_duration' exits, which are not silence decisions at all.
+        self.fired_budget_s: float | None = None
 
     def __call__(self, frame: bytes) -> None:
         if self._done:
@@ -206,8 +265,14 @@ class _WakeEndpointer:
         secs = n / self._sr
         self._elapsed += secs
         if _rms_int16(frame) >= self._p.energy_threshold:
+            # Speech resumed. A gap long enough to look like an ending, that turned out not to be one, is the
+            # clearest possible evidence that this utterance contains pauses - checked BEFORE the counter is reset.
+            if (self._speech and self._p.pause_evidence_s > 0
+                    and self._trailing_silence >= self._p.pause_evidence_s):
+                self._saw_pause = True
             self._speech = True
             self._trailing_silence = 0.0
+            self._speech_s += secs
         elif self._speech:
             self._trailing_silence += secs
 
@@ -217,13 +282,23 @@ class _WakeEndpointer:
         grace_ok = self._elapsed >= self._p.lead_grace_s
         if grace_ok and not self._speech and self._elapsed >= self._p.no_speech_s:
             self._fire("no_speech")
-        elif grace_ok and self._speech and self._trailing_silence >= self._p.silence_s:
+        elif grace_ok and self._speech and self._trailing_silence >= self._silence_budget():
             self._fire("silence")
         elif self._elapsed >= self._p.max_capture_s:
             self._fire("max_duration")
 
+    def _silence_budget(self) -> float:
+        """Trailing silence required to end THIS capture, right now. Never more than ``silence_s``."""
+        if (self._saw_pause
+                or self._speech_s < self._p.fast_after_speech_s
+                or self._speech_s >= self._p.fast_until_speech_s):
+            return self._p.silence_s
+        return min(self._p.fast_silence_s, self._p.silence_s)
+
     def _fire(self, reason: str) -> None:
         self._done = True
+        if reason == "silence":
+            self.fired_budget_s = self._silence_budget()
         self._on_finalize(reason)
 
 
@@ -306,9 +381,11 @@ class VoiceController:
         stt = FasterWhisperSTT(
             model_name=config.get("voice.stt_model", "small"),
             device=config.get("voice.stt_device", "cpu"),
+            compute_type=config.get("voice.stt_compute_type", "int8"),
             language=config.get("voice.stt_language", "en"),
             beam_size=int(config.get("voice.stt_beam_size", 1)),
             vad_filter=bool(config.get("voice.stt_vad_filter", True)),
+            temperature=_stt_temperature(config),
         )
         tts = create_tts_provider(config)   # provider-agnostic; null-safe fallback
         session = VoiceSession(
@@ -317,6 +394,7 @@ class VoiceController:
             on_state=on_state, on_transcript=on_transcript,
             on_message=on_message,
             speak_response=config.get("voice.speak_responses", True),
+            speak_successful_actions=bool(config.get("voice.speak_successful_actions", False)),
             min_speech_ms=_min_speech_ms(config),
         )
         wake = cls._build_wake(config)
@@ -412,6 +490,7 @@ class VoiceController:
                 daemon=True)
             self._monitor.start()
         self._prewarm_stt()
+        self._prewarm_apps()
 
     def _prewarm_stt(self) -> None:
         """Warm the STT model off-thread at start() so the first command isn't a
@@ -420,6 +499,31 @@ class VoiceController:
         if not callable(warm):
             return
         threading.Thread(target=warm, name="void-stt-warmup", daemon=True).start()
+
+    def _prewarm_apps(self) -> None:
+        """Discover installed applications AND the owner's folder names off-thread at start(), like the STT model.
+
+        Measured on the owner's machine: the first "open <app>" after a restart paid 473 ms for the initial
+        discovery. Nothing else in the command path comes close, and it is pure start-up cost - the catalog is
+        identical whenever it is built. Best-effort and daemonized; a failure leaves the ordinary lazy build.
+        """
+        assistant = getattr(self._session, "assistant", None) or getattr(self._session, "_assistant", None)
+        fast = getattr(assistant, "_fast", None)
+        catalog = getattr(fast, "catalog", None)
+        folders = getattr(fast, "folders", None)
+        if catalog is None and folders is None:
+            return
+
+        def warm():
+            for index in (catalog, folders):       # the folder scan is 217 ms here: the same start-up cost
+                if index is None:
+                    continue
+                try:
+                    index.entries()
+                except Exception:                  # noqa: BLE001 - a discovery failure is handled at use
+                    _log.debug("APP_PREWARM_FAILED", exc_info=True)
+
+        threading.Thread(target=warm, name="void-apps-warmup", daemon=True).start()
 
     def poll_once(self) -> None:
         """One deterministic monitor tick: kill-switch enforcement + speech
@@ -747,9 +851,11 @@ class VoiceController:
         except Exception:
             pass
         self._broker.subscribe(endpointer)
-        _log.info("COMMAND_CAPTURE_STARTED (listening for command; grace=%.2fs "
-                  "no_speech=%.1fs silence=%.2fs)", self._wake_policy.lead_grace_s,
-                  self._wake_policy.no_speech_s, self._wake_policy.silence_s)
+        p = self._wake_policy
+        _log.info("COMMAND_CAPTURE_STARTED (listening for command; grace=%.2fs no_speech=%.1fs "
+                  "silence=%.2fs fast=%.2fs when speech in [%.2f, %.2f)s pause_evidence=%.2fs)",
+                  p.lead_grace_s, p.no_speech_s, p.silence_s, min(p.fast_silence_s, p.silence_s),
+                  p.fast_after_speech_s, p.fast_until_speech_s, p.pause_evidence_s)
 
     def _wake_finalize(self, reason: str) -> None:
         """Endpointer callback (broker pump thread). End the wake capture the
@@ -763,10 +869,12 @@ class VoiceController:
             stale = self._session.generation != self._wake_gen
         if endpointer is not None:
             self._safe_unsub(endpointer)
-        _log.info("COMMAND_ENDPOINT reason=%s stale=%s", reason, stale)
+        budget = getattr(endpointer, "fired_budget_s", None)
+        _log.info("COMMAND_ENDPOINT reason=%s budget=%s stale=%s", reason, budget, stale)
         if stale:
             return                           # a newer session owns the mic now
-        self._session.note_endpoint_reason(reason)    # telemetry label only
+        # Which budget ended the capture, so the fast-vs-safe split over real use is readable from perf.jsonl.
+        self._session.note_endpoint_reason(reason, budget_s=budget)
         self.on_ptt_release()                # -> worker: finalize + STT + dispatch + speak
 
     @property

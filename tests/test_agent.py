@@ -308,7 +308,8 @@ def test_llm_call_timing_is_logged_without_goal_or_message_content(tmp_path, cap
     llm_lines = [r.message for r in caplog.records if "LLM_CALL_" in r.message]
     assert len(llm_lines) == 2   # one per generate() call
     for line in llm_lines:
-        assert "LLM_CALL_DONE attempt=" in line
+        # the line now names the provider too, which is what makes a failover readable in the log
+        assert "LLM_CALL_DONE provider=" in line and "attempt=" in line
         assert "duration=" in line
         assert "SUPER_SECRET_GOAL_TEXT" not in line   # never the goal/message text
     assert "tool_calls=1" in llm_lines[0]

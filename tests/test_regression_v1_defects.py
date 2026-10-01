@@ -186,8 +186,7 @@ def test_d04b_harness_owner_written_pairing_window_is_redeemable(tmp_path):
     assert PairingManager(state).redeem(token) == "phone"
 
 
-@_xfail("D-04b", "an agent-created pairing_window.json (MEDIUM, autonomous) becomes a valid pairing window")
-def test_d04b_agent_cannot_plant_a_pairing_window_in_the_state_dir():
+def test_d04b_agent_cannot_plant_a_pairing_window_in_the_state_dir():        # fixed by T1.1 (engine-protected roots)
     home = Path(os.path.expanduser("~"))              # sandboxed by the T0.1 fixture
     state = Config({}).state_dir()                    # the (sandboxed) ~/.void
     fa = FileActions(allowed_roots=[home], delete_to_recycle_bin=True)   # broad roots, like the owner's C:\

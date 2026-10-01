@@ -1,0 +1,127 @@
+# Development configuration for the "Hey V.O.I.D." wake-word model.
+#
+# This is a SMALL, FAST configuration whose only job is to prove the pipeline
+# works end-to-end (generate -> augment -> features -> train -> evaluate ->
+# export). It is NOT expected to produce a robust wake-word model - scale
+# n_samples/n_samples_val/training_steps up substantially, and switch
+# tts_backend to "piper" (once piper-sample-generator is set up locally), for
+# a production attempt. See ../README.md for the full explanation.
+#
+# Phonetic note: the target phrase is written here as plain "hey void" (not
+# "Hey V.O.I.D." with periods) so every TTS backend reads it as the ordinary
+# English word "void", not as spelled-out letters or a normalized acronym.
+# This was a deliberate, explicit check (not an assumption) - see README.
+
+model_name: "hey_void"
+target_phrase: "hey void"
+output_dir: "models"
+data_dir: "data"
+
+seed: 1234
+
+# --- positive sample generation (training/generate_positive.py) -----------
+positive:
+  tts_backend: "sapi"              # "sapi" (dev, no extra assets) or "piper" (production)
+  n_samples: 200                   # dev scale; a production run needs several thousand+
+  n_samples_val: 50
+  voices: ["David", "Zira"]        # installed SAPI voices (see wakeword-training/README.md
+                                    # for how this list was inventoried) - cycled by
+                                    # SapiSampleGenerator._voice_tokens instead of leaving
+                                    # every positive clip on one single default voice
+  # Only used when tts_backend == "piper":
+  piper_sample_generator_path: ""  # local checkout of github.com/rhasspy/piper-sample-generator
+  piper_voices: []                 # one or more .onnx Piper voice model paths
+
+# --- negative sample generation (training/generate_negative.py) -----------
+negative:
+  tts_backend: "sapi"
+  n_adversarial_phrases: 15        # phonetically-similar phrases generated via
+                                    # openwakeword.data.generate_adversarial_texts
+  n_adversarial_samples: 200
+  n_noise_samples: 200             # synthetic white/pink noise clips (numpy only)
+  n_neutral_speech_samples: 100    # ordinary sentences, spoken, as a speech-negative stand-in
+  val_fraction: 0.25               # independently-generated val counts, not a post-hoc
+                                    # split of the training clips (avoids train/val leakage)
+  custom_negative_phrases:
+    - "hey voice"
+    - "hey boy"
+    - "hey voided"
+    - "hey world"
+    - "okay void"
+  neutral_sentences:
+    - "what time is it"
+    - "turn on the lights"
+    - "play some music"
+    - "set a timer for five minutes"
+    - "what is the weather today"
+    - "remind me to call mom later"
+    - "how far is it to the airport"
+    - "can you open the calendar"
+    - "what's on my schedule tomorrow"
+    - "turn down the volume please"
+    - "i need to buy groceries this weekend"
+    - "did you see the game last night"
+    - "the coffee machine is broken again"
+    - "can you send that email for me"
+    - "what's the capital of france"
+    - "i'll be home around six o'clock"
+    - "please close the garage door"
+    - "how do you spell that word"
+    - "can you check my email"
+    - "i think it's going to rain later"
+    - "let's order pizza for dinner"
+    - "the meeting got moved to friday"
+    - "can you turn off the television"
+    - "i left my keys on the counter"
+    - "what's the traffic like right now"
+    - "can you set an alarm for seven"
+    - "i need to charge my phone"
+    - "the dog needs to go for a walk"
+    - "did you finish the report yet"
+    - "can you play my favorite playlist"
+    - "i'm running a few minutes late"
+    - "what's the score of the game"
+    - "can you find a good restaurant nearby"
+    - "the printer is out of paper again"
+    - "i forgot to lock the front door"
+    - "can you tell me a joke"
+    - "what's the news today"
+    - "i need to schedule a dentist appointment"
+    - "can you increase the brightness"
+    - "let's watch a movie tonight"
+
+# --- augmentation (training/augment.py) ------------------------------------
+augmentation:
+  enabled: true
+  variants_per_clip: 2
+  gain_db_range: [-6, 6]
+  pitch_semitone_range: [-2, 2]
+  add_noise_probability: 0.5
+  noise_snr_db_range: [5, 15]
+  bandstop_probability: 0.3
+  distortion_probability: 0.2
+  reverb_probability: 0.3
+
+# --- feature extraction (training/extract_features.py) --------------------
+features:
+  sample_rate: 16000
+  # Chosen so a whole clip's embedding sequence is ~16 frames (the model's
+  # input_shape[0]) - training/extract_features.py verifies this explicitly
+  # against the installed openwakeword version and searches nearby durations
+  # if this exact value doesn't land on 16, rather than assuming the formula.
+  clip_seconds: 2.1
+
+# --- model / training (training/train.py) ----------------------------------
+model:
+  model_type: "dnn"                # matches openwakeword.train.Model's supported types
+  layer_dim: 32
+  n_blocks: 1
+  batch_size: 16
+  training_steps: 200              # dev scale; production runs are often tens of thousands
+  learning_rate: 0.001
+  val_every_n_steps: 25
+
+# --- evaluation (training/evaluate.py) -------------------------------------
+evaluation:
+  threshold: 0.5
+  target_fp_per_hour: 0.5

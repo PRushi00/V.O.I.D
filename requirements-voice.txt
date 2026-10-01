@@ -14,3 +14,8 @@ numpy>=1.24             # audio buffers
 keyboard>=0.13          # global push-to-talk hotkey
 openwakeword>=0.6       # local wake-word detection (Phase 9C; needs a custom
                         # "Hey V.O.I.D." model - no pretrained model is bundled)
+
+# Optional: GPU speech-to-text (voice.stt_device: cuda). CTranslate2 bundles cuDNN but not cuBLAS.
+# Measured on an RTX 5070: 1092 ms -> 115 ms mean decode at identical end-to-end accuracy. Without it
+# V.O.I.D falls back to cpu/int8 automatically, so this is a speed-up, not a requirement.
+nvidia-cublas-cu12; platform_system == "Windows"

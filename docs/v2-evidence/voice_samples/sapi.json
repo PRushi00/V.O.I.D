@@ -1,0 +1,156 @@
+[
+ {
+  "provider": "sapi",
+  "voice": "Microsoft David Desktop",
+  "line": "V01_ack_short",
+  "render_total_s": 0.026,
+  "audio_s": 1.26
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft David Desktop",
+  "line": "V02_ack_yes",
+  "render_total_s": 0.007,
+  "audio_s": 1.27
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft David Desktop",
+  "line": "V03_conversation",
+  "render_total_s": 0.03,
+  "audio_s": 10.6
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft David Desktop",
+  "line": "V04_technical",
+  "render_total_s": 0.022,
+  "audio_s": 11.4
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft David Desktop",
+  "line": "V05_question",
+  "render_total_s": 0.011,
+  "audio_s": 5.95
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft David Desktop",
+  "line": "V06_confirmation",
+  "render_total_s": 0.01,
+  "audio_s": 5.49
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft David Desktop",
+  "line": "V07_error",
+  "render_total_s": 0.011,
+  "audio_s": 7.28
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft David Desktop",
+  "line": "V08_long",
+  "render_total_s": 0.036,
+  "audio_s": 22.98
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft David Desktop",
+  "line": "V09_pronunciation",
+  "render_total_s": 0.031,
+  "audio_s": 19.65
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft David Desktop",
+  "line": "V10_interrupt_setup",
+  "render_total_s": 0.029,
+  "audio_s": 19.35
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft David Desktop",
+  "line": "V11_interrupt_reply",
+  "render_total_s": 0.004,
+  "audio_s": 2.34
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft Zira Desktop",
+  "line": "V01_ack_short",
+  "render_total_s": 0.016,
+  "audio_s": 1.3
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft Zira Desktop",
+  "line": "V02_ack_yes",
+  "render_total_s": 0.006,
+  "audio_s": 1.34
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft Zira Desktop",
+  "line": "V03_conversation",
+  "render_total_s": 0.038,
+  "audio_s": 10.3
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft Zira Desktop",
+  "line": "V04_technical",
+  "render_total_s": 0.032,
+  "audio_s": 11.41
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft Zira Desktop",
+  "line": "V05_question",
+  "render_total_s": 0.015,
+  "audio_s": 5.87
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft Zira Desktop",
+  "line": "V06_confirmation",
+  "render_total_s": 0.013,
+  "audio_s": 5.33
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft Zira Desktop",
+  "line": "V07_error",
+  "render_total_s": 0.017,
+  "audio_s": 7.2
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft Zira Desktop",
+  "line": "V08_long",
+  "render_total_s": 0.056,
+  "audio_s": 22.78
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft Zira Desktop",
+  "line": "V09_pronunciation",
+  "render_total_s": 0.043,
+  "audio_s": 19.15
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft Zira Desktop",
+  "line": "V10_interrupt_setup",
+  "render_total_s": 0.045,
+  "audio_s": 18.91
+ },
+ {
+  "provider": "sapi",
+  "voice": "Microsoft Zira Desktop",
+  "line": "V11_interrupt_reply",
+  "render_total_s": 0.005,
+  "audio_s": 2.43
+ }
+]

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 
 from void.actions.base import Tool, ToolResult
+from void.security.protected import EngineProtected
 from void.security.risk import RiskLevel
 
 # Directories we never descend into during search - noise and/or huge.
@@ -46,13 +47,17 @@ class PathNotAllowed(Exception):
 
 class FileActions:
     def __init__(self, allowed_roots: list[Path], delete_to_recycle_bin: bool = True,
-                 protected_roots: list[Path] | None = None):
+                 protected_roots: list[Path] | None = None,
+                 engine_protected: EngineProtected | None = None):
         # Resolve roots once; empty list means "no confinement" (discouraged).
         self.allowed_roots = [Path(r).resolve() for r in allowed_roots]
         # Protected roots are EXCLUSIONS that override allowed_roots. Anything
         # inside a protected root is denied even when it also sits inside an
         # allowed root (e.g. OneDrive Personal under an authorized C:\).
         self.protected_roots = [Path(r).resolve() for r in (protected_roots or [])]
+        # ENGINE-protected paths (V.O.I.D's own state/secrets, credential stores, ...): fixed by the engine, not by
+        # config or the model. ``protected_roots`` above can only ADD to them; nothing here removes one.
+        self._engine = engine_protected if engine_protected is not None else EngineProtected.default()
         self.delete_to_recycle_bin = delete_to_recycle_bin
 
     # --- safety --------------------------------------------------------
@@ -63,6 +68,8 @@ class FileActions:
         Uses Path-based containment (never string prefixes), so a protected
         root ``.../Projects`` does not accidentally match ``.../ProjectsBackup``.
         """
+        if self._engine.covers(path):
+            return True
         for pr in self.protected_roots:
             try:
                 if path == pr or path.is_relative_to(pr):
@@ -80,13 +87,17 @@ class FileActions:
         except OSError:
             return True  # if we cannot tell, treat as a link and skip it
 
-    def _confine(self, path_str: str) -> Path:
+    def _confine(self, path_str: str, write: bool = False) -> Path:
         """Resolve a path and ensure it is allowed and not protected.
 
-        Precedence: canonicalize -> PROTECTED check (deny) -> allowed check.
-        Protected roots always win, so an excluded subtree is denied regardless
-        of what the caller (or the LLM) requests.
+        Precedence: ENGINE protection (raw form + identity) -> canonicalize -> PROTECTED check (deny) -> allowed
+        check. Protected roots always win, so an excluded subtree is denied regardless of what the caller (or the
+        LLM) requests. ``write`` additionally refuses the engine's write-deny roots (system dirs, V.O.I.D's code).
         """
+        reason = self._engine.denies(path_str, write=write)
+        if reason is not None:
+            raise PathNotAllowed(
+                f"That location is protected by V.O.I.D ({reason}) and cannot be accessed by file tools.")
         path = Path(os.path.expanduser(path_str)).resolve()
         # Protected roots override everything, evaluated after canonicalization
         # (so traversal and symlinks cannot slip past the exclusion).
@@ -461,7 +472,7 @@ class FileActions:
     def write(self, path: str, content: str, overwrite: bool = False) -> ToolResult:
         """Create or update a text file. Overwriting requires overwrite=True."""
         try:
-            p = self._confine(path)
+            p = self._confine(path, write=True)
         except PathNotAllowed as exc:
             return ToolResult.failure(str(exc), error=str(exc))
         existed = p.exists()
@@ -480,7 +491,7 @@ class FileActions:
     def delete(self, path: str) -> ToolResult:
         """Delete a file by sending it to the Recycle Bin (recoverable)."""
         try:
-            p = self._confine(path)
+            p = self._confine(path, write=True)
         except PathNotAllowed as exc:
             return ToolResult.failure(str(exc), error=str(exc))
         if not p.exists():

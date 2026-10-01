@@ -1,0 +1,91 @@
+==============================================================================
+ADVERSARIAL FALSE-POSITIVE PHRASE-ATTRIBUTION ANALYSIS
+==============================================================================
+27 adversarial-category false positives analyzed (at threshold 0.5), out of 150 adversarial validation clips.
+
+------------------------------------------------------------------------------
+CONFIRMED (facts directly recoverable from current files)
+------------------------------------------------------------------------------
+- All 27 flagged files exist on disk, unmodified, at the paths listed below.
+- WAV metadata: every one of the 27 files contains ONLY 'fmt ' and 'data' RIFF chunks - no embedded comment/INFO/LIST chunk of any kind. SAPI's SpFileStream writes bare PCM with zero metadata.
+- Directory structure: adversarial WAVs live in a single flat directory per split - no per-phrase subfolder exists.
+- No sidecar file (manifest/csv/json/log/txt) of any kind exists alongside the WAV data anywhere under data/.
+- train_void.py's logging goes to console/stream only (no FileHandler) and only logs directory paths per category, never per-file phrase mapping - nothing persisted to disk.
+- openwakeword.data.generate_adversarial_texts() (the function that produced the adversarial phrase list) draws from the GLOBAL np.random state with no seed argument, and generate_negative.py never seeds that global state before calling it - so even the exact SET of ~15 generated phrases used for this dataset cannot be deterministically reproduced by re-running the generator against the same config.
+- Augmentation type (orig/aug0/aug1) and raw-vs-augmented lineage ARE recoverable via the filename suffix convention, and are reported below.
+
+------------------------------------------------------------------------------
+NOT RECOVERABLE
+------------------------------------------------------------------------------
+Phrase-level attribution is impossible from the current dataset because no filename-to-phrase manifest or recoverable metadata exists.
+(Per instructions: STOPPING phrase-level grouping here - not fabricated.)
+
+------------------------------------------------------------------------------
+FUTURE IMPROVEMENT (not implemented - recommendation only)
+------------------------------------------------------------------------------
+filename -> phrase:      generate_negative.py's TTS-generation loops (adversarial and neutral-speech) already know, at generation time, which phrase index/text produced each output file (tts_backends.py's generate() iterates 'texts[i % len(texts)]' per sample) - this could be written to a sidecar manifest (e.g. a <category>_manifest.jsonl with {filename, phrase} per line) with a small, additive change to SapiSampleGenerator.generate() / PiperSampleGenerator.generate() and their callers, at negligible cost.
+
+filename -> voice:       Similarly, _voice_tokens()/the resolved voice per sample index is already computed inside generate() and could be recorded per file in the same manifest.
+
+filename -> aug source:  augment_directory() already derives its output filenames deterministically from the source raw file's stem ('{stem}_orig.wav', '{stem}_aug{v}.wav'), so raw-to-augmented traceability already exists structurally via the filename suffix convention - this part does not need a new manifest, only the raw-file-to-phrase/voice manifest above, which the augmented filename stem would then transitively inherit.
+
+------------------------------------------------------------------------------
+RAW-SOURCE CLUSTERING (grouping by filename stem - NOT phrase identity)
+------------------------------------------------------------------------------
+14 distinct raw adversarial recordings (out of 50 in the adversarial validation split) account for all 27 false positives - the errors are NOT spread independently across augmentation randomness. 5 of those raw recordings have ALL THREE variants (the unaugmented original plus both augmented copies) scoring as false positives, contributing 15/27 of the total - since the unaugmented original is already a false positive in these cases, the confusion originates in the raw recording itself, not in anything augmentation adds. This is a genuine, filename-derivable pattern (grouping by raw-source stem), distinct from and not reliant on phrase-text identity, which remains unrecoverable.
+
+                              stem  #FP variants             variants   all-3?
+  784f56c0face4c7a95836d988a4df446             3       aug0,aug1,orig     True
+  8ce69e698dbb4990bd5850cf637e4aee             3       aug0,aug1,orig     True
+  acbe9b7e5e30470abe28ae07f8976bd0             3       aug0,aug1,orig     True
+  bf178098d3e24cf2ba169be4c107f3c1             3       aug0,aug1,orig     True
+  cb53489939ed44fb9d51cb3818c343e2             3       aug0,aug1,orig     True
+  1579cc3425f74c80beec78b3aaaee402             2            aug0,aug1    False
+  1a6ca9cbab7a4c10a226b0521e3ed83e             2            aug0,orig    False
+  730cbdaace5f4541bf73c617d890ac8f             2            aug1,orig    False
+  1477f0ac1165413bbea5f223804e5664             1                 aug1    False
+  3b3f20deb34c4270a6b2415ce0718b07             1                 aug1    False
+  4550edfc44214b8ea2cae1258df2fbe4             1                 aug0    False
+  5eee0b9f701c4ee68b7a075e496cf71f             1                 aug0    False
+  b742a085ef7e4b1ebcda26ce08617dbe             1                 aug1    False
+  c39cb3572da7493e91e8e6b5244d73f6             1                 aug1    False
+
+------------------------------------------------------------------------------
+PER-FP INSPECTION (all 27 adversarial false positives at threshold 0.5)
+------------------------------------------------------------------------------
+  score    aug   dur_s       rms  fp@0.6  fp@0.7  filename
+ 0.9323   aug0   2.038    9643.4    True    True  acbe9b7e5e30470abe28ae07f8976bd0_aug0.wav
+ 0.9311   aug1   1.634    1809.0    True    True  bf178098d3e24cf2ba169be4c107f3c1_aug1.wav
+ 0.9304   aug0   1.694     553.9    True    True  784f56c0face4c7a95836d988a4df446_aug0.wav
+ 0.9271   aug1   1.520    2334.2    True    True  8ce69e698dbb4990bd5850cf637e4aee_aug1.wav
+ 0.9260   aug1   2.097   10044.4    True    True  b742a085ef7e4b1ebcda26ce08617dbe_aug1.wav
+ 0.9223   aug1   1.304    1211.5    True    True  1579cc3425f74c80beec78b3aaaee402_aug1.wav
+ 0.9223   orig   1.609    2143.3    True    True  1a6ca9cbab7a4c10a226b0521e3ed83e_orig.wav
+ 0.9202   aug0   1.654    1164.6    True    True  cb53489939ed44fb9d51cb3818c343e2_aug0.wav
+ 0.9114   aug0   1.304    1995.0    True    True  1579cc3425f74c80beec78b3aaaee402_aug0.wav
+ 0.9082   aug0   1.947    2026.4    True    True  bf178098d3e24cf2ba169be4c107f3c1_aug0.wav
+ 0.8878   aug0   1.520    2747.1    True    True  8ce69e698dbb4990bd5850cf637e4aee_aug0.wav
+ 0.8857   orig   1.634    1821.2    True    True  bf178098d3e24cf2ba169be4c107f3c1_orig.wav
+ 0.8788   aug0   1.964    2367.3    True    True  5eee0b9f701c4ee68b7a075e496cf71f_aug0.wav
+ 0.8536   aug1   1.674    1572.6    True    True  c39cb3572da7493e91e8e6b5244d73f6_aug1.wav
+ 0.8432   aug1   2.745    7059.6    True    True  acbe9b7e5e30470abe28ae07f8976bd0_aug1.wav
+ 0.8371   aug0   1.609    1338.4    True    True  1a6ca9cbab7a4c10a226b0521e3ed83e_aug0.wav
+ 0.7731   aug1   1.479    1440.3    True    True  730cbdaace5f4541bf73c617d890ac8f_aug1.wav
+ 0.7370   orig   1.479    2634.0    True    True  730cbdaace5f4541bf73c617d890ac8f_orig.wav
+ 0.6778   aug1   3.287    8517.8    True   False  1477f0ac1165413bbea5f223804e5664_aug1.wav
+ 0.6606   orig   1.654    2359.0    True   False  cb53489939ed44fb9d51cb3818c343e2_orig.wav
+ 0.6333   orig   1.694    2495.0    True   False  784f56c0face4c7a95836d988a4df446_orig.wav
+ 0.6333   orig   1.694    2495.0    True   False  acbe9b7e5e30470abe28ae07f8976bd0_orig.wav
+ 0.6089   aug0   1.464    1808.5    True   False  4550edfc44214b8ea2cae1258df2fbe4_aug0.wav
+ 0.6020   orig   1.520    2151.1    True   False  8ce69e698dbb4990bd5850cf637e4aee_orig.wav
+ 0.5761   aug1   1.731    2230.4   False   False  3b3f20deb34c4270a6b2415ce0718b07_aug1.wav
+ 0.5347   aug1   2.398   12380.7   False   False  cb53489939ed44fb9d51cb3818c343e2_aug1.wav
+ 0.5188   aug1   2.681   11888.4   False   False  784f56c0face4c7a95836d988a4df446_aug1.wav
+
+score range: min=0.5188  max=0.9323  mean=0.7916
+still FP at runtime threshold 0.6: 24/27
+still FP at threshold 0.7: 18/27
+
+==============================================================================
+RESULT: Phrase-level attribution was NOT possible. No phrase-level grouping table is produced (per instructions, none was fabricated).
+==============================================================================

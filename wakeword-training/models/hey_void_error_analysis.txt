@@ -1,0 +1,121 @@
+==============================================================================
+hey_void MODEL - ERROR ANALYSIS REPORT (analysis artifact, not a training run)
+==============================================================================
+Model:      C:\V.O.I.D\wakeword-training\models\hey_void.onnx
+Checkpoint: C:\V.O.I.D\wakeword-training\models\hey_void.pt
+Evaluation-config threshold: 0.5   (NOT the runtime threshold)
+Runtime V.O.I.D wake threshold (reference only, unchanged): 0.6
+Positive validation clips: 150   Negative validation clips: 375
+
+--- Sanity check against models/hey_void_evaluation.json ---
+  recomputed_false_positives_at_0.5: 29
+  recomputed_false_negatives_at_0.5: 9
+  matches_evaluation_json_29_fp: True
+  matches_evaluation_json_9_fn: True
+
+--- False-positive breakdown by category (at threshold 0.5) ---
+[adversarial]
+  total samples: 150   FP count: 27   FP rate: 0.18
+  FP score  min=0.5188  max=0.9323  mean=0.7916  median=0.8536
+  still FP at runtime 0.6: 24   still FP at 0.7: 18
+  augmentation-type breakdown of FPs: {'aug0': 9, 'aug1': 11, 'orig': 7}
+
+[noise]
+  total samples: 150   FP count: 0   FP rate: 0.0
+  FP score  min=None  max=None  mean=None  median=None
+  still FP at runtime 0.6: 0   still FP at 0.7: 0
+  augmentation-type breakdown of FPs: {}
+
+[speech]
+  total samples: 75   FP count: 2   FP rate: 0.0267
+  FP score  min=0.705  max=0.8184  mean=0.7617  median=0.7617
+  still FP at runtime 0.6: 2   still FP at 0.7: 2
+  augmentation-type breakdown of FPs: {'aug0': 1, 'orig': 1}
+
+--- False-negative detail (at threshold 0.5), sorted by score ascending ---
+  score=0.0350  category=positive  aug_type=aug1  duration=1.2745s  rms=1433.42  close_to_boundary(<=0.1)=False
+    C:\V.O.I.D\wakeword-training\data\augmented\positive_val\2a7d89a4fd494413b08fc4085d458a95_aug1.wav
+  score=0.0674  category=positive  aug_type=aug0  duration=1.2745s  rms=1337.2  close_to_boundary(<=0.1)=False
+    C:\V.O.I.D\wakeword-training\data\augmented\positive_val\b5d3eacf69d142a39e44b3dfe37a5633_aug0.wav
+  score=0.0774  category=positive  aug_type=aug0  duration=2.0004s  rms=9357.48  close_to_boundary(<=0.1)=False
+    C:\V.O.I.D\wakeword-training\data\augmented\positive_val\184fe2d7537545b6b1ac6d54bc58793c_aug0.wav
+  score=0.0985  category=positive  aug_type=aug1  duration=1.4277s  rms=5358.53  close_to_boundary(<=0.1)=False
+    C:\V.O.I.D\wakeword-training\data\augmented\positive_val\5fc44add649441d0a0d7988ac8193b27_aug1.wav
+  score=0.1987  category=positive  aug_type=aug0  duration=2.6324s  rms=7557.86  close_to_boundary(<=0.1)=False
+    C:\V.O.I.D\wakeword-training\data\augmented\positive_val\02a982b9ba0c4b0f97280c32cb5fca4a_aug0.wav
+  score=0.2064  category=positive  aug_type=aug1  duration=2.5166s  rms=6646.5  close_to_boundary(<=0.1)=False
+    C:\V.O.I.D\wakeword-training\data\augmented\positive_val\5aef9704067a44efac7493ea50baa46b_aug1.wav
+  score=0.2618  category=positive  aug_type=aug1  duration=2.163s  rms=4543.54  close_to_boundary(<=0.1)=False
+    C:\V.O.I.D\wakeword-training\data\augmented\positive_val\159f6e523d3c4d23a48751fb826ef480_aug1.wav
+  score=0.2996  category=positive  aug_type=aug1  duration=1.5844s  rms=1287.86  close_to_boundary(<=0.1)=False
+    C:\V.O.I.D\wakeword-training\data\augmented\positive_val\0993b651d59046ee8409068e279f10cf_aug1.wav
+  score=0.3403  category=positive  aug_type=aug0  duration=1.5844s  rms=1357.86  close_to_boundary(<=0.1)=False
+    C:\V.O.I.D\wakeword-training\data\augmented\positive_val\848beec8fae64e8c96b4998af76cb403_aug0.wav
+
+All 9 false negatives are far below the 0.5 threshold (max score 0.34) - none are borderline/close-to-boundary cases, all are clear misses.
+
+--- Pattern analysis ---
+FP rate by category: {'adversarial': 0.18, 'noise': 0.0, 'speech': 0.0267}
+RMS energy: FP mean=3732.6217  non-FP-negative mean=3762.3632  -> no meaningful difference
+Duration: FP mean=1.8609s  non-FP-negative mean=2.0801s  -> small difference, not a strong pattern
+Augmentation-type distribution, all negatives: {'aug0': 125, 'aug1': 125, 'orig': 125}
+Augmentation-type distribution, FPs only: {'aug0': 10, 'aug1': 11, 'orig': 8}  -> roughly proportional to base rate, no skew
+
+Phrase/voice attribution: Per-file phrase text and per-file TTS voice are NOT recoverable from the current pipeline: SapiSampleGenerator.generate() names output files with uuid4 hex and never writes a filename->text or filename->voice manifest to disk (confirmed by inspecting training/tts_backends.py and training/generate_negative.py just now). Therefore neither 'specific generated phrase' nor 'speaker/voice' can be empirically correlated with false positives from this data; only the category-level (adversarial/noise/speech) and augmentation-type breakdowns above are recoverable and reported.
+
+--- Speaker/negative-voice diversity check (current source, re-verified) ---
+positive.voices in config: ['David', 'Zira']
+generate_negative.py references a voices parameter: False
+get_tts_backend() default voices=None: True
+CONFIRMED (code inspection, current files): generate_negative.py never reads negative.voices and never passes voices= to get_tts_backend(), which defaults voices=None -> SapiSampleGenerator(voices=None) -> a single default SAPI voice for ALL adversarial-phrase and neutral-speech negative clips, even though positive generation now uses ['David','Zira']. This is a verified STRUCTURAL fact, reported as a potential weakness per instructions - see pattern_analysis for whether the error data itself supports it as a cause of the observed false positives (it does not directly, since per-file voice cannot be attributed without a manifest).
+
+--- Threshold table (0.50 - 0.90) ---
+  thr    TP    FN    FP    TN   recall      FPR  precision  runtime?
+  0.5   141     9    29   346     0.94   0.0773     0.8294
+ 0.55   141     9    27   348     0.94    0.072     0.8393
+  0.6   140    10    26   349   0.9333   0.0693     0.8434 <== runtime
+ 0.65   140    10    22   353   0.9333   0.0587     0.8642
+  0.7   140    10    20   355   0.9333   0.0533      0.875
+ 0.75   138    12    18   357     0.92    0.048     0.8846
+  0.8   138    12    17   358     0.92   0.0453     0.8903
+ 0.85   135    15    14   361      0.9   0.0373      0.906
+  0.9   127    23    10   365   0.8467   0.0267      0.927
+
+==============================================================================
+ROOT CAUSE ASSESSMENT
+==============================================================================
+Classification: E - Combination of data/training-capacity limitation and evaluation-data limitation
+
+[Rank 1] Confidence: high (directly supported by per-sample data)
+  False positives are heavily concentrated in the adversarial category: 27/29 (93%) of all FPs, an 18% FP rate within that category (27/150) versus 0% for noise (0/150) and 2.7% for speech (2/75). Many of these are high-confidence (mean score 0.79, median 0.85) and threshold-resistant: 24/27 remain false positives at the runtime threshold of 0.6, and 18/27 remain false positives even at 0.7. This indicates the model has not learned a robust acoustic-phonetic boundary between "hey void" and its deliberately-close adversarial phrases (e.g. "hey voice", "okay void") - consistent with the dev-scale model/data size this config explicitly documents as a proof-of-pipeline configuration, not a production one.
+
+[Rank 2] Confidence: medium (distinct, data-supported pattern, separate from the FP finding)
+  All 9 false negatives are augmented variants (aug0/aug1); zero are unaugmented (_orig) clips, out of 150 positive validation clips split evenly 50/50/50 across orig/aug0/aug1. This suggests the augmentation pipeline (pitch shift, noise, distortion, reverb, bandstop) is pushing some positive examples into misclassification, and/or that the model has not been given enough capacity or positive-source diversity to remain robust across the augmentation range on top of the current 2-voice positive set.
+
+[Rank 3] Confidence: low-to-medium (confirmed structural fact, but NOT empirically attributable to specific false positives with current data)
+  generate_negative.py never passes a voices= argument to get_tts_backend(), and get_tts_backend defaults voices=None -> a single default SAPI voice for ALL adversarial-phrase and neutral-speech negative clips, even though positive generation now cycles ["David","Zira"]. This is a verified asymmetry re-checked in the current source. It is a PLAUSIBLE contributing factor (a single monotone negative voice could share more incidental acoustic similarity with the now-more-varied positive set than a diverse negative voice set would), but per-file voice cannot be recovered from the current dataset (no filename->voice manifest exists), so this cannot be confirmed as a direct cause of the specific 29 false positives - reported as a hypothesis only, per instructions.
+
+[Rank 4] Confidence: contextual limitation, not a cause
+  The validation set is small and entirely synthetic (375 negative clips, ~0.21 hours) - the training pipeline's own evaluate.py caveats already flag this as not representative of real-world robustness. This does not explain the observed 93% adversarial-category concentration, but it does mean the measured 7.73% overall false-accept rate should not be extrapolated to real-world behavior in either direction.
+
+[Rank 5] Confidence: ruled out as primary factor (data-supported)
+  Threshold tuning alone does not resolve the core issue: even at threshold 0.9 (well above the runtime 0.6), 10 false positives remain, and 18/27 adversarial false positives persist at 0.7. Raising the threshold trades recall for a modest FP reduction but does not address the underlying phonetic-discrimination gap.
+
+[Rank 6] Confidence: checked, no correlation found
+  RMS energy (FP mean 3732.6 vs non-FP-negative mean 3762.4) and clip duration (FP mean 1.86s vs 2.08s) show no meaningful difference between false positives and true negatives. Augmentation type is also evenly distributed among false positives (aug0=10, aug1=11, orig=8, roughly matching the 125/125/125 base rate) - augmentation type does NOT correlate with false positives (in contrast to the false-negative pattern above, which is strongly augmentation-linked).
+
+==============================================================================
+ENGINEERING RECOMMENDATION
+==============================================================================
+CURRENT FINDING
+  The new model achieves 0.94 recall and 92.8% accuracy on the current validation set, but 7.73% of negative validation clips are false positives, and this is not evenly distributed: 93% of all false positives (27/29) come from the adversarial (phonetically-similar-phrase) category specifically, at an 18% within-category false-positive rate, versus 0% for synthetic noise and 2.7% for neutral speech. Many of these adversarial false positives are high-confidence (mean 0.79, median 0.85) and persist even at the runtime threshold of 0.6 (24/27) and at 0.7 (18/27). Separately, all 9 false negatives are augmented variants of positive clips - none are unaugmented originals.
+
+ROOT CAUSE / LIKELY CONTRIBUTORS
+  See root_cause_assessment.confidence_ranked_contributors for the full ranked list. In summary: the primary, data-confirmed contributor is a phonetic-discrimination gap specific to the adversarial phrase set (high confidence). A secondary, data-confirmed pattern is that augmentation is implicated in all observed false negatives (medium confidence). A plausible but NOT empirically confirmed contributor is the single-voice negative-generation asymmetry (voices are not wired into generate_negative.py, verified in current source) - flagged as a hypothesis, not a proven cause, since per-file voice/phrase attribution is not recoverable from the current dataset. The small, synthetic-only validation set is a genuine limitation on how far ANY of these conclusions generalize to real-world use. Threshold tuning is confirmed NOT to be a sufficient fix on its own.
+
+NEXT ACTION
+  Manually listen to (or transcribe) the 27 flagged adversarial-category false-positive WAV files - their exact paths are already listed in this report's per_sample data (filter category=="adversarial" and is_false_positive_at_0.5==true) - to determine whether the false positives are concentrated in a small number of specific adversarial phrases (e.g. only "hey voice" or only "okay void") or spread evenly across all ~15-20 generated/custom adversarial phrases. This costs nothing (the files already exist, nothing is regenerated or retrained) and directly determines the next real step: if concentrated in a few phrases, the fix is targeted (e.g. add more negative examples of just those phrases); if spread evenly, it points toward the broader model-capacity/negative-voice-diversity hypotheses above and a different next step. This is the smallest technically justified step before deciding whether to retrain or change any runtime configuration - not performed here, per instructions.
+
+==============================================================================
+Per-sample records (all 525 validation clips with scores/predictions/labels) are in the accompanying hey_void_error_analysis.json under 'per_sample'.
+==============================================================================

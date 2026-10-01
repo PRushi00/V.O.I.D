@@ -14,6 +14,8 @@ tool calls. V.O.I.D's Agent / RiskGate / ToolRegistry remain the executor.
 from __future__ import annotations
 
 import base64
+import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 from void.providers.base import (
@@ -29,6 +31,8 @@ from void.security.credentials import (
     CredentialPool,
     CredentialsExhausted,
 )
+
+_log = logging.getLogger("void.providers.gemini")
 
 
 def _coerce_args(args) -> dict:
@@ -112,6 +116,118 @@ def _classify_error(exc: Exception) -> str:
     return "other"
 
 
+# --- request deadline ---------------------------------------------------
+#
+# Without a deadline one stalled request can hold the whole assistant for the SDK's own (very long) default. The
+# deadline applies to each HTTP request; there is no retry inside it.
+DEFAULT_TIMEOUT_S = 30.0
+_MIN_TIMEOUT_S = 1.0
+_MAX_TIMEOUT_S = 300.0
+
+
+def normalise_timeout(value) -> float:
+    """Config value -> a sane deadline in seconds. Never raises: an unusable value falls back to the default."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_TIMEOUT_S
+    if seconds != seconds:                         # NaN
+        return DEFAULT_TIMEOUT_S
+    return min(max(seconds, _MIN_TIMEOUT_S), _MAX_TIMEOUT_S)
+
+
+# --- thinking configuration ---------------------------------------------
+#
+# Which thinking settings a model accepts differs by family, and sending an unsupported one is a hard 400. So the
+# value is validated against the model BEFORE it is sent, and anything not known to be supported is simply not sent
+# (the model's own default applies). "minimal" in particular is documented for the flash-lite line only; it is never
+# sent to a model that is not known to take it.
+_LEVELS_FLASH_LITE = ("minimal", "low", "medium", "high")
+_LEVELS_GEMINI_3PLUS = ("low", "medium", "high")
+_BUDGET_MAX = 32768
+_UNSET_WORDS = ("", "none", "null", "default", "auto")
+
+
+def _model_thinking_style(model: str) -> tuple[str, tuple[str, ...]]:
+    """('level', allowed_levels) | ('budget', ()) | ('unknown', ())."""
+    m = (model or "").strip().lower()
+    if "flash-lite" in m:
+        return "level", _LEVELS_FLASH_LITE
+    match = re.search(r"gemini-(\d+)(?:\.(\d+))?", m)
+    if match:
+        major = int(match.group(1))
+        if major >= 3:
+            return "level", _LEVELS_GEMINI_3PLUS
+        if major == 2 and match.group(2) == "5":
+            return "budget", ()
+    return "unknown", ()
+
+
+def resolve_thinking(model: str, value) -> tuple[tuple[str, object] | None, str | None]:
+    """Validate a configured thinking value for ``model``.
+
+    Returns ``(setting, warning)``. ``setting`` is ``("level", "low")``, ``("budget", 0)`` or ``None`` (send nothing;
+    the model default applies). ``warning`` explains why a configured value was NOT used; it never contains a secret.
+    """
+    if value is None or (isinstance(value, str) and value.strip().lower() in _UNSET_WORDS):
+        return None, None
+    style, levels = _model_thinking_style(model)
+    if isinstance(value, bool):
+        return None, "thinking must be a level name or an integer budget; ignoring it"
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if re.fullmatch(r"-?\d+", text):
+            value = int(text)
+        else:
+            if style == "level" and text in levels:
+                return ("level", text), None
+            if style == "level":
+                return None, (f"thinking level '{text}' is not supported by {model} "
+                              f"(supported: {', '.join(levels)}); using the model default")
+            if style == "budget":
+                return None, f"{model} takes a numeric thinking budget, not a level; using the model default"
+            return None, f"thinking is not configurable for unrecognised model {model}; using the model default"
+    if isinstance(value, int):
+        if style == "budget" and -1 <= value <= _BUDGET_MAX:
+            return ("budget", value), None
+        if style == "budget":
+            return None, f"thinking budget {value} is out of range; using the model default"
+        return None, f"{model} takes a thinking level, not a numeric budget; using the model default"
+    return None, "thinking value not understood; using the model default"
+
+
+# --- granular failure classification -----------------------------------
+#
+# ``_classify_error`` above answers one question (rotate the credential or not) and is unchanged. This one names the
+# failure so the provider can decide fail-fast vs. bounded agent retry, and so telemetry says WHY without ever
+# carrying the exception text.
+def classify_failure(exc: BaseException) -> str:
+    """One of: rate_limit, auth, not_found, invalid_request, timeout, server, network, other."""
+    base = _classify_error(exc) if isinstance(exc, Exception) else "other"
+    if base == "quota":
+        return "rate_limit"
+    if base == "auth":
+        return "auth"
+    code = getattr(exc, "code", None)
+    status = getattr(exc, "status", None)
+    if isinstance(code, int):
+        if code == 404 or status == "NOT_FOUND":
+            return "not_found"
+        if code in (408, 504) or status == "DEADLINE_EXCEEDED":
+            return "timeout"
+        if code == 400 or status in ("INVALID_ARGUMENT", "FAILED_PRECONDITION"):
+            return "invalid_request"
+        if code >= 500:
+            return "server"
+    names = {c.__name__.lower() for c in type(exc).__mro__}
+    if any("timeout" in n for n in names):
+        return "timeout"
+    if any(k in n for n in names for k in ("connecterror", "connectionerror", "networkerror", "remoteprotocol",
+                                            "gaierror")):
+        return "network"
+    return "other"
+
+
 def _retry_delay_seconds(exc: Exception) -> float | None:
     """Best-effort, never-raising extraction of an explicit retry delay (s)."""
     details = getattr(exc, "details", None)
@@ -153,10 +269,17 @@ class GeminiProvider(LLMProvider):
 
     def __init__(self, model: str = "gemini-1.5-flash",
                  temperature: float = 0.2, max_output_tokens: int = 2048,
-                 credential_pool: CredentialPool | None = None):
+                 credential_pool: CredentialPool | None = None,
+                 timeout_s: float = DEFAULT_TIMEOUT_S, thinking=None):
         self.model = model
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
+        self.timeout_s = normalise_timeout(timeout_s)
+        # Validated once, here. ``thinking_setting`` is what will actually be sent (or None); ``thinking_warning``
+        # says why a configured value was dropped.
+        self.thinking_setting, self.thinking_warning = resolve_thinking(model, thinking)
+        if self.thinking_warning:
+            _log.warning("GEMINI_THINKING_IGNORED %s", self.thinking_warning)
         self._genai = None
         self._types = None
         self._credentials = credential_pool
@@ -195,9 +318,10 @@ class GeminiProvider(LLMProvider):
         is never stored on the provider or logged. Raises CredentialMissing if
         the credential has no stored value.
         """
-        genai, _types = self._sdk()
+        genai, types = self._sdk()
         key = self._pool().get_value(credential)  # raises CredentialMissing
-        return genai.Client(api_key=key)
+        return genai.Client(api_key=key,
+                            http_options=types.HttpOptions(timeout=int(self.timeout_s * 1000)))
 
     def available(self) -> bool:
         """True if the SDK is importable and a usable credential exists.
@@ -329,6 +453,10 @@ class GeminiProvider(LLMProvider):
         tool_payload = self._to_tools(tools)
         if tool_payload:
             kwargs["tools"] = tool_payload
+        if self.thinking_setting is not None:
+            kind, value = self.thinking_setting
+            kwargs["thinking_config"] = (types.ThinkingConfig(thinking_level=value) if kind == "level"
+                                         else types.ThinkingConfig(thinking_budget=value))
         return types.GenerateContentConfig(**kwargs)
 
     def _parse(self, response) -> LLMResponse:
@@ -403,7 +531,18 @@ class GeminiProvider(LLMProvider):
                     model=self.model, contents=contents, config=config)
                 return self._parse(response)
             except Exception as exc:
+                failure = classify_failure(exc)
+                _log.info("GEMINI_CALL_FAILED kind=%s", failure)       # the class only, never the message
                 kind = _classify_error(exc)
+                if failure == "timeout":
+                    # A slow request is not the credential's fault and re-sending it doubles the wait: fail fast.
+                    raise ProviderUnavailable(
+                        f"Gemini did not answer within {self.timeout_s:g}s.") from exc
+                if failure == "not_found":
+                    raise ProviderUnavailable(
+                        f"The Gemini model '{self.model}' was not found.") from exc
+                if failure == "invalid_request":
+                    raise ProviderUnavailable("Gemini rejected the request as invalid.") from exc
                 if kind == "quota":
                     pool.mark_unavailable(
                         cred.name, _cooldown_until(now, _QUOTA_COOLDOWN_S, exc))
@@ -416,8 +555,8 @@ class GeminiProvider(LLMProvider):
                         cred.name, _cooldown_until(now, _AUTH_COOLDOWN_S))
                     last_exc = exc
                     continue
-                # Transient/permanent non-quota error: preserve existing
-                # behavior (the agent's retry loop handles these).
+                # 5xx / network / unrecognised: possibly transient, so preserve existing behavior (the agent's
+                # bounded retry loop handles these; there is no retry here).
                 raise
 
         raise ProviderUnavailable(

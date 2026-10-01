@@ -1,0 +1,28 @@
+[
+ {
+  "provider": "gemini-tts",
+  "model": "gemini-3.1-flash-tts-preview",
+  "voice": "Kore",
+  "line": "V01_ack_short",
+  "chars": 5,
+  "ttfa_s": 1.594,
+  "total_s": 1.903,
+  "audio_s": 1.04,
+  "bytes": 49920,
+  "error": null,
+  "stream_chunks": 26
+ },
+ {
+  "provider": "gemini-tts",
+  "model": "gemini-3.1-flash-tts-preview",
+  "voice": "Kore",
+  "line": "V03_conversation",
+  "chars": 137,
+  "ttfa_s": 1.602,
+  "total_s": 4.381,
+  "audio_s": 8.92,
+  "bytes": 428160,
+  "error": null,
+  "stream_chunks": 223
+ }
+]

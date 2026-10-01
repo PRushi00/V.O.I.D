@@ -20,6 +20,7 @@ from void.memory.persist import Injection, MemorySafeStore, was_redacted
 from void.core.kill_switch import KillSwitch, StopRequested
 from void.core.task import CorruptedTaskState, Status, Task, TaskStore
 from void.providers.base import LLMProvider, ProviderUnavailable
+from void.providers import failures
 from void.security.risk import RiskGate, RiskLevel
 
 # Latency investigation: privacy-safe stage timing only - tool NAMES (engine-
@@ -112,6 +113,10 @@ class AgentResult:
     status: str
     result: str | None
     steps: int
+    #: True when this task COMPLETED by performing a local action whose outcome the owner can already see - an
+    #: application launched, a folder opened. The reply is then a courtesy rather than information, which is why
+    #: the voice session may stay silent. Never set for a failure, a clarification, or anything a model wrote.
+    local_action: bool = False
 
 
 class Agent:
@@ -124,6 +129,7 @@ class Agent:
         store: TaskStore,
         max_steps: int = 12,
         max_retries: int = 2,
+        fallbacks: "list[LLMProvider] | None" = None,
         on_event: OnEvent | None = None,
         defer_confirmation: bool = False,
         memory_context: Callable[[str], list[dict]] | None = None,
@@ -139,6 +145,11 @@ class Agent:
         self.store = MemorySafeStore(store, lambda: self._injection)
         self.max_steps = max_steps
         self.max_retries = max_retries
+        # Providers to hand over to when this one cannot answer, in order. Empty keeps the old behaviour exactly:
+        # bounded retries on one provider, then the task fails.
+        self._fallbacks = list(fallbacks or [])
+        # Set when a task completes because a terminal_on_success tool succeeded; reset for every run.
+        self._completed_by_local_action = False
         self.on_event = on_event or (lambda _msg: None)
         # When True (headless/unattended), a step containing a
         # confirmation-required action is SUSPENDED as AWAITING_CONFIRMATION
@@ -168,6 +179,7 @@ class Agent:
         output starts TAINTED: memory writes proposed from it are quarantined."""
         seen_tool_output = any(m.get("role") == "tool" and m.get("name") != memory_scope.PROPOSE_TOOL
                                for m in task.messages)
+        self._completed_by_local_action = False
         self._scope = memory_scope.RunScope(task_id=task.id, tainted=seen_tool_output)
         self._memory_msgs = None
         self._sticky_memory = was_redacted(task)          # once memory-influenced, a task stays protected
@@ -196,32 +208,63 @@ class Agent:
         return [*messages[:head], *self._memory_msgs, *messages[head:]]
 
     def _generate_with_retry(self, messages: list[dict]):
+        """One model answer, with bounded retries and - when the failure warrants it - another provider.
+
+        How a failure is treated depends on what kind it is (``void/providers/failures``): a 503 is worth one
+        short retry, a bad credential or an exhausted quota is worth none, and an invalid request must surface
+        rather than be re-sent somewhere else. When this provider is out of attempts and the category allows it,
+        the next available provider takes over the SAME conversation. Without fallbacks configured this behaves
+        exactly as it always did.
+        """
         specs = None if self.recall_only else self.tools.specs()
         messages = self._with_memory(messages)
+        chain = [self.provider, *self._fallbacks]
         last_exc: Exception | None = None
-        for attempt in range(self.max_retries + 1):
-            self.kill_switch.raise_if_engaged()
-            t0 = time.monotonic()
-            try:
-                response = self.provider.generate(messages, tools=specs)
-            except ProviderUnavailable:
-                raise  # not transient - fail fast
-            except Exception as exc:  # transient (network, rate limit, ...)
-                _log.info("LLM_CALL_FAILED attempt=%d duration=%.2fs %s",
-                          attempt + 1, time.monotonic() - t0, type(exc).__name__)
+        for index, provider in enumerate(chain):
+            if index:
+                _log.info("LLM_FAILOVER from=%s to=%s reason=%s",
+                          getattr(chain[index - 1], "name", "unknown"),
+                          getattr(provider, "name", "unknown"), failures.classify(last_exc))
+                perf.emit("route", provider=getattr(provider, "name", "unknown"), reason="failover")
+                self.on_event(f"Switching to {getattr(provider, 'name', 'another provider')}.")
+                self.provider = provider
+            attempt = 0
+            while True:
+                self.kill_switch.raise_if_engaged()
+                t0 = time.monotonic()
+                try:
+                    response = self.provider.generate(messages, tools=specs)
+                except Exception as exc:
+                    category = failures.classify(exc)
+                    allowed, may_failover = failures.policy(category)
+                    _log.info("LLM_CALL_FAILED provider=%s attempt=%d duration=%.2fs %s category=%s",
+                              getattr(provider, "name", "unknown"), attempt + 1,
+                              time.monotonic() - t0, type(exc).__name__, category)
+                    perf.emit("llm", attempt=attempt + 1, duration_s=round(time.monotonic() - t0, 3),
+                              ok=False, error_class=type(exc).__name__,
+                              provider=getattr(provider, "name", "unknown"))
+                    last_exc = exc
+                    attempt += 1
+                    # Shortening the retries is only a good trade when there is somewhere to go. On the LAST
+                    # provider in the chain there is not, so a retryable category keeps the full budget rather
+                    # than making a single-provider setup less resilient than it was.
+                    budget = min(allowed, self.max_retries + 1)
+                    if allowed > 1 and index == len(chain) - 1:
+                        budget = self.max_retries + 1
+                    if attempt < budget:
+                        self.on_event(f"LLM call failed (attempt {attempt}): {exc}")
+                        time.sleep(failures.backoff_s(attempt - 1))
+                        continue
+                    if not may_failover:
+                        raise                     # the request itself is wrong; another provider cannot help
+                    break                         # out of attempts here: try the next provider, if any
+                n_calls = len(response.tool_calls) if response.has_tool_calls else 0
+                _log.info("LLM_CALL_DONE provider=%s attempt=%d duration=%.2fs tool_calls=%d",
+                          getattr(provider, "name", "unknown"), attempt + 1,
+                          time.monotonic() - t0, n_calls)
                 perf.emit("llm", attempt=attempt + 1, duration_s=round(time.monotonic() - t0, 3),
-                          ok=False, error_class=type(exc).__name__,
-                          provider=getattr(self.provider, "name", "unknown"))
-                last_exc = exc
-                self.on_event(f"LLM call failed (attempt {attempt + 1}): {exc}")
-                time.sleep(min(2 ** attempt, 5))
-                continue
-            n_calls = len(response.tool_calls) if response.has_tool_calls else 0
-            _log.info("LLM_CALL_DONE attempt=%d duration=%.2fs tool_calls=%d",
-                      attempt + 1, time.monotonic() - t0, n_calls)
-            perf.emit("llm", attempt=attempt + 1, duration_s=round(time.monotonic() - t0, 3),
-                      ok=True, tool_calls=n_calls, provider=getattr(self.provider, "name", "unknown"))
-            return response
+                          ok=True, tool_calls=n_calls, provider=getattr(provider, "name", "unknown"))
+                return response
         raise last_exc  # type: ignore[misc]
 
     @staticmethod
@@ -373,6 +416,126 @@ class Agent:
         self.store.save(task)
         return self._loop(task)
 
+    def run_direct(self, goal: str, calls, reply_on_denied: str = "I need your approval for that, so I didn't do it.",
+                   ) -> AgentResult | None:
+        """Run engine-chosen tool calls WITHOUT a model (the deterministic fast path).
+
+        ``calls`` are ``DirectCall``s built by ``void.core.fast_path``: a tool name plus arguments the ENGINE picked
+        (an alias key or a catalog app_id - never text from the request). Each goes through ``_run_call``, the same
+        funnel a model-proposed call uses, so the kill switch, the tool's risk level, ``RiskGate.authorize``,
+        tainting and telemetry all apply unchanged. Alternatives are tried in order; the first success ends the run.
+
+        Returns None - having executed nothing that succeeded - when the ordinary agent should handle the goal
+        instead: an action the risk gate would ask the owner about (the normal loop owns confirmation and its
+        deferral), or every alternative failed. A denial by the gate is final and is reported, not retried through
+        another path. ``self.provider`` is never touched.
+        """
+        task = Task(goal=goal)
+        self._begin_run(task)
+        try:
+            for call in calls:
+                tool = self.tools.get(call.name)
+                if tool is None or self.risk_gate.requires_confirmation(tool.effective_risk(call.arguments)):
+                    return None
+                msg, ok, _first, kind, _n = self._run_call(call.name, call.arguments)
+                if ok:
+                    return self._finish_direct(task, call.reply, [msg])
+                if kind == "unauthorized":
+                    return self._finish_direct(task, reply_on_denied, [msg], status=Status.FAILED)
+        except StopRequested as stop:
+            task.status = Status.PAUSED
+            task.error = f"Stopped: {stop}"
+            self.store.save(task)
+            self.on_event(f"Task {task.id} paused by kill switch. Resumable.")
+            return self._result(task)
+        return None
+
+    def run_direct_targets(self, goal: str, targets, failures=(),
+                           reply_on_denied: str = "I need your approval for that, so I didn't do it.",
+                           ) -> AgentResult | None:
+        """Run several independent groups of engine-chosen calls (the multi-application fast path).
+
+        ``targets`` is a sequence of ``(label, alternatives)`` pairs from ``void.core.fast_path``: within a target
+        the alternatives are tried in order until one succeeds (alias, then catalog), and each TARGET runs whatever
+        the others did. ``failures`` are targets that resolved to nothing before execution - they are reported, not
+        executed, and they never prevent the ones that resolved from running.
+
+        Returns None - having executed nothing that succeeded - when the ordinary agent should own the sentence
+        instead: any target whose tool is unknown or would need the owner's confirmation (checked over EVERY target
+        before the first one executes, so a command is never half-done and then deferred), or a run in which nothing
+        opened and a launch was attempted and failed. A name that simply is not installed is answered here instead,
+        because the ordinary path searches the same catalog and cannot do better.
+        """
+        # A local import: fast_path owns every user-facing sentence of this path, and imports nothing of agent.
+        from void.core.fast_path import cannot_find_sentence, opening_sentence
+        groups = [(label, tuple(calls)) for label, calls in targets]
+        for _label, calls in groups:
+            for call in calls:
+                tool = self.tools.get(call.name)
+                if tool is None or self.risk_gate.requires_confirmation(tool.effective_risk(call.arguments)):
+                    return None
+        task = Task(goal=goal)
+        self._begin_run(task)
+        messages: list[dict] = []
+        opened: list[str] = []
+        missing = [str(f) for f in failures]        # resolved to NOTHING: reported, never executed
+        broke: list[str] = []                       # resolved, but the launch itself failed
+        try:
+            for label, calls in groups:
+                done = False
+                for call in calls:
+                    msg, ok, _first, kind, _n = self._run_call(call.name, call.arguments)
+                    messages.append(msg)
+                    if ok:
+                        opened.append(label)
+                        done = True
+                        break
+                    if kind == "unauthorized":
+                        # A denial is final and is reported as such, for THIS target only.
+                        return self._finish_direct(task, reply_on_denied, messages, status=Status.FAILED)
+                if not done:
+                    broke.append(label)
+        except StopRequested as stop:
+            task.status = Status.PAUSED
+            task.error = f"Stopped: {stop}"
+            self.store.save(task)
+            self.on_event(f"Task {task.id} paused by kill switch. Resumable.")
+            return self._result(task)
+        if not opened:
+            if broke or not missing:
+                # A launch that was attempted and failed is the ordinary agent's to retry or explain - returning
+                # None here is what preserves that, and it is why a refused protected target still reaches it.
+                return None
+            return self._finish_direct(task, cannot_find_sentence(missing), messages, status=Status.FAILED)
+        unopened = missing + broke
+        reply = cannot_find_sentence(unopened) if unopened else opening_sentence(opened)
+        # A partial result must be HEARD, so it is not reported as a silent local action.
+        return self._finish_direct(task, reply, messages, local_action=not unopened)
+
+    def _result(self, task: Task) -> AgentResult:
+        """The run's outcome. Central so every exit reports ``local_action`` consistently."""
+        return AgentResult(task, task.status, task.result, task.steps,
+                           local_action=(self._completed_by_local_action
+                                         and task.status == Status.COMPLETED))
+
+    def _finish_direct(self, task: Task, reply: str, tool_messages: list[dict],
+                       status: str = Status.COMPLETED, local_action: bool | None = None) -> AgentResult:
+        task.messages = [{"role": "user", "content": task.goal},
+                         *tool_messages,
+                         {"role": "assistant", "content": reply}]
+        task.steps = 1
+        task.status = status
+        if status == Status.COMPLETED:
+            task.result = reply
+        else:
+            task.error = reply
+        self.store.save(task)
+        self.on_event(reply)
+        silent = (status == Status.COMPLETED) if local_action is None else local_action
+        return AgentResult(task, task.status,
+                           task.result if status == Status.COMPLETED else reply, task.steps,
+                           local_action=silent)
+
     def resume(self, task: Task) -> AgentResult:
         # A status outside the known Status set (corrupted row, or from an
         # incompatible future version) must never fall through to the loop
@@ -388,20 +551,20 @@ class Agent:
         if task.status in Status.TERMINAL:
             self.on_event(
                 f"Task {task.id} is already {task.status}; nothing to resume.")
-            return AgentResult(task, task.status, task.result, task.steps)
+            return self._result(task)
         # A task waiting for confirmation must NOT execute anything on a plain
         # resume - it stays awaiting until an explicit approve/deny.
         if task.status == Status.AWAITING_CONFIRMATION and task.pending:
             self.on_event(
                 f"Task {task.id} is awaiting owner confirmation; "
                 f"approve or deny to proceed.")
-            return AgentResult(task, task.status, task.result, task.steps)
+            return self._result(task)
         # Ambiguous find_directory (or other engine BLOCKED state) stays
         # blocked until the owner clarifies; do not resume into COMPLETED.
         if task.status == Status.BLOCKED:
             self.on_event(
                 f"Task {task.id} is blocked pending clarification.")
-            return AgentResult(task, task.status, task.result, task.steps)
+            return self._result(task)
         self.on_event(f"Resuming task {task.id} from step {task.steps}.")
         self._begin_run(task)
         return self._loop(task)
@@ -423,7 +586,7 @@ class Agent:
             self.on_event(
                 f"Task {task.id} is already {task.status}; its pending action "
                 f"cannot be executed.")
-            return AgentResult(task, task.status, task.result, task.steps)
+            return self._result(task)
         if not task.pending:
             return self.resume(task)
         if task.pending.get("kind") == "directory_disambiguation":
@@ -488,7 +651,7 @@ class Agent:
             task.status = Status.PAUSED
             task.error = "Stopped by kill switch during confirmed step."
             self.store.save(task)
-            return AgentResult(task, task.status, task.result, task.steps)
+            return self._result(task)
 
         unresolved = self._has_unresolved_failure(kinds)
         _record("succeeded" if all(oks) else "failed", oks, stopped=False,
@@ -498,7 +661,7 @@ class Agent:
         task.steps += 1
         task.pending = None
         if self._apply_find_directory_block(task, find_data):
-            return AgentResult(task, task.status, task.result, task.steps)
+            return self._result(task)
         task.status = Status.RUNNING
         self.store.save(task)
         return self._loop(task)
@@ -609,6 +772,9 @@ class Agent:
         if ack is not None:
             task.result = ack
             task.status = Status.COMPLETED
+            # The answer IS the tool's own outcome line, for a tool whose success ends the task (launch_app,
+            # open_path). Record that so the voice session can let the action speak for itself.
+            self._completed_by_local_action = True
             self.store.save(task)
             _log.info("AUTO_COMPLETE tool=%s (skipped final LLM call)",
                       tool_calls[0].name)
@@ -774,7 +940,7 @@ class Agent:
         if task.status in Status.TERMINAL:
             self.on_event(
                 f"Task {task.id} is already {task.status}; nothing to resume.")
-            return AgentResult(task, task.status, task.result, task.steps)
+            return self._result(task)
 
         pending = task.pending
         if not pending or pending.get("kind") != "directory_disambiguation":
@@ -790,7 +956,7 @@ class Agent:
             )
             self.store.save(task)
             self.on_event(task.error)
-            return AgentResult(task, task.status, task.result, task.steps)
+            return self._result(task)
 
         self._begin_run(task)
         chosen = candidates[idx - 1]
@@ -851,7 +1017,7 @@ class Agent:
                 if response.has_tool_calls:
                     outcome = self._commit_step(task, response)
                     if outcome in ("paused", "awaiting", "blocked", "completed"):
-                        return AgentResult(task, task.status, task.result, task.steps)
+                        return self._result(task)
                     continue  # 'continue'
 
                 # No tool calls -> LLM offered a final answer. The engine
@@ -870,36 +1036,36 @@ class Agent:
                         task.status = Status.FAILED
                         task.error = f"Completion refused: {reason}"
                     self.store.save(task)
-                    return AgentResult(task, task.status, task.result, task.steps)
+                    return self._result(task)
                 task.result = final
                 task.status = Status.COMPLETED
                 self.store.save(task)
-                return AgentResult(task, task.status, task.result, task.steps)
+                return self._result(task)
 
             # Safety cap reached.
             task.status = Status.FAILED
             task.error = f"Reached max_steps ({self.max_steps}) without finishing."
             self.store.save(task)
             self.on_event(task.error)
-            return AgentResult(task, task.status, task.result, task.steps)
+            return self._result(task)
 
         except StopRequested as stop:
             task.status = Status.PAUSED
             task.error = f"Stopped: {stop}"
             self.store.save(task)
             self.on_event(f"Task {task.id} paused by kill switch. Resumable.")
-            return AgentResult(task, task.status, task.result, task.steps)
+            return self._result(task)
 
         except ProviderUnavailable as exc:
             task.status = Status.FAILED
             task.error = str(exc)
             self.store.save(task)
             self.on_event(f"No LLM available: {exc}")
-            return AgentResult(task, task.status, task.result, task.steps)
+            return self._result(task)
 
         except Exception as exc:  # unexpected - checkpoint so we can inspect
             task.status = Status.FAILED
             task.error = f"{type(exc).__name__}: {exc}"
             self.store.save(task)
             self.on_event(f"Task failed: {task.error}")
-            return AgentResult(task, task.status, task.result, task.steps)
+            return self._result(task)

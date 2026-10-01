@@ -7,7 +7,10 @@ themselves are validated separately against real audio (see
 wakeword-training/docs/gen3.md)."""
 from __future__ import annotations
 
+import sys
 import time
+import types
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -255,3 +258,72 @@ def test_infer_loop_emits_periodic_processing_active_health_marker(caplog, monke
     assert markers
     for r in markers:
         assert "last_score=" in r.message and "threshold=" in r.message
+
+
+# --- CPU budget of the always-on encoder ---------------------------------------------------------
+#
+# The detector encodes a 2 s window every 200 ms forever. CTranslate2's default is to use every core, which measured
+# SLOWER and far more erratic than one thread (p50 168 ms / p95 403 ms vs 88 / 92 on 24 idle cores) while saturating
+# the machine and starving the STT decode of the command that follows the wake. See docs/VOICE_LATENCY_2026-09-23.md.
+
+def test_the_encoder_is_built_with_a_bounded_cpu_thread_count():
+    import void.voice.whisper_gen3_wake as mod
+    seen = {}
+
+    class _FakeWhisperModel:
+        def __init__(self, name, device=None, compute_type=None, cpu_threads=None):
+            seen.update(name=name, device=device, compute_type=compute_type, cpu_threads=cpu_threads)
+
+    sys_mod = types.ModuleType("faster_whisper")
+    sys_mod.WhisperModel = _FakeWhisperModel
+    with mock.patch.dict(sys.modules, {"faster_whisper": sys_mod}):
+        det = mod.WhisperGen3WakeDetector(classifier_path="x.onnx", cpu_threads=2,
+                                          _session_factory=lambda: _FakeSession(0.0))
+        det._load()
+    assert seen["cpu_threads"] == 2 and seen["device"] == "cpu"
+
+
+def test_the_default_cpu_thread_count_is_one_and_bad_values_fall_back_safely():
+    import void.voice.whisper_gen3_wake as mod
+    assert mod._DEFAULT_CPU_THREADS == 1
+    mk = lambda t: mod.WhisperGen3WakeDetector(classifier_path="x.onnx", cpu_threads=t)   # noqa: E731
+    assert mk(None)._cpu_threads == 1 and mk("nonsense")._cpu_threads == 1
+    assert mk(0)._cpu_threads == 1 and mk(-4)._cpu_threads == 1      # never 0/negative (= "all cores" in ct2)
+    assert mk(3)._cpu_threads == 3
+    assert mod.WhisperGen3WakeDetector(classifier_path="x.onnx")._cpu_threads == 1
+
+
+def test_the_config_key_reaches_the_detector():
+    from void.config import Config
+    from void.voice.wake import create_wake_detector
+    d = create_wake_detector(Config({"voice": {"wake_provider": "whisper_gen3",
+                                               "wake_model_path": "x.onnx", "wake_cpu_threads": 4}}))
+    assert d._cpu_threads == 4
+    shipped = create_wake_detector(Config.load())      # the shipped default stays bounded
+    assert shipped._cpu_threads == 1
+
+
+def test_the_onnx_classifier_session_pool_is_bounded_too():
+    """ORT sizes its intra-op pool to every core and spin-waits between runs: 20.6 cores of continuous idle load vs
+    0.30 when bounded, at identical per-inference time (docs/VOICE_LATENCY_2026-09-23.md)."""
+    import void.voice.whisper_gen3_wake as mod
+    made = {}
+
+    class _Opts:
+        intra_op_num_threads = None
+        inter_op_num_threads = None
+
+    def _session(path, sess_options=None, providers=None):
+        made.update(path=path, opts=sess_options, providers=providers)
+        return _FakeSession(0.0)
+
+    fake_ort = types.ModuleType("onnxruntime")
+    fake_ort.SessionOptions = _Opts
+    fake_ort.InferenceSession = _session
+    fw = types.ModuleType("faster_whisper")
+    fw.WhisperModel = lambda *a, **k: object()
+    with mock.patch.dict(sys.modules, {"onnxruntime": fake_ort, "faster_whisper": fw}):
+        det = mod.WhisperGen3WakeDetector(classifier_path=__file__, cpu_threads=2)
+        det._load()
+    assert made["opts"].intra_op_num_threads == 2 and made["opts"].inter_op_num_threads == 2
+    assert made["providers"] == ["CPUExecutionProvider"]

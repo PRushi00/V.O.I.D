@@ -1,0 +1,22 @@
+# Generated data/models - never commit these; they're large and reproducible
+# from the pipeline itself.
+data/positive/
+data/negative/
+data/augmented/
+data/features/
+data/validation/*
+!data/validation/.gitkeep
+models/*.onnx
+models/*.onnx.data
+models/*.pt
+models/*.json
+# Timestamped snapshots of the above, taken before a retrain. Same category, same reason, different directory name -
+# generated, superseded, and referenced by nothing in the pipeline or the runtime.
+models_backup_*/
+
+# The dedicated training venv (never V.O.I.D's own .venv).
+.venv-training/
+venv-training/
+
+__pycache__/
+*.pyc

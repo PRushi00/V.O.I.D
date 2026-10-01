@@ -12,23 +12,86 @@ app:
 llm:
   # Which provider drives planning/tool-calling by default.
   # Order defines fallback: if the primary is unavailable, the next is tried.
+  # Online brain: Gemini gemini-3.8-flash (existing Gemini credentials). Offline/degraded brain: local Ollama. The OpenAI-
+  # compatible (FreeModel) and AgentRouter providers stay registered but are NOT in the default order; name one as
+  # llm.primary in config/local_config.yaml to use it.
   primary: "gemini"
   fallback: ["local"]
 
+  openai:
+    model: "gpt-5.6-sol"
+    # Per-request deadline in seconds (1-300).
+    timeout_s: 60
+    # NO key here. Credentials are read from the environment: OPENAI_API_KEY (primary) and, only when a credential-
+    # specific failure (401/403/429) occurs, OPENAI_API_KEY_BACKUP_1 .. OPENAI_API_KEY_BACKUP_4 in that order.
+
+  agentrouter:
+    # Third-party OpenAI-compatible gateway (https://agentrouter.org/v1) - NOT OpenAI. Not in the default order: select it with
+    # llm.primary: "agentrouter" in config/local_config.yaml. Credential: AGENTROUTER_API_KEY (environment); never here.
+    model: "gpt-5.6-sol"
+    timeout_s: 60
+
   gemini:
-    model: "gemini-3.6-flash"
+    model: "gemini-3.8-flash"
     # API key is NOT stored here. It is read from the OS secret store under
     # service="void", key="gemini_api_key". Set it with:
     #   python -m void set-key gemini
     temperature: 0.2
     max_output_tokens: 2048
+    # Per-request deadline in seconds (1-300). A request that has not answered by then fails fast (no retry).
+    timeout_s: 30
+    # Thinking effort, validated against the model before it is sent. A level name ("low"/"medium"/"high";
+    # "minimal" only on flash-lite models) or, for gemini-2.5, an integer budget. Empty = the model's own default.
+    # An unsupported value is NOT sent (a warning is logged) instead of failing the request.
+    # "low" (evidence-based, 2026-09-22, docs/GEMINI_3_8_FLASH.md): a same-config A/B against the model default showed
+    # thinking="low" answering trivial/tool-selection prompts in ~2-6s with ~0 thinking tokens, vs ~8-11s and ~230+
+    # thinking tokens at the model's own default - a meaningful latency win, with tool-calling logic unaffected
+    # (thinking_config is independent of the tools payload; see gemini_provider._generate_config).
+    thinking: "low"
 
   local:
-    # V1: EXPERIMENTAL / unverified fallback. Gemini is the primary V1 brain.
+    # Offline / degraded fallback brain (used when the primary has no usable credential).
     # Local fallback via Ollama (https://ollama.com). Runs on the RTX 5070.
-    base_url: "http://localhost:11434"
-    model: "llama3.1:8b"
+    # 127.0.0.1, not "localhost": on a default Windows install "localhost" resolves to the IPv6 ::1 first and
+    # Ollama listens only on IPv4, so every call waited ~2 s for that connection to fail before retrying.
+    # Measured 2026-09-24: readiness probe 2110 ms -> 16 ms, generation 4.32 s -> 2.17 s.
+    base_url: "http://127.0.0.1:11434"
+    # Measured 2026-09-24: llama3.1:8b was NOT installed, so available() was False and this fallback brain was
+    # unreachable - a Gemini outage failed the task outright. qwen3:8b is what Ollama actually has here, and
+    # answers in ~2.65 s warm with think=false (vs a 14-16 s hard failure).
+    model: "qwen3:8b"
     temperature: 0.2
+    # Request deadline in seconds.
+    timeout_s: 120
+    # Thinking-capable models (e.g. qwen3) reason for seconds before answering: false skips that (measured ~2.7 s vs
+    # ~9.5 s p50 for a tool call), true keeps it, null leaves the model's default. Models that do not support the
+    # option are detected once and asked without it.
+    think: false
+    # Context window in tokens (V.O.I.D's prompt + tool schemas is ~2.3k) and how long the model stays loaded.
+    num_ctx: 8192
+    keep_alive: "10m"
+
+fast_path:
+  # "Open <something not installed>" is answered here instead of being handed to the model. Measured 2026-09-24:
+  # "Open Notepad++" (not installed) used to cost 12 model calls and end in "The task failed" - 1.4 min at the
+  # owner's Gemini p50 and 7.4 min at p90. The model cannot do better, because its find_app tool reads the same
+  # catalog the resolver just searched. Set false to send unresolvable names to the model as before.
+  answer_unknown_apps: true
+  # Resolve a spoken FOLDER name deterministically, instead of sending it to the model. A shallow index of the
+  # owner's own directories (home plus the allowed roots, folder_depth levels down) is matched by IDENTITY only -
+  # the same name, or the same name spaced differently. Never a prefix, never phonetic, never fuzzy; two matches
+  # ask rather than guess, and an installed application always wins its own name. Every candidate passes the file
+  # layer's confinement, so allowed_roots and protected_roots still decide what can be seen and opened.
+  # The alternative was measured and is not usable here: find_directory walks the whole allowed tree and takes
+  # 13.7-24.6 s with allowed_roots ["C:\\"], returning "ambiguous" for ordinary names anyway.
+  resolve_folders: true
+  folder_depth: 3                # 3 reaches ~/OneDrive/<x>/Projects, which is where OneDrive redirection puts it
+  folder_ttl_s: 600              # seconds a scan is trusted (measured: 196 directories in 217 ms)
+  # A plain "open <known app>" command (an alias such as notepad/chrome/vscode, or an application in the
+  # Start-Menu catalog with exactly one exact-name match) runs with NO model call. It still goes through the kill
+  # switch, risk gate and telemetry. Anything else - unknown/ambiguous apps, compound requests, paths, shells -
+  # goes to the model as before. Set false to send every command through the model.
+  enabled: true
 
 agent:
   max_steps: 12          # safety cap on tool-call iterations per goal
@@ -86,11 +149,23 @@ voice:
   ptt_strict_chord: true         # true: the chord's modifiers (Ctrl) MUST be held; a bare Space does
                                  # nothing (D-02). false restores the V1 behaviour (last key only).
   stt_model: "small"             # faster-whisper model (tiny|base|small|medium)
-  stt_device: "cpu"              # "cpu" (int8) or "cuda"
+  # Measured 2026-09-24 on this machine (RTX 5070), same audio and same decoding options:
+  #   cpu  / int8     1092 ms mean decode
+  #   cuda / float16   115 ms mean decode   (9.5x faster, 806 MB VRAM)
+  # End-to-end accuracy was IDENTICAL (11/14 spoken commands opened the right application under both), so
+  # this is latency bought for nothing. A machine without a usable GPU falls back to cpu/int8 automatically
+  # with a warning - the GPU path needs the CUDA 12 runtime wheels (nvidia-cublas-cu12).
+  stt_device: "cuda"             # "cpu" or "cuda"; falls back to cpu automatically when unusable
+  stt_compute_type: "float16"    # cpu: int8 | cuda: float16 (int8_float16 uses less VRAM, same speed)
   stt_language: "en"
   stt_beam_size: 1               # 1 = greedy (fast, best for short commands); 5 = library default
   stt_vad_filter: true           # trim non-speech before Whisper (accuracy; auto-falls back if unavailable)
   speak_responses: true          # speak the reply through local TTS
+  # A local action that succeeded is its own confirmation: the application window appears. Speaking
+  # "Opening VS Code." afterwards adds ~1.7-2.4 s of talking to a command that finished in ~10 ms.
+  # Failures, clarifications ("I found more than one match"), "I can't find X" and every answer a model
+  # writes are still spoken - only a COMPLETED local action is silent. true restores the confirmation.
+  speak_successful_actions: false
   tts_provider: "sapi"           # local TTS backend: "sapi" (Windows) or "null"
   tts_rate: 1                    # SAPI speaking rate -10..10 (0 = normal); 1 ~= moderately faster
   # Wake word (Phase 9C-1: detector boundary only - NOT wired to the session
@@ -100,17 +175,51 @@ voice:
   wake_provider: "openwakeword"  # wake backend: "openwakeword" or "null"
   wake_model_path: ""            # path to a custom "Hey V.O.I.D." model (required)
   wake_threshold: 0.6            # conservative: prefer a miss over a false wake
+  wake_cpu_threads: 1            # cores the always-on Gen 3 wake encoder may use. The library default (ALL cores)
+                                 # measured slower AND more erratic than 1 (p50 168ms/p95 403ms vs 88/92 for a 2s
+                                 # window on 24 cores) while saturating the machine and starving the STT decode that
+                                 # follows a wake. Raise only with measurements. See docs/VOICE_LATENCY_2026-09-23.md.
   # Wake-initiated capture endpointing (Phase 9C-3). Wake has no physical PTT
   # release, so a wake capture always ends on one of these bounded conditions -
   # never "listen forever". A simple int16 RMS energy gate marks "speech"; it is
   # not a full VAD. Values are validated (clamped to safe minimums) on load.
   wake_no_speech_timeout: 4.0    # seconds to wait for any speech after wake
-  wake_silence_timeout: 0.8      # seconds of trailing silence that ends an utterance (snappier)
+  # Measured 2026-09-24 by replaying 95 recordings of the OWNER's voice (originals plus speed/noise
+  # variants) through the production endpointer. Below 0.6 s their own pauses start being mistaken for the
+  # end of the command: 0.5 s truncated 3 recordings, 0.3 s truncated 4. At 0.6 s, none.
+  # One deterministic speech-to-text pass. faster-whisper's own default retries a segment at rising temperature
+  # (up to six passes) whenever a decode looks bad: measured here that is free on audio it decodes confidently and
+  # 2.0x-7.2x slower on audio it does not, where it also returns a DIFFERENT transcript on every run because
+  # sampling above 0 is stochastic. Resolution accuracy over 46 synthesised commands was identical either way.
+  # Set to null to restore the retry. See docs/STT_AND_MULTI_APP_2026-09-28.md.
+  stt_temperature: 0.0
+  wake_silence_timeout: 0.6      # the SAFE trailing-silence budget: the maximum, and the fallback. Validated:
+                                 # 0.5 s truncated 3 of the owner's recordings, 0.6 s truncated none.
+  # ADAPTIVE trailing silence. Measured over 95 recordings of the owner's voice (52 internal gaps), the longest
+  # silence INSIDE an utterance depends on how much speech has already been heard: up to 0.51 s before 0.30 s of
+  # speech, never more than 0.30 s after it. So the full budget is paid only while the utterance could still be at
+  # that fragile beginning, and a shorter one once it is clearly under way. Measured effect on the owner's own
+  # recordings: endpoint p50 0.45 -> 0.30 s, p90 0.57 -> 0.39 s, with ZERO truncations - where the same 0.40 s
+  # applied unconditionally truncates 2 of 20. See docs/VOICE_ENDPOINTING_V5_2026-10-01.md.
+  wake_fast_silence_timeout: 0.4 # the shorter budget. Set to >= wake_silence_timeout to disable all of this.
+  wake_fast_after_speech: 0.3    # voiced seconds that must have accumulated before the shorter budget applies
+  wake_fast_until_speech: 1.8    # ...and after which the safe budget returns: past this the owner is speaking a
+                                 # SENTENCE, whose clause breaks are long (measured: a 0.45 s break after 2.58 s of
+                                 # speech), and which is followed by a model call of several seconds anyway.
+  wake_pause_evidence: 0.2       # a SURVIVED internal gap this long means this utterance has pauses in it, and the
+                                 # safe budget returns for the rest of it. Measured: with this latch a second pause
+                                 # of up to 420 ms survives, exactly as under the old fixed budget; without it,
+                                 # only 240 ms. 0 disables the latch.
   wake_max_capture_seconds: 15.0 # hard cap on one wake-initiated capture
   min_speech_ms: 250             # a capture with less speech than this (a clipped wake-word tail, a tap) never
                                  # reaches STT/the agent: Whisper invents words from slivers. 0 disables the guard
   wake_rearm_delay_ms: 500       # settle time (post TTS/command) before re-arming wake
-  wake_energy_threshold: 500     # int16 RMS at/above which a frame counts as speech
+  # 500 was too high for this microphone: 14 of those 95 recordings never crossed it, so real commands were
+  # dismissed as 'no speech' after a 4 s wait (141 such captures in the telemetry), and quiet frames inside a
+  # command started the trailing-silence timer while the owner was still talking. At 300 only 3 are missed and
+  # truncation at 0.6 s drops from 4 to 0. The owner's room floor is ~14 RMS, so 300 keeps a wide margin, and
+  # the negative corpus shows no increase in noise holding a capture open (123/220 clips at 300 vs 121 at 500).
+  wake_energy_threshold: 300     # int16 RMS at/above which a frame counts as speech
   wake_lead_grace_s: 0.4         # after wake, keep the command window open this long before
                                  # silence/no-speech can end it (so the wake tail + the pause
                                  # before the command are never mistaken for a finished utterance)

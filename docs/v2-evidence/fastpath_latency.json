@@ -1,0 +1,52 @@
+{
+  "n": 300,
+  "catalog_discovery_once": {
+    "entries": 157,
+    "build_ms": 8.5
+  },
+  "reference_model_latency_s": {
+    "gemini-3.5-flash-lite (minimal), tool call p50": 1.3,
+    "ollama qwen3:8b (think off), tool call p50": 2.7,
+    "gemini-3.6-flash (current config), 'Open Notepad.' 7.5/9.0/6.4 s -> median": 7.5
+  },
+  "paths": {
+    "model_path": {
+      "llm_calls_total": 300,
+      "llm_calls_per_command": 1.0,
+      "routing": {
+        "p50": 4.863,
+        "p95": 5.686,
+        "max": 9.907
+      },
+      "execution": {
+        "p50": 0.0,
+        "p95": 0.001,
+        "max": 0.004
+      },
+      "total": {
+        "p50": 7.342,
+        "p95": 8.465,
+        "max": 14.35
+      }
+    },
+    "fast_path": {
+      "llm_calls_total": 0,
+      "llm_calls_per_command": 0.0,
+      "routing": {
+        "p50": 0.091,
+        "p95": 0.135,
+        "max": 4.301
+      },
+      "execution": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "max": 0.0
+      },
+      "total": {
+        "p50": 2.489,
+        "p95": 2.953,
+        "max": 7.329
+      }
+    }
+  }
+}

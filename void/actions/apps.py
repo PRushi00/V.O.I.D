@@ -15,7 +15,7 @@ import webbrowser
 from pathlib import Path
 
 from void.actions.base import Tool, ToolResult
-from void.actions.computer import AppCatalog, ComputerBackendError
+from void.actions.computer import AppCatalog, ComputerBackendError, is_app_user_model_id
 from void.actions.files import FileActions, PathNotAllowed
 from void.security.risk import RiskLevel
 
@@ -79,10 +79,14 @@ class AppActions:
         return ToolResult.success(f"Opened {p}.")
 
     def _default_launch(self, kind: str, target: str) -> None:
-        """No-shell OS launch of a validated target: a resolved .exe via Popen,
-        or a Start-Menu .lnk via os.startfile. Never a shell/command string."""
+        """No-shell OS launch of a validated target: a resolved .exe via Popen, a Start-Menu .lnk via os.startfile,
+        or a Store app by AppUserModelID via explorer's AppsFolder. Never a shell/command string."""
         if kind == "lnk":
             os.startfile(target)  # type: ignore[attr-defined]
+        elif kind == "uwp":
+            if not is_app_user_model_id(target):
+                raise OSError("refusing to launch a malformed application id")
+            subprocess.Popen(["explorer.exe", "shell:AppsFolder\\" + target])
         else:
             subprocess.Popen([target])
 
@@ -105,10 +109,19 @@ class AppActions:
             except ComputerBackendError:
                 entry = None
             if entry is not None:
-                if not AppCatalog.revalidate(entry):
+                if not self._catalog.validate(entry):
                     return ToolResult.failure(
                         f"'{entry.name}' is no longer available at its known "
                         f"location; re-run find_app.")
+                if entry.kind == "uwp":
+                    # A Store app is addressed by AppUserModelID, not by a path, so the protected-LOCATION check does
+                    # not apply (there is no file to protect). What must hold is that the id is still well formed.
+                    if not is_app_user_model_id(entry.target):
+                        return ToolResult.failure(
+                            f"'{entry.name}' has an unusable application id and will not be launched.")
+                elif self._files._engine.denies_launch(entry.target) is not None:
+                    return ToolResult.failure(
+                        f"'{entry.name}' is stored in a location protected by V.O.I.D and will not be launched.")
                 try:
                     self._launch(entry.kind, entry.target)
                 except OSError as exc:
@@ -118,8 +131,10 @@ class AppActions:
 
         # 2) Fixed engine-defined alias -> resolve a real exe on PATH (no shell).
         if name.lower() in _APP_ALIASES:
-            exe = next((shutil.which(c) for c in _APP_ALIASES[name.lower()]
-                        if shutil.which(c)), None)
+            # One PATH scan per candidate, not two. shutil.which walks every PATH directory (19.6 ms for
+            # "code" here), and the previous form called it once to test the candidate and again to take it.
+            exe = next((found for c in _APP_ALIASES[name.lower()]
+                        if (found := shutil.which(c))), None)
             if exe:
                 try:
                     subprocess.Popen([exe])

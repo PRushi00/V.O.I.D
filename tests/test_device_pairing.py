@@ -4,11 +4,12 @@ ordinarily separate process invocations sharing state only via this file,
 the same pattern void.core.kill_switch already uses for its stop file)."""
 import json
 import logging
+import time
 
 import pytest
 
 from void.device import pairing as pairing_mod
-from void.device.pairing import PairingError, PairingManager
+from void.device.pairing import EXPIRED, NO_WINDOW, PairingError, PairingManager
 
 
 def test_begin_then_redeem_happy_path(tmp_path):
@@ -157,3 +158,69 @@ def test_unexpected_read_error_is_logged_distinctly_from_a_genuine_absence(
     assert exc.value.reason == pairing_mod.NO_WINDOW
     assert any("PAIRING_FILE_READ_FAILED" in r.message and "PermissionError" in r.message
               for r in caplog.records)
+
+
+# --- F: window protection (T1.1 companion) ---------------------------------
+
+def _plant(tmp_path, **fields):
+    import json
+    (tmp_path / "pairing_window.json").write_text(json.dumps({"token": "PLANTED", "name": "evil", **fields}),
+                                                  encoding="utf-8")
+
+
+def test_a_window_never_outlives_its_configured_lifetime(tmp_path):
+    pm = PairingManager(tmp_path, window_seconds=60)
+    t = pm.begin("phone", now=1000.0)
+    assert t.expires_at == 1060.0
+    with pytest.raises(PairingError) as e:
+        pm.redeem(t.token, now=1061.0)
+    assert e.value.reason == EXPIRED
+
+
+def test_a_planted_far_future_window_is_not_honoured(tmp_path):
+    """A file claiming a much longer window than begin() can issue was not written by this code."""
+    _plant(tmp_path, expires_at=time.time() + 10**9)
+    with pytest.raises(PairingError) as e:
+        PairingManager(tmp_path).redeem("PLANTED")
+    assert e.value.reason == EXPIRED
+    assert not (tmp_path / "pairing_window.json").exists()          # and it is discarded, not left armed
+
+
+@pytest.mark.parametrize("bad", ["Infinity", "NaN", "1e999"])
+def test_a_non_finite_expiry_is_not_a_window_that_never_expires(tmp_path, bad):
+    (tmp_path / "pairing_window.json").write_text(
+        '{"token": "PLANTED", "name": "evil", "expires_at": %s}' % bad, encoding="utf-8")
+    with pytest.raises(PairingError) as e:
+        PairingManager(tmp_path).redeem("PLANTED")
+    assert e.value.reason == NO_WINDOW
+
+
+def test_a_redeemed_token_cannot_be_replayed(tmp_path):
+    pm = PairingManager(tmp_path)
+    t = pm.begin("phone")
+    assert pm.redeem(t.token) == "phone"
+    for _ in range(3):
+        with pytest.raises(PairingError):
+            pm.redeem(t.token)
+
+
+def test_a_wrong_guess_neither_opens_nor_burns_the_window_and_the_right_token_still_works(tmp_path):
+    pm = PairingManager(tmp_path)
+    t = pm.begin("phone")
+    for guess in ("", "x", t.token[:-1], t.token + "x", t.token.upper()):
+        with pytest.raises(PairingError):
+            pm.redeem(guess)
+    assert pm.redeem(t.token) == "phone"
+
+
+def test_the_window_file_lives_only_in_the_state_dir_which_the_file_tools_cannot_write(tmp_path):
+    from void.actions.files import FileActions
+    from void.security.protected import EngineProtected
+    state = tmp_path / ".void"
+    state.mkdir()
+    pm = PairingManager(state)
+    pm.begin("phone")
+    assert pm._path.parent == state
+    fa = FileActions([tmp_path], engine_protected=EngineProtected.default(state_dir=state))
+    for verb in (lambda p: fa.write(str(p), "x", overwrite=True), lambda p: fa.delete(str(p)), lambda p: fa.read(str(p))):
+        assert not verb(pm._path).ok

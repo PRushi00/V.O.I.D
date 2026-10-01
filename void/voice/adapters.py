@@ -344,23 +344,51 @@ class FasterWhisperSTT(STT):
         utterances; greedy decoding is the bigger perceived-latency win.
       * ``condition_on_previous_text=False`` - each command is independent, so
         the prior-text context (a hallucination source) is dropped.
+      * ``temperature=0`` - ONE deterministic pass. faster-whisper's default
+        retries a segment at rising temperature (up to six passes) whenever the
+        decode looks bad. Measured on this machine, alternating both settings on
+        the same warm model: no difference on audio it decodes confidently
+        (102 vs 105 ms, identical text) and **2.0x-7.2x slower** on difficult
+        audio, where every run also produced a DIFFERENT transcript because
+        sampling above 0 is stochastic. Resolution accuracy over 46 synthesised
+        commands was identical either way (91 %), so the retry costs latency and
+        repeatability and buys nothing. ``temperature=None`` restores it.
       * optional ``vad_filter`` trims non-speech so Whisper transcribes only the
         voiced span (a small accuracy win). It uses faster-whisper's bundled
         Silero VAD; if that asset/runtime is unavailable we transparently retry
         without it, so enabling it never reduces reliability.
       * ``warmup()`` loads the model (and runs one tiny dummy decode) ahead of
         time so the FIRST real command doesn't pay the cold-start cost.
+      * ``device``/``compute_type`` select the backend. Measured on this machine
+        (docs/VOICE_PIPELINE_V2_2026-09-24.md), same audio and same options:
+        cpu/int8 1092 ms mean, cuda/float16 **115 ms** - and identical
+        end-to-end accuracy (11/14 commands opened the right application under
+        both). A configured device that cannot be used falls back to cpu/int8
+        with a warning rather than leaving the owner unable to speak.
+
+    Biasing the decoder towards the installed application names was measured and
+    REJECTED (docs/VOICE_REGRESSION_2026-09-24.md): with the display names the
+    catalog can actually supply it was WORSE than plain decoding, and it glued
+    the verb to the name ("OpenWindows Terminal"), which the launch grammar
+    cannot parse. Only a hand-curated list of spoken forms helped, and that is
+    the application list automatic discovery exists to avoid.
     """
+
+    #: What to fall back to when the configured device cannot be used.
+    _CPU_FALLBACK = ("cpu", "int8")
 
     def __init__(self, model_name: str = "small", device: str = "cpu",
                  compute_type: str = "int8", language: str = "en",
-                 beam_size: int = 1, vad_filter: bool = True):
+                 beam_size: int = 1, vad_filter: bool = True,
+                 temperature: float | None = 0.0):
         self._model_name = model_name
         self._device = device
         self._compute_type = compute_type
         self._language = language
         self._beam_size = max(1, int(beam_size))
         self._vad_filter = bool(vad_filter)
+        # None keeps faster-whisper's own rising-temperature retry; a number pins a single deterministic pass.
+        self._temperature = None if temperature is None else float(temperature)
         self._model = None
 
     def _load(self):
@@ -372,19 +400,43 @@ class FasterWhisperSTT(STT):
             raise VoiceDependencyError(
                 "local STT needs 'faster-whisper' "
                 "(pip install -r requirements-voice.txt)") from exc
+        if self._device != "cpu":
+            # CTranslate2 finds its CUDA libraries through PATH; without this, device="cuda" fails on Windows
+            # even with a working GPU and driver.
+            from void.voice import cuda
+            cuda.register()
         try:
             self._model = WhisperModel(
                 self._model_name, device=self._device,
                 compute_type=self._compute_type)
-        except Exception as exc:   # model download / init failure
-            raise STTError(f"could not initialize STT model "
-                           f"'{self._model_name}': {exc}") from exc
+        except Exception as exc:   # model download / init failure, or no usable GPU
+            if (self._device, self._compute_type) == self._CPU_FALLBACK:
+                raise STTError(f"could not initialize STT model "
+                               f"'{self._model_name}': {exc}") from exc
+            # A machine without a GPU, without the CUDA runtime, or with the GPU busy must still hear its owner.
+            _log.warning("STT_DEVICE_UNAVAILABLE device=%s compute=%s falling_back_to=%s (%s)",
+                         self._device, self._compute_type, self._CPU_FALLBACK[0], type(exc).__name__)
+            self._device, self._compute_type = self._CPU_FALLBACK
+            try:
+                self._model = WhisperModel(
+                    self._model_name, device=self._device,
+                    compute_type=self._compute_type)
+            except Exception as exc2:
+                raise STTError(f"could not initialize STT model "
+                               f"'{self._model_name}': {exc2}") from exc2
         return self._model
+
+    @property
+    def device(self) -> str:
+        """The device actually in use - which is not necessarily the one configured."""
+        return self._device
 
     def _decode(self, audio, *, vad: bool) -> str:
         model = self._model
         kwargs = dict(language=self._language, beam_size=self._beam_size,
                       condition_on_previous_text=False)
+        if self._temperature is not None:
+            kwargs["temperature"] = self._temperature
         if vad:
             kwargs["vad_filter"] = True
         segments, _info = model.transcribe(audio, **kwargs)

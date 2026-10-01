@@ -31,3 +31,15 @@ Thumbs.db
 
 # Test run output
 junit.xml
+
+# The owner's voice recordings used to train and evaluate the wake word. These are personal
+# biometric data and must never enter git history; the scripts and config beside them stay trackable.
+wakeword-training/data/**/*.wav
+wakeword-training/data/**/*.npy
+# The rule above is anchored at data/, so it does NOT cover these two, and both must stay out of history:
+#   personal_voice/ is the same recordings again (a staging copy of data/personal_positive) - personal biometric data;
+#   backups/ is 1.1 GB of generated training snapshots (3 timestamped dataset+model copies), superseded and
+#   referenced by nothing in the runtime or the training scripts.
+# Both remain on disk; only Git ignores them.
+wakeword-training/personal_voice/
+wakeword-training/backups/

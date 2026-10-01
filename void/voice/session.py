@@ -48,6 +48,7 @@ class VoiceSession:
                  on_transcript: Callable[[str], None] | None = None,
                  on_message: Callable[[str], None] | None = None,
                  speak_response: bool = True,
+                 speak_successful_actions: bool = False,
                  speak_grace_seconds: float = 0.5,
                  min_speech_ms: float = audio_guard.DEFAULT_MIN_SPEECH_MS,
                  now: Callable[[], float] | None = None):
@@ -60,6 +61,11 @@ class VoiceSession:
         self._on_transcript = on_transcript or (lambda _t: None)
         self._msg = on_message or (lambda _m: None)
         self._speak_response = speak_response
+        # A local action that succeeded is its own confirmation - the window appears - so saying "Opening VS Code."
+        # afterwards adds ~2 s of talking to a command that took milliseconds. Failures, clarifications and
+        # anything a model wrote are unaffected: only AgentResult.local_action is suppressed, and only when the
+        # task COMPLETED. True restores the spoken confirmation.
+        self._speak_successful_actions = speak_successful_actions
         self._min_speech_ms = min_speech_ms      # captures with less speech than this never reach STT
         self._lock = threading.RLock()
         self._state = VoiceState.IDLE
@@ -82,6 +88,7 @@ class VoiceSession:
         self._interaction_id: str | None = None
         self._activation_source = "ptt"
         self._endpoint_reason = "ptt_release"
+        self._endpoint_budget_s: float | None = None
         self._capture_started: float | None = None
 
     # --- observability ------------------------------------------------
@@ -103,10 +110,15 @@ class VoiceSession:
         self._activation_source = source
         self._apply(VoiceEvent.PTT_DOWN)
 
-    def note_endpoint_reason(self, reason: str) -> None:
-        """Telemetry only: why an automatic (wake) capture ended."""
+    def note_endpoint_reason(self, reason: str, budget_s: float | None = None) -> None:
+        """Telemetry only: why an automatic (wake) capture ended, and on which trailing-silence budget.
+
+        ``budget_s`` is a NUMBER of seconds - the adaptive budget that fired - and is meaningful only for the
+        'silence' reason. No decision anywhere depends on it.
+        """
         if reason in ("silence", "no_speech", "max_duration"):
             self._endpoint_reason = reason
+            self._endpoint_budget_s = budget_s if isinstance(budget_s, (int, float)) else None
 
     def on_ptt_release(self) -> None:
         self._apply(VoiceEvent.PTT_UP)
@@ -218,8 +230,11 @@ class VoiceSession:
                             VoiceEvent.INTERNAL_ERROR, gen=g))
                 elif c == VoiceCommand.CAPTURE_FINALIZE:
                     if self._capture_started is not None:
-                        self._perf("endpoint", reason=self._endpoint_reason,
-                                   capture_s=round(self._now() - self._capture_started, 3))
+                        fields = {"reason": self._endpoint_reason,
+                                  "capture_s": round(self._now() - self._capture_started, 3)}
+                        if self._endpoint_budget_s is not None:
+                            fields["budget_s"] = round(float(self._endpoint_budget_s), 3)
+                        self._perf("endpoint", **fields)
                         self._capture_started = None
                     ok, audio = self._safe_finalize_capture()
                     g = self._generation
@@ -305,7 +320,10 @@ class VoiceSession:
             return
         transcript = (transcript or "").strip()
         stt_fields = {"decode_s": round(time.monotonic() - t0, 3), "empty": not transcript,
-                      "backend": type(self._stt).__name__}
+                      "backend": type(self._stt).__name__,
+                      # A COUNT, never the text: a slow decode that produced a long transcript is Whisper working
+                      # harder on this audio, which is not the same thing as a busy machine.
+                      "chars": len(transcript)}
         if n >= 0:
             stt_fields["audio_s"] = round(n / 16000.0, 3)
         self._perf("stt", **stt_fields)
@@ -339,14 +357,22 @@ class VoiceSession:
         else:
             text = getattr(result, "result", None) or ""
             kind = "llm_text" if text else "silent"
+        # A successful local action needs no announcement. The engine decides what counts as one
+        # (AgentResult.local_action); the session only honours it, and never for a status phrase - those exist
+        # precisely because the task needs the owner.
+        silent_action = (status_phrase is None
+                         and getattr(result, "local_action", False)
+                         and not self._speak_successful_actions)
+        if silent_action:
+            kind = "silent"
         self._pending_response = text
         self._perf("respond", kind=kind)
-        if self._speak_response and text:
+        if self._speak_response and text and not silent_action:
             _log.info("DISPATCH_OK -> SPEAK (response_len=%d)", len(text))
             self._apply(VoiceEvent.DISPATCH_OK_SPEAK, gen=gen)
         else:
-            _log.info("DISPATCH_OK -> silent (has_text=%s speak=%s)",
-                      bool(text), self._speak_response)
+            _log.info("DISPATCH_OK -> silent (has_text=%s speak=%s local_action=%s)",
+                      bool(text), self._speak_response, silent_action)
             self._apply(VoiceEvent.DISPATCH_OK_SILENT, gen=gen)
 
     def _run_speak(self, gen: int) -> None:

@@ -43,6 +43,12 @@ _DEFAULT_THRESHOLD = 0.34          # validated Gen3 Exp02 operating point (owner
 _DEFAULT_WINDOW_S = 2.0            # must match training/eval clip_seconds
 _DEFAULT_HOP_S = 0.2              # inference cadence
 _MIN_INFER_SAMPLES = int(0.6 * _SAMPLE_RATE)   # don't score until ~0.6 s has arrived
+# Cores this always-on detector may use, for BOTH of its inference engines. Left at their defaults each one sizes its
+# pool to every core: measured on this 24-core machine, the encode is SLOWER and more erratic that way (2 s window,
+# idle, p50/p95 ms: default(all) 168/403, 8 threads 191/220, 4 threads 110/276, 2 threads 77/108, 1 thread 88/92 -
+# only 1-2 stay under the 200 ms hop at p95), and ONNX Runtime's spin-waiting pool burned 20.6 cores continuously vs
+# 0.30 bounded, with no change in per-inference time. See docs/VOICE_LATENCY_2026-09-23.md.
+_DEFAULT_CPU_THREADS = 1
 _HEALTH_LOG_PERIOD_S = 5.0    # periodic marker cadence; never per-frame/per-inference
 
 
@@ -63,6 +69,7 @@ class WhisperGen3WakeDetector(WakeWordDetector):
                  whisper_compute_type: str = "int8",
                  window_seconds: float = _DEFAULT_WINDOW_S,
                  hop_seconds: float = _DEFAULT_HOP_S,
+                 cpu_threads: int = _DEFAULT_CPU_THREADS,
                  on_wake: Callable[[str], None] | None = None,
                  _encoder_factory: Callable[[], object] | None = None,
                  _session_factory: Callable[[], object] | None = None):
@@ -73,6 +80,10 @@ class WhisperGen3WakeDetector(WakeWordDetector):
         self._whisper_compute_type = whisper_compute_type
         self._window_samples = int(window_seconds * _SAMPLE_RATE)
         self._hop_seconds = float(hop_seconds)
+        try:
+            self._cpu_threads = max(1, int(cpu_threads))
+        except (TypeError, ValueError):
+            self._cpu_threads = _DEFAULT_CPU_THREADS
 
         self._encoder_factory = _encoder_factory
         self._session_factory = _session_factory
@@ -124,8 +135,15 @@ class WhisperGen3WakeDetector(WakeWordDetector):
             except ImportError as exc:
                 raise VoiceDependencyError("gen3 wake word needs 'onnxruntime'") from exc
             try:
+                # ONNX Runtime otherwise sizes its intra-op pool to every core AND spin-waits between runs. The
+                # classifier itself is trivial (microseconds on one thread), but at this cadence that pool measured
+                # 20.6 cores of continuous load vs 0.30 with the pool bounded - same per-inference time. That idle
+                # burn is what starved the STT decode of the command following a wake.
+                opts = ort.SessionOptions()
+                opts.intra_op_num_threads = self._cpu_threads
+                opts.inter_op_num_threads = self._cpu_threads
                 self._session = ort.InferenceSession(
-                    self._classifier_path, providers=["CPUExecutionProvider"])
+                    self._classifier_path, sess_options=opts, providers=["CPUExecutionProvider"])
             except Exception as exc:
                 raise WakeWordBackendError(f"could not load gen3 classifier: {exc}") from exc
         self._input_name = self._session.get_inputs()[0].name
@@ -141,7 +159,8 @@ class WhisperGen3WakeDetector(WakeWordDetector):
             try:
                 self._encoder = WhisperModel(
                     self._whisper_model, device="cpu",
-                    compute_type=self._whisper_compute_type)
+                    compute_type=self._whisper_compute_type,
+                    cpu_threads=self._cpu_threads)
             except Exception as exc:
                 raise WakeWordBackendError(f"could not load Whisper encoder: {exc}") from exc
         return self._encoder

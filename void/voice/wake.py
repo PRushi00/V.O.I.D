@@ -248,6 +248,10 @@ _PROVIDERS: dict[str, Callable[..., WakeWordDetector]] = {
 # scale differs from openWakeWord's, and 0.34 is the validated Exp02
 # operating point (owner-voice recall 22/23). See wakeword-training/docs/gen3.md.
 _DEFAULT_GEN3_THRESHOLD = 0.34
+# Cores the always-on Gen 3 encoder may use. The library default (every core) measured SLOWER and far more erratic
+# than one thread while saturating the machine - see void/voice/whisper_gen3_wake.py and
+# docs/VOICE_LATENCY_2026-09-23.md. Overridable via voice.wake_cpu_threads.
+_DEFAULT_GEN3_CPU_THREADS = 1
 
 
 def register_wake_provider(name: str, factory: Callable[..., WakeWordDetector]) -> None:
@@ -291,6 +295,7 @@ def create_wake_detector(config=None, *, provider: str | None = None,
         return factory(
             classifier_path=_cfg("voice.wake_model_path", "") or None,
             threshold=_cfg("voice.wake_threshold", _DEFAULT_GEN3_THRESHOLD),
+            cpu_threads=_cfg("voice.wake_cpu_threads", _DEFAULT_GEN3_CPU_THREADS),
             on_wake=on_wake,
         )
     return factory(on_wake=on_wake)

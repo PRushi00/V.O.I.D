@@ -1,0 +1,78 @@
+{
+  "model": "gemini-3.8-flash",
+  "n_target_simple_per_cond": 10,
+  "n_target_tool_per_cond": 5,
+  "simple": {
+    "default": {
+      "n_ok": 2,
+      "n_fail": 8,
+      "failures": [
+        "server",
+        "server",
+        "server",
+        "other",
+        "other",
+        "other",
+        "other",
+        "other"
+      ],
+      "p50_s": 9.74,
+      "p95_s": "n/a (n<20)",
+      "max_s": 11.009,
+      "min_s": 8.471,
+      "avg_thinking_tokens": 233.5
+    },
+    "low": {
+      "n_ok": 3,
+      "n_fail": 7,
+      "failures": [
+        "other",
+        "other",
+        "other",
+        "other",
+        "other",
+        "other",
+        "other"
+      ],
+      "p50_s": 2.806,
+      "p95_s": "n/a (n<20)",
+      "max_s": 6.073,
+      "min_s": 2.027,
+      "avg_thinking_tokens": 0.0
+    }
+  },
+  "tool": {
+    "default": {
+      "n_ok": 0,
+      "n_fail": 5,
+      "failures": [
+        "other",
+        "other",
+        "other",
+        "other",
+        "other"
+      ],
+      "p50_s": null,
+      "p95_s": "n/a (n<20)",
+      "max_s": null,
+      "min_s": null,
+      "avg_thinking_tokens": null
+    },
+    "low": {
+      "n_ok": 0,
+      "n_fail": 5,
+      "failures": [
+        "other",
+        "other",
+        "other",
+        "other",
+        "other"
+      ],
+      "p50_s": null,
+      "p95_s": "n/a (n<20)",
+      "max_s": null,
+      "min_s": null,
+      "avg_thinking_tokens": null
+    }
+  }
+}
