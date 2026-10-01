@@ -1,13 +1,21 @@
-"""File actions: search, read, write/update, and safe delete.
+"""File actions: search, inspect, read, write/update, copy, move, and safe delete.
 
 All paths are confined to the configured ``allowed_roots`` so V.O.I.D cannot
 wander outside the owner's intended scope. Deletes go to the Recycle Bin
 (recoverable) - never a hard unlink - in V1.
+
+Operations with two paths (copy, move) confine BOTH ends independently, and
+confine the destination for writing, so a transfer can never be used to reach a
+location that ``write_file`` would itself refuse. Folders are deliberately not
+transferable: one wrong argument on a recursive move is unrecoverable, and
+nothing in V2 needs it.
 """
 from __future__ import annotations
 
+import datetime
 import fnmatch
 import os
+import shutil
 from pathlib import Path
 
 from void.actions.base import Tool, ToolResult
@@ -39,6 +47,40 @@ _CONTEXT_FILLER = frozenset({
     "into", "inside", "within", "under", "below", "from", "folder",
     "directory", "dir", "named", "called", "please",
 })
+
+
+def _risk_path(path_str: object) -> Path | None:
+    """A path a risk decision may be based on, or None when no decision can safely be based on it.
+
+    Needed because ``Path(...).exists()`` fails *open*: on Windows a path containing a NUL byte resolves
+    without raising and then reports that it does not exist, so a nonsense destination was graded MEDIUM
+    (no confirmation) rather than HIGH. Anything that is not a plain, non-empty, NUL-free string is
+    refused here, and the caller fails safe.
+    """
+    if not isinstance(path_str, str) or not path_str.strip() or "\x00" in path_str:
+        return None
+    try:
+        return Path(os.path.expanduser(path_str)).resolve()
+    except (OSError, ValueError):
+        return None
+
+
+def _when(timestamp: float) -> str | None:
+    """A filesystem timestamp as a plain local date and time, or None if it is unusable."""
+    try:
+        return datetime.datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _size(num_bytes: int) -> str:
+    """A byte count a person can hear: "4.2 MB", not "4404019 bytes"."""
+    value = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
 
 
 class PathNotAllowed(Exception):
@@ -519,17 +561,139 @@ class FileActions:
             "security.delete_to_recycle_bin or delete manually."
         )
 
+    def stat(self, path: str) -> ToolResult:
+        """Describe a file or folder without reading its contents: size, dates, kind, read-only flag.
+
+        Read-only and content-free, which is the point: "when did I last touch this?" and "how big is
+        it?" are answerable without a single byte of the file entering V.O.I.D or a model's context.
+        """
+        try:
+            p = self._confine(path)
+        except PathNotAllowed as exc:
+            return ToolResult.failure(str(exc), error=str(exc))
+        if not p.exists():
+            return ToolResult.failure(f"Nothing exists at {p}.")
+        try:
+            info = p.stat()
+        except OSError as exc:
+            return ToolResult.failure(f"Could not read information about {p}: {exc}", error=str(exc))
+        is_dir = p.is_dir()
+        data = {"path": str(p), "name": p.name,
+                "kind": "folder" if is_dir else "file",
+                "size_bytes": None if is_dir else info.st_size,
+                "modified": _when(info.st_mtime),
+                "created": _when(info.st_ctime),
+                "accessed": _when(info.st_atime),
+                "read_only": not os.access(p, os.W_OK),
+                "is_link": self._is_reparse_point(p),
+                "suffix": p.suffix.lower() or None}
+        if is_dir:
+            # A count, not a listing: "how many things are in here" without enumerating names.
+            try:
+                data["entries"] = sum(1 for _ in p.iterdir())
+            except OSError:
+                data["entries"] = None
+            summary = (f"{p.name} is a folder, last modified {data['modified']}"
+                       + (f", containing {data['entries']} item(s)."
+                          if data["entries"] is not None else "."))
+        else:
+            summary = (f"{p.name} is a {_size(info.st_size)} file, last modified "
+                       f"{data['modified']}.")
+        if data["read_only"]:
+            summary += " It is read-only."
+        return ToolResult.success(summary, data=data)
+
+    def copy(self, source: str, destination: str, overwrite: bool = False) -> ToolResult:
+        """Copy a file. Both ends are confined separately, so neither can reach outside the allowed roots.
+
+        Confining the destination with ``write=True`` is what stops a copy being used as a write
+        primitive against a location that ``write_file`` itself would refuse.
+        """
+        return self._transfer(source, destination, overwrite, move=False)
+
+    def move(self, source: str, destination: str, overwrite: bool = False) -> ToolResult:
+        """Move or rename a file. Both ends are confined; the source is confined for writing too,
+        because a move removes it."""
+        return self._transfer(source, destination, overwrite, move=True)
+
+    def _transfer(self, source: str, destination: str, overwrite: bool, *, move: bool) -> ToolResult:
+        verb = "move" if move else "copy"
+        try:
+            # A move deletes the source, so the source needs write authority for a move and only read
+            # authority for a copy. The destination always needs write authority.
+            src = self._confine(source, write=move)
+            dst = self._confine(destination, write=True)
+        except PathNotAllowed as exc:
+            return ToolResult.failure(str(exc), error=str(exc))
+        if not src.exists():
+            return ToolResult.failure(f"Nothing to {verb} at {src}.")
+        if src.is_dir():
+            # Recursive directory transfer multiplies the consequences of one mistaken argument, and
+            # nothing in V2 needs it. Deliberately out of scope rather than quietly supported.
+            return ToolResult.failure(
+                f"I can only {verb} files, not folders. Name a file instead.")
+        if self._is_reparse_point(src):
+            return ToolResult.failure(
+                f"{src} is a link, and I do not {verb} links - the result would be ambiguous.")
+        # A destination naming a directory means "into that directory", which is what a person means by
+        # "move this into Archive"; resolving it here keeps the confinement check above authoritative.
+        if dst.is_dir():
+            dst = dst / src.name
+            try:
+                dst = self._confine(str(dst), write=True)
+            except PathNotAllowed as exc:
+                return ToolResult.failure(str(exc), error=str(exc))
+        if dst == src:
+            return ToolResult.failure(f"The source and destination are the same file ({src}).")
+        if dst.exists() and not overwrite:
+            return ToolResult.failure(
+                f"{dst} already exists. Set overwrite=true to replace it.")
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if move:
+                # replace() is atomic on the same volume and overwrites; across volumes it raises, and
+                # shutil.move handles that case. Only reached when overwrite was authorised above.
+                try:
+                    src.replace(dst)
+                except OSError:
+                    shutil.move(str(src), str(dst))
+            else:
+                shutil.copy2(str(src), str(dst))
+        except OSError as exc:
+            return ToolResult.failure(f"Could not {verb} {src} to {dst}: {exc}", error=str(exc))
+        past = "Moved" if move else "Copied"
+        return ToolResult.success(f"{past} {src.name} to {dst}.", data={"source": str(src),
+                                                                       "destination": str(dst)})
+
     # --- dynamic risk --------------------------------------------------
+
+    def _transfer_risk(self, arguments: dict) -> RiskLevel:
+        """A transfer that would replace an existing file is HIGH; otherwise MEDIUM. Fail safe to HIGH.
+
+        Same reasoning as ``_write_risk``: creating something new is recoverable, destroying something
+        that was already there is not, so only the second asks the owner.
+        """
+        p = _risk_path(arguments.get("destination"))
+        if p is None:
+            return RiskLevel.HIGH
+        try:
+            if p.is_dir():
+                source = _risk_path(arguments.get("source"))
+                if source is None:
+                    return RiskLevel.HIGH
+                p = p / source.name
+            return RiskLevel.HIGH if p.exists() else RiskLevel.MEDIUM
+        except Exception:                                      # noqa: BLE001
+            return RiskLevel.HIGH
 
     def _write_risk(self, arguments: dict) -> RiskLevel:
         """Modifying/overwriting an EXISTING file is HIGH (needs confirmation);
         creating a new file is MEDIUM. Fail safe to HIGH on any doubt.
         """
-        path = arguments.get("path")
-        if not path:
+        p = _risk_path(arguments.get("path"))
+        if p is None:
             return RiskLevel.HIGH
         try:
-            p = Path(os.path.expanduser(path)).resolve()
             return RiskLevel.HIGH if p.exists() else RiskLevel.MEDIUM
         except Exception:
             return RiskLevel.HIGH
@@ -672,5 +836,67 @@ class FileActions:
                 handler=self.delete,
                 # High risk on purpose: deleting user data always asks first.
                 risk=RiskLevel.HIGH,
+            ),
+            Tool(
+                name="get_file_info",
+                description=(
+                    "Describe a file or folder without opening it: size, when it was last modified, "
+                    "whether it is read-only, and for a folder how many items it holds. Use this for "
+                    "'how big is this?' or 'when did I last change this?' - it reads no contents."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File or folder to describe."},
+                    },
+                    "required": ["path"],
+                },
+                handler=self.stat,
+                risk=RiskLevel.LOW,
+            ),
+            Tool(
+                name="copy_file",
+                description=(
+                    "Copy a file to another location inside the allowed roots. The destination may be a "
+                    "folder, meaning 'into that folder'. Copies files only, not folders. Replacing an "
+                    "existing file requires overwrite=true and the owner's confirmation."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "source": {"type": "string", "description": "File to copy."},
+                        "destination": {"type": "string",
+                                        "description": "New path, or a folder to copy into."},
+                        "overwrite": {"type": "boolean",
+                                      "description": "Replace the destination if it exists."},
+                    },
+                    "required": ["source", "destination"],
+                },
+                handler=self.copy,
+                # MEDIUM for a new file, HIGH when it would replace one. See _transfer_risk.
+                risk=RiskLevel.MEDIUM,
+                risk_fn=self._transfer_risk,
+            ),
+            Tool(
+                name="move_file",
+                description=(
+                    "Move or rename a file inside the allowed roots. The destination may be a folder, "
+                    "meaning 'into that folder'. Moves files only, not folders. Replacing an existing "
+                    "file requires overwrite=true and the owner's confirmation."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "source": {"type": "string", "description": "File to move."},
+                        "destination": {"type": "string",
+                                        "description": "New path, or a folder to move into."},
+                        "overwrite": {"type": "boolean",
+                                      "description": "Replace the destination if it exists."},
+                    },
+                    "required": ["source", "destination"],
+                },
+                handler=self.move,
+                risk=RiskLevel.MEDIUM,
+                risk_fn=self._transfer_risk,
             ),
         ]

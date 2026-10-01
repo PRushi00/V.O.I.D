@@ -32,7 +32,6 @@ becomes ``protected``; the kill switch becomes ``stopped``. None of them can bec
 from __future__ import annotations
 
 import logging
-import platform
 import re
 import sys
 
@@ -41,6 +40,7 @@ from void.app import Assistant, _NoProvider
 from void.core.agent import Agent
 from void.core.kill_switch import StopRequested
 from void.core.task import Status
+from void.system import host as host_probe
 from void.mcp import schemas
 from void.mcp.errors import ErrorCode, McpError, VoidMcpError, error, sanitise
 from void.mcp.schemas import (ApplicationInfo, ErrorInfo, FindApplicationResult, LaunchApplicationResult,
@@ -277,31 +277,30 @@ class VoidMcpAdapter:
         return OpenPathResult(ok=True, detail=sanitise(summary))
 
     def get_system_info(self) -> SystemInfo:
-        """A minimal machine summary. Deliberately omits hostname, user, environment and any path."""
+        """A minimal machine summary. Deliberately omits hostname, user, environment and any path.
+
+        Reads through :mod:`void.system.host`, which is V.O.I.D's own observation layer, rather than
+        keeping a second copy of the same psutil and platform calls - that duplication existed before
+        that layer did, and there is no reason for two of them.
+
+        The field set stays deliberately smaller than what the probe can report. An MCP client needs to
+        know roughly what kind of machine it is talking to; it does not need the owner's process list,
+        disk layout, battery state or GPU. Widening this is a separate decision with its own review (see
+        docs/V2_DOMAINS.md), not something that should follow automatically from the probe growing.
+        """
         info = SystemInfo(ok=True)
         try:
-            from void import __version__ as void_version
-            info.void_version = void_version
-        except Exception:                             # noqa: BLE001
-            pass
-        try:
-            info.os_family = platform.system() or None
-            info.os_release = platform.release() or None
-            info.python_version = platform.python_version()
-        except Exception:                             # noqa: BLE001
-            pass
-        try:
-            import os
-            info.cpu_count = os.cpu_count()
-        except Exception:                             # noqa: BLE001
-            pass
-        try:
-            import psutil
-            vm = psutil.virtual_memory()
-            info.memory_total_gb = round(vm.total / 2 ** 30, 1)
-            info.memory_available_gb = round(vm.available / 2 ** 30, 1)
-        except Exception:                             # noqa: BLE001 - psutil is optional to this answer
-            pass
+            reading = host_probe.operating_system()
+            reading.merge(host_probe.processor()).merge(host_probe.memory())
+        except Exception:                             # noqa: BLE001 - a summary must never be the failure
+            return info
+        info.void_version = reading.get("void_version")
+        info.os_family = reading.get("os_family")
+        info.os_release = reading.get("os_release")
+        info.python_version = reading.get("python_version")
+        info.cpu_count = reading.get("cpu_logical")
+        info.memory_total_gb = reading.get("memory_total_gb")
+        info.memory_available_gb = reading.get("memory_available_gb")
         return info
 
     def get_void_status(self) -> VoidStatus:

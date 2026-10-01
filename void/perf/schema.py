@@ -81,6 +81,22 @@ EVENTS: dict[str, dict[str, object]] = {
     "memory": {"op": _enum("write", "retrieve", "context", "route"), "n": _int, "duration_s": _float},
     "gateway": {"period_s": _float, "ok": _int, "rejected": _int, "rate_limited": _int,
                 "paired": _int, "dropped": _int, "conn_errors": _int},
+    # V2 observation (domains 3, 6, 7). ``probe`` is a program-controlled name, never a device or process
+    # name; ``unavailable`` counts the metrics that could not be read, which is how "the GPU is idle" stays
+    # distinguishable from "there is no readable GPU here" in the telemetry as well as in the answer.
+    "observe": {"probe": _name, "duration_s": _float, "values": _int, "unavailable": _int},
+    # V2 camera (domain 5). The audit trail for a device that points at the owner: every activation, every
+    # lapse and every frame. ``op`` and ``state`` are enumerations and ``session_s`` is a duration - there
+    # is no field here that could carry an image, a description, or what the owner asked about it.
+    "camera": {"op": _enum("activate", "deactivate", "expire", "capture", "denied"),
+               "state": _enum("disabled", "off", "active"), "session_s": _float,
+               "captures": _int, "cloud": _bool},
+    # V2 conversation mode (domain 4). Counts and reasons only, never a transcript: this is how the
+    # fast-vs-safe question "do follow-up windows actually get used, or do they mostly lapse?" becomes
+    # answerable from real use rather than from an assumption.
+    "conversation": {"op": _enum("open", "follow_up", "end"), "turns": _int, "window_s": _float,
+                     "why": _enum("silence", "standby_phrase", "max_turns", "stopped", "shutdown",
+                                  "no_speech", "aborted")},
 }
 
 COMMON = {"interaction_id": _id}

@@ -122,6 +122,20 @@ security:
   # Deletes go to the Recycle Bin, never a hard unlink, in V1.
   delete_to_recycle_bin: true
 
+# Camera (V2 domain 5). Deny-by-default: while `enabled` is false the capability does not exist -
+# not for the model, not for a confirmed tool call, not for MCP. Turning it on is an edit to YOUR
+# local_config.yaml, which no part of V.O.I.D can write.
+camera:
+  enabled: false                 # master switch. false = V.O.I.D cannot use the camera at all.
+  session_timeout_s: 120         # an activation lapses after this; there is no permanent "on".
+                                 # Clamped to 5..600s on load.
+  allow_cloud_analysis: false     # a SEPARATE decision from looking locally: may a frame leave this
+                                 # machine for a cloud vision model? Default no. When a frame is ever
+                                 # sent, the spoken answer says so.
+  device_index: 0                # which camera, when the machine has several
+  max_width: 640                 # frames are downscaled to this width before anything looks at them:
+                                 # less incidental detail in the background, less to send if sent.
+
 # Diagnostic log + privacy-safe performance stream (V2.0). Both are size-bounded.
 logging:
   max_bytes: 5242880            # per file; ~6 files kept (live + backups) => ~30 MB ceiling
@@ -201,6 +215,17 @@ voice:
   # that fragile beginning, and a shorter one once it is clearly under way. Measured effect on the owner's own
   # recordings: endpoint p50 0.45 -> 0.30 s, p90 0.57 -> 0.39 s, with ZERO truncations - where the same 0.40 s
   # applied unconditionally truncates 2 of 20. See docs/VOICE_ENDPOINTING_V5_2026-10-01.md.
+  # CONVERSATION MODE (V2 domain 4). Before this, every sentence needed its own wake word, because the
+  # detector re-armed the moment a reply finished. With it on, the microphone stays open for a few seconds
+  # after a reply, so a follow-up needs no wake word.
+  # The cost is that during that window anything heard becomes a command. Four independent bounds contain
+  # it: the window is short; one silent window ends the conversation; a conversation is capped at
+  # conversation_max_turns; and the owner can end it in words ("that's all", "goodbye", "standby") or with
+  # the kill switch. It changes NO authorization - a follow-up turn is a new command through the same
+  # funnel and inherits nothing, so being mid-conversation is never a credential.
+  conversation_mode: true        # false restores V1 behaviour: a wake word before every sentence
+  conversation_follow_up_s: 7.0  # how long to keep listening after a reply (clamped to 1..30s)
+  conversation_max_turns: 12     # exchanges before a wake word is required again (clamped to 1..100)
   wake_fast_silence_timeout: 0.4 # the shorter budget. Set to >= wake_silence_timeout to disable all of this.
   wake_fast_after_speech: 0.3    # voiced seconds that must have accumulated before the shorter budget applies
   wake_fast_until_speech: 1.8    # ...and after which the safe budget returns: past this the owner is speaking a

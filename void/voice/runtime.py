@@ -21,7 +21,7 @@ import logging
 import queue
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 # Lifecycle diagnostics: markers land in the local diagnostic log (see
@@ -172,6 +172,109 @@ class _WakePolicy:
         )
 
 
+# --- conversation mode: wake once, then keep talking ----------------------
+#
+# Before this, every sentence needed its own wake word: the detector re-armed as soon as the reply finished,
+# so "open Opera" / "what's the weather" / "thanks" was three wake words. Conversation mode keeps the
+# microphone open for a short window after a reply, so a follow-up needs no wake word at all.
+#
+# The cost is real and is why the window is short: during it, anything the detector hears becomes a command,
+# with no wake word standing in front of it. Four bounds contain that, and each is independent:
+#
+#   * the window is seconds long, not minutes (``follow_up_s``);
+#   * it only stays open while the owner keeps actually talking - one silent window ends the conversation;
+#   * a conversation is capped at ``max_turns`` exchanges however talkative it is;
+#   * the owner can end it in words (``_STANDBY_PHRASES``), and the kill switch still ends it instantly.
+#
+# What conversation mode explicitly does NOT change: authorization. A follow-up turn is a new command through
+# the same funnel, and inherits nothing from the turn before it - no confirmation, no risk decision, no
+# authority. Being mid-conversation is not a credential.
+
+@dataclass(frozen=True)
+class _ConversationPolicy:
+    """When a reply may be followed by another command without a new wake word."""
+
+    enabled: bool = True
+    #: How long to keep listening after a reply for the owner to carry on.
+    follow_up_s: float = 7.0
+    #: Exchanges in one conversation before a wake word is required again. A bound, not a target.
+    max_turns: int = 12
+
+    @classmethod
+    def from_config(cls, config) -> "_ConversationPolicy":
+        def _num(key, default, low, high):
+            try:
+                value = float(config.get(key, default))
+            except (TypeError, ValueError, AttributeError):
+                value = float(default)
+            return min(max(value, low), high)
+        try:
+            enabled = bool(config.get("voice.conversation_mode", True))
+        except AttributeError:
+            enabled = True
+        return cls(enabled=enabled,
+                   follow_up_s=_num("voice.conversation_follow_up_s", 7.0, 1.0, 30.0),
+                   max_turns=int(_num("voice.conversation_max_turns", 12.0, 1.0, 100.0)))
+
+
+#: Why a conversation ended, mapped from the human-readable reason to the telemetry enumeration. A reason
+#: not in here is recorded as plain silence rather than dropped, so the count always adds up.
+_END_REASONS = {
+    "owner said standby": "standby_phrase",
+    "follow-up window passed in silence": "silence",
+    "no speech after wake": "no_speech",
+    "max_turns": "max_turns",
+    "session stopped": "stopped",
+    "session moved on": "stopped",
+    "shutdown": "shutdown",
+    "follow-up capture could not start": "aborted",
+}
+
+#: Things the owner can say to end a conversation and go back to needing a wake word.
+#:
+#: Matched against the WHOLE transcript, normalised - never as a substring, because "stop the music" and
+#: "never mind that, open Opera" are commands, not dismissals, and treating them as an exit would silently
+#: swallow them. A phrase that is only part of a longer sentence is left to the ordinary command path.
+_STANDBY_PHRASES = frozenset({
+    "standby", "stand by", "go to standby", "go on standby",
+    "that's all", "thats all", "that is all", "that's it", "thats it", "that is it",
+    "that'll be all", "thatll be all",
+    "nothing else", "nothing more", "no more", "that's everything", "thats everything",
+    "never mind", "nevermind", "forget it",
+    "goodbye", "good bye", "bye", "bye bye", "see you", "see you later",
+    "thanks that's all", "thanks thats all", "thank you that's all", "thank you thats all",
+    "we're done", "were done", "we are done", "i'm done", "im done", "i am done",
+    "all done", "done for now", "that will be all",
+    "stop listening", "stop listening now", "you can stop listening",
+    "go to sleep", "go back to sleep", "sleep now",
+})
+
+#: Characters stripped before matching a standby phrase: whatever punctuation the transcriber chose.
+_PHRASE_STRIP = ".,!?;:'\"-- \t\n"
+
+
+def is_standby_phrase(transcript: str) -> bool:
+    """Whether a transcript is the owner ending the conversation, and nothing else.
+
+    Whole-utterance only. "Never mind, open Opera" is a command and must stay one; only a transcript that
+    consists of a dismissal counts as one.
+    """
+    if not transcript:
+        return False
+    text = " ".join(str(transcript).lower().split())
+    text = text.strip(_PHRASE_STRIP)
+    # Punctuation inside the phrase ("that's all." / "ok, goodbye") is removed so the comparison is about
+    # the words, not about how the transcriber punctuated them.
+    text = " ".join(word.strip(_PHRASE_STRIP) for word in text.split()).strip()
+    if text in _STANDBY_PHRASES:
+        return True
+    # A leading courtesy is extremely common ("okay, that's all", "thanks, goodbye") and carries no command.
+    for lead in ("okay ", "ok ", "alright ", "right ", "thanks ", "thank you ", "cool ", "great "):
+        if text.startswith(lead) and text[len(lead):].strip() in _STANDBY_PHRASES:
+            return True
+    return False
+
+
 def _min_speech_ms(config) -> float:
     """``voice.min_speech_ms`` (0 disables the pre-STT guard); a bad value keeps the safe default."""
     try:
@@ -310,7 +413,8 @@ class VoiceController:
                  on_message: Callable[[str], None] | None = None,
                  on_state: Callable[[str], None] | None = None,
                  now: Callable[[], float] | None = None,
-                 health_sink: Callable[[dict], object] | None = None):
+                 health_sink: Callable[[dict], object] | None = None,
+                 conversation: "_ConversationPolicy | None" = None):
         self._session = session
         self._activation = activation
         self._poll_interval = poll_interval
@@ -358,6 +462,19 @@ class VoiceController:
             self._wake_policy.rearm_delay_ms
             / max(1.0, poll_interval * 1000.0))))
 
+        # --- conversation mode (V2 domain 4) ------------------------------
+        # Inert unless a broker and a wake detector exist, exactly like the wake integration above: a
+        # PTT-only or test controller behaves as it did before this was added.
+        self._conversation = conversation or _ConversationPolicy()
+        #: True once a capture has produced speech, until the conversation ends. While true, returning to
+        #: IDLE opens a follow-up window instead of re-arming the wake detector.
+        self._conversation_open = False
+        #: Exchanges so far in this conversation, against ``max_turns``.
+        self._conversation_turns = 0
+        #: True while the capture currently running is a follow-up rather than a wake-initiated one. Only
+        #: used to decide what a ``no_speech`` ending means.
+        self._in_follow_up = False
+
     # --- construction from config -------------------------------------
     @classmethod
     def from_assistant(cls, assistant, config=None, *,
@@ -388,10 +505,22 @@ class VoiceController:
             temperature=_stt_temperature(config),
         )
         tts = create_tts_provider(config)   # provider-agnostic; null-safe fallback
+        # The controller sees each transcript FIRST, so conversation mode can notice the owner saying
+        # "that's all". Chained rather than replacing: the caller's own callback (UI bridge, CLI echo)
+        # still gets every transcript, and a failure in either does not swallow the other.
+        holder: dict = {}
+
+        def relay_transcript(text, _caller=on_transcript):
+            controller_ref = holder.get("controller")
+            if controller_ref is not None:
+                controller_ref.note_transcript(text)
+            if _caller is not None:
+                _caller(text)
+
         session = VoiceSession(
             assistant, assistant.kill_switch,
             capture=capture, stt=stt, tts=tts,
-            on_state=on_state, on_transcript=on_transcript,
+            on_state=on_state, on_transcript=relay_transcript,
             on_message=on_message,
             speak_response=config.get("voice.speak_responses", True),
             speak_successful_actions=bool(config.get("voice.speak_successful_actions", False)),
@@ -415,7 +544,9 @@ class VoiceController:
                          worker=worker, broker=broker, wake=wake,
                          wake_policy=_WakePolicy.from_config(config),
                          on_message=on_message, on_state=on_state,
-                         health_sink=health_sink)
+                         health_sink=health_sink,
+                         conversation=_ConversationPolicy.from_config(config))
+        holder["controller"] = controller
         # PTT edges go through the controller: press is quick (mic open / barge-
         # in) and runs inline on the hook thread; release runs the blocking
         # STT/Assistant/TTS chain on the serial worker so the hook thread stays
@@ -550,6 +681,7 @@ class VoiceController:
         terminal CLOSED (releases the TTS worker/COM and detaches capture), then
         close the broker (releases the physical microphone backend)."""
         self._stop_evt.set()
+        self._end_conversation("shutdown")
         try:
             self._activation.stop()
         except Exception:  # pragma: no cover - defensive
@@ -598,20 +730,106 @@ class VoiceController:
             if self._wake_capture_active:
                 self._idle_ticks = 0
                 return
+            latched = False
             idle = (self._session.state == VoiceState.IDLE
                     and not self._wake_broken)
             if idle:
                 self._idle_ticks += 1
-                if (not self._wake_armed
-                        and self._idle_ticks >= self._rearm_ticks):
-                    self._arm_wake_locked()
+                if self._idle_ticks < self._rearm_ticks:
+                    return
+                # A conversation is under way: carry on listening rather than making the owner say the
+                # wake word again. If nobody speaks, the follow-up capture ends itself on no_speech and
+                # _wake_finalize closes the conversation, so the next tick re-arms as usual.
+                if self._conversation_open and self._may_follow_up():
+                    follow_up = self._begin_follow_up_locked
+                else:
+                    follow_up = None
+                    if not self._wake_armed:
+                        self._arm_wake_locked()
             else:
+                follow_up = None
                 self._idle_ticks = 0
                 if self._wake_armed:
                     self._disarm_wake_locked()
                 if self._endpointer is not None:      # defensive
                     self._safe_unsub(self._endpointer)
                     self._endpointer = None
+                # A latched stop or a terminal close ends any conversation. Without this, a conversation
+                # left open by the kill switch would resume - with no wake word - the moment the session
+                # was explicitly re-armed, which is exactly when the owner expects a clean slate.
+                latched = self._session.state in (VoiceState.STOPPED, VoiceState.CLOSED)
+        # Outside the lock: both of these do more than flip a flag, and _end_conversation takes the lock.
+        if latched:
+            self._end_conversation("session stopped")
+        elif follow_up is not None:
+            follow_up()                      # beginning a capture blocks (mic open, broker drain)
+
+    def _may_follow_up(self) -> bool:
+        """Whether a follow-up capture may start now. Caller holds ``_wake_lock``."""
+        if not self._conversation.enabled or self._broker is None:
+            return False
+        if self._conversation_turns >= self._conversation.max_turns:
+            self._end_conversation("max_turns")     # _wake_lock is an RLock, so re-entering is fine
+            return False
+        return True
+
+    def _begin_follow_up_locked(self) -> None:
+        """Start a capture with no wake word in front of it, for the follow-up window.
+
+        Deliberately reuses the whole wake-capture path - same reducer, same generation handling, same
+        endpointer - with one substitution: the no-speech timeout becomes the follow-up window, so a window
+        nobody speaks into closes itself and ends the conversation. Nothing about authorization differs.
+        """
+        with self._wake_lock:
+            if self._wake_capture_active or not self._conversation_open:
+                return
+            if self._wake_armed:
+                # The detector must not also be listening: a wake word spoken mid-conversation would
+                # otherwise start a second capture over this one.
+                self._disarm_wake_locked()
+            self._wake_capture_active = True
+            self._in_follow_up = True
+            self._wake_gen = self._session.generation
+        _log.info("CONVERSATION_FOLLOW_UP turn=%d window=%.1fs",
+                  self._conversation_turns + 1, self._conversation.follow_up_s)
+        perf.emit("conversation", op="follow_up", turns=self._conversation_turns + 1,
+                  window_s=round(self._conversation.follow_up_s, 1))
+        self._begin_wake_capture(follow_up=True)
+
+    def _end_conversation(self, reason: str) -> None:
+        """Close the conversation so the next idle tick re-arms the wake detector."""
+        with self._wake_lock:
+            if not self._conversation_open:
+                return
+            turns = self._conversation_turns
+            self._conversation_open = False
+            self._conversation_turns = 0
+        _log.info("CONVERSATION_ENDED reason=%s turns=%d", reason, turns)
+        perf.emit("conversation", op="end", turns=turns, why=_END_REASONS.get(reason, "silence"))
+
+    def note_transcript(self, transcript: str) -> None:
+        """Observe what the owner said, to notice an explicit return to standby.
+
+        Wired in front of the caller's own ``on_transcript`` so the controller sees every transcript. It
+        reads the text and decides one thing - whether the conversation is over. It never acts on the
+        content, and the transcript continues to the ordinary command path untouched either way: a standby
+        phrase is still dispatched, because "goodbye" deserves a reply.
+        """
+        try:
+            if self._conversation.enabled and is_standby_phrase(transcript):
+                self._end_conversation("owner said standby")
+        except Exception:                                      # noqa: BLE001 - never break the pipeline
+            _log.exception("CONVERSATION_PHRASE_CHECK_FAILED")
+
+    def conversation_snapshot(self) -> dict:
+        """Observation only: whether a conversation is open, and how many turns it has run."""
+        with self._wake_lock:
+            return {"enabled": self._conversation.enabled,
+                    "open": self._conversation_open,
+                    "turns": self._conversation_turns,
+                    "max_turns": self._conversation.max_turns,
+                    "follow_up_s": self._conversation.follow_up_s,
+                    "in_follow_up": self._in_follow_up}
 
     # --- mic-health supervision (broker-based runtimes only) -----------
     #
@@ -822,10 +1040,15 @@ class VoiceController:
         else:
             job()                            # tests without a worker: inline
 
-    def _begin_wake_capture(self) -> None:
+    def _begin_wake_capture(self, follow_up: bool = False) -> None:
         """Off the pump thread. Disarm the detector, then begin capture exactly
         like a PTT press (same reducer, same NEW_GENERATION), then attach the
-        endpointer for THIS capture."""
+        endpointer for THIS capture.
+
+        ``follow_up`` marks a capture that no wake word preceded (conversation mode). The only difference
+        it makes is the no-speech timeout: a follow-up waits the follow-up window for the owner to start
+        talking, and a window nobody speaks into ends the conversation.
+        """
         with self._wake_lock:
             if not self._wake_capture_active:
                 return
@@ -835,9 +1058,19 @@ class VoiceController:
         if self._session.state != VoiceState.LISTENING:
             with self._wake_lock:            # e.g. KillSwitch coerced the press
                 self._wake_capture_active = False
+                self._in_follow_up = False
             _log.info("COMMAND_CAPTURE aborted (state=%s)", self._session.state)
+            # A capture that could not start must not leave the conversation open, or the next tick
+            # retries it forever instead of falling back to the wake word.
+            if follow_up:
+                self._end_conversation("follow-up capture could not start")
             return
-        endpointer = _WakeEndpointer(self._wake_policy, self._wake_finalize)
+        policy = self._wake_policy
+        if follow_up:
+            # One substitution, and no other difference: how long to wait for speech to begin. There is
+            # no wake phrase in front of a follow-up, so the lead-in grace is not needed either.
+            policy = replace(policy, no_speech_s=self._conversation.follow_up_s, lead_grace_s=0.0)
+        endpointer = _WakeEndpointer(policy, self._wake_finalize)
         with self._wake_lock:
             # bind to the generation THIS capture created (post NEW_GENERATION),
             # so a later barge-in / killswitch / shutdown marks the finalize stale
@@ -851,9 +1084,10 @@ class VoiceController:
         except Exception:
             pass
         self._broker.subscribe(endpointer)
-        p = self._wake_policy
-        _log.info("COMMAND_CAPTURE_STARTED (listening for command; grace=%.2fs no_speech=%.1fs "
+        p = policy
+        _log.info("COMMAND_CAPTURE_STARTED (%s; grace=%.2fs no_speech=%.1fs "
                   "silence=%.2fs fast=%.2fs when speech in [%.2f, %.2f)s pause_evidence=%.2fs)",
+                  "follow-up, no wake word" if follow_up else "listening for command",
                   p.lead_grace_s, p.no_speech_s, p.silence_s, min(p.fast_silence_s, p.silence_s),
                   p.fast_after_speech_s, p.fast_until_speech_s, p.pause_evidence_s)
 
@@ -867,12 +1101,29 @@ class VoiceController:
             self._wake_capture_active = False
             endpointer, self._endpointer = self._endpointer, None
             stale = self._session.generation != self._wake_gen
+            was_follow_up, self._in_follow_up = self._in_follow_up, False
         if endpointer is not None:
             self._safe_unsub(endpointer)
         budget = getattr(endpointer, "fired_budget_s", None)
-        _log.info("COMMAND_ENDPOINT reason=%s budget=%s stale=%s", reason, budget, stale)
+        _log.info("COMMAND_ENDPOINT reason=%s budget=%s stale=%s follow_up=%s",
+                  reason, budget, stale, was_follow_up)
         if stale:
+            self._end_conversation("session moved on")
             return                           # a newer session owns the mic now
+        if reason == "no_speech":
+            # Nobody spoke. After a wake word that is a false wake; in a follow-up window it is the
+            # ordinary, silent end of a conversation. Either way there is no command, so re-arm.
+            self._end_conversation("follow-up window passed in silence" if was_follow_up
+                                   else "no speech after wake")
+        elif self._conversation.enabled:
+            # Speech was captured, so a reply is coming and the owner may well carry on afterwards. The
+            # window opens once the session settles back to IDLE (see _reconcile_wake).
+            with self._wake_lock:
+                self._conversation_open = True
+                self._conversation_turns += 1
+                turns = self._conversation_turns
+            _log.info("CONVERSATION_TURN %d/%d", turns, self._conversation.max_turns)
+            perf.emit("conversation", op="open", turns=turns)
         # Which budget ended the capture, so the fast-vs-safe split over real use is readable from perf.jsonl.
         self._session.note_endpoint_reason(reason, budget_s=budget)
         self.on_ptt_release()                # -> worker: finalize + STT + dispatch + speak

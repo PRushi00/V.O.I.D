@@ -12,7 +12,9 @@ from void import perf
 from void.actions.apps import AppActions
 from void.actions.computer import AppCatalog, ComputerActions, make_backend
 from void.actions.files import FileActions, PathNotAllowed
+from void.actions.observe import ObserveActions
 from void.actions.folders import DEFAULT_DEPTH, FolderCatalog, scan_roots
+from void.actions.vision import VisionActions
 from void.actions.registry import ToolRegistry
 from void.config import Config
 from void.core.agent import Agent, AgentResult
@@ -99,6 +101,15 @@ class Assistant:
         self.tools.register_all(file_actions.tools())
         self.tools.register_all(app_actions.tools())
         self.tools.register_all(computer_actions.tools())
+        # Read-only observation of the machine itself: health, attached devices, network state
+        # (V2 domains 3, 6 and 7). Holds no state and caches nothing - see void/actions/observe.py
+        # for the invariants every tool in it shares.
+        self.tools.register_all(ObserveActions().tools())
+        # Camera (V2 domain 5). Registered always, but the gate is deny-by-default: while
+        # camera.enabled is false every one of these tools refuses, so registration grants nothing.
+        # See void/vision/__init__.py for the four independent controls.
+        self.vision = VisionActions(config=self.config)
+        self.tools.register_all(self.vision.tools())
 
         # Persistent memory (V2.0). Lazy: no file and no key exist until the first write.
         # Memory is DATA - it never feeds RiskGate. The model may only SUGGEST via

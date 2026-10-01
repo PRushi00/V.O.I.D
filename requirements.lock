@@ -53,6 +53,7 @@ more-itertools==11.1.0
 narwhals==2.26.0
 numpy==2.5.2
 onnxruntime==1.29.0
+opencv-python-headless==5.0.0.93
 openwakeword==0.6.0
 packaging==26.3
 pluggy==1.6.0

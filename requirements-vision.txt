@@ -1,0 +1,20 @@
+# V.O.I.D OPTIONAL camera dependencies (V2 domain 5).
+#
+# Core V.O.I.D does NOT require these, and installing them does not turn the camera on: the camera is
+# deny-by-default in config (`camera.enabled: false`) and every capture additionally needs the owner's
+# confirmation through RiskGate. Install only to use the camera capability:
+#     .venv\Scripts\python.exe -m pip install -r requirements-vision.txt
+#
+# HEADLESS on purpose. The full `opencv-python` wheel bundles Qt and can open its own windows; V.O.I.D
+# needs frame acquisition and nothing else, and a second GUI surface it does not control is a liability.
+# The headless build is also smaller (~44 MB).
+#
+# Measured on this machine (ASUS FHD webcam, 2026-10-01): DirectShow opens and returns a 640x480 frame in
+# ~1.24 s; Media Foundation fails to open at all, so DirectShow is tried first. The device is released
+# after every frame, so the hardware indicator light is off whenever V.O.I.D is not looking.
+#
+# numpy is already required by the voice stack (requirements-voice.txt) and is used here to measure
+# brightness and contrast without sending the image anywhere.
+
+opencv-python-headless>=4.8     # single-frame capture and JPEG encoding (cv2)
+numpy>=1.24                     # frame statistics, computed locally
