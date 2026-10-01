@@ -1,0 +1,17 @@
+# V.O.I.D OPTIONAL MCP server dependencies.
+#
+# Core V.O.I.D does NOT require these. Install only to expose V.O.I.D's capabilities over the Model Context
+# Protocol:
+#     .venv\Scripts\python.exe -m pip install -r requirements-mcp.txt
+#
+# Then serve on stdio with:
+#     .venv\Scripts\python.exe -m void.mcp
+#
+# MCP is an interoperability protocol, NOT V.O.I.D's authorization boundary: every call is executed by the existing
+# capability layer behind the existing kill switch, risk levels, RiskGate policy, protected roots and audit trail.
+# See docs/MCP_V0_1.md.
+#
+# Pinned to major 2 on purpose. The v1 -> v2 rename (FastMCP -> MCPServer) was a breaking API change, and v2 also
+# moved result fields to snake_case (input_schema, is_error, structured_content); void/mcp/server.py is written
+# against the v2 API and mcp 1.x will not run it.
+mcp>=2.2,<3            # official MCP Python SDK (pulls mcp-types, starlette, uvicorn, httpx2, jsonschema, pyjwt)

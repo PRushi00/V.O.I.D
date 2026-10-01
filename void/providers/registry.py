@@ -64,6 +64,10 @@ class ProviderRegistry:
         order = [primary] + [f for f in fallback if f != primary]
         return cls(providers, order)
 
+    def names(self) -> list[str]:
+        """Configured provider names, in preference order. Mirrors ``ToolRegistry.names()``; probes nothing."""
+        return [n for n in self._order if n in self._providers]
+
     def get(self, name: str) -> LLMProvider | None:
         return self._providers.get(name)
 

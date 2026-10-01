@@ -107,6 +107,19 @@ def _untrusted(text: str) -> str:
 OnEvent = Callable[[str], None]
 
 
+@dataclass(frozen=True)
+class ToolInvocation:
+    """Outcome of ``Agent.invoke_tool``: the engine's deterministic verdict on one tool call.
+
+    ``kind`` is engine-owned and identical to ``_run_call``'s: 'ok', 'unauthorized', 'unknown' or 'tool_failure'.
+    """
+    ok: bool
+    kind: str
+    summary: str
+    #: The executed tool's own structured data, when it produced any. None for an unknown/unauthorized call.
+    data: object = None
+
+
 @dataclass
 class AgentResult:
     task: Task
@@ -283,6 +296,20 @@ class Agent:
             return None
         return data
 
+    def invoke_tool(self, name: str, arguments: dict) -> "ToolInvocation":
+        """Run ONE named tool through the same funnel the agent loop uses, and report the outcome.
+
+        For callers outside the agent loop (the MCP adapter) that need a single capability executed with the full
+        security path and no model call: kill switch -> per-call risk -> ``RiskGate.authorize`` -> execute ->
+        audit + telemetry. It adds no policy; ``kind`` is the engine's own verdict, unchanged.
+
+        Raises ``StopRequested`` when the kill switch is engaged, exactly as the agent loop sees it.
+        """
+        _message, ok, first, kind, _n = self._run_call(name, arguments)
+        result = getattr(self, "_last_tool_result", None)
+        return ToolInvocation(ok=ok, kind=kind, summary=first,
+                              data=getattr(result, "data", None) if result is not None else None)
+
     def _run_call(self, name: str, arguments: dict,
                   owner_decision: bool | None = None) -> tuple[dict, bool, str, str, list[dict] | None]:
         """Run one tool call through the risk gate.
@@ -299,6 +326,9 @@ class Agent:
         carries a durable owner approve/deny, only ever set by the owner-driven
         approve/deny path, never by the LLM.
         """
+        # The structured result of the most recent call, for callers that need a tool's DATA and not just its
+        # summary (void/mcp/adapter.py). Set here so there is still exactly one place a tool is executed.
+        self._last_tool_result = None
         self.kill_switch.raise_if_engaged()
         tool = self.tools.get(name)
         if tool is None:
@@ -326,6 +356,7 @@ class Agent:
         t0 = time.monotonic()
         with memory_scope.bind(self._scope):
             result = self.tools.execute(name, arguments)
+        self._last_tool_result = result
         if name != memory_scope.PROPOSE_TOOL:
             self._scope.taint()          # this run has now seen tool output (untrusted)
         # Diagnostic only: tool NAME (an engine-defined identifier) + risk +
