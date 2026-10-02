@@ -19,6 +19,11 @@ from void.actions.registry import ToolRegistry
 from void.config import Config
 from void.core.agent import Agent, AgentResult
 from void.core.fast_path import FastPath
+from void.orchestration.apps import ApplicationRegistry
+from void.orchestration.commands import ControlContext, ControlIntent, classify as classify_control
+from void.orchestration.events import EventLog
+from void.orchestration.routes import ExistingTabRoutes, FastPathRoutes, RouteResolver, WorldState
+from void.orchestration.verify import Verifier
 from void.core.kill_switch import KillSwitch
 from void.core.task import Status, Task, TaskStore
 from void.memory import intent as memory_intent
@@ -48,6 +53,22 @@ class _NoProvider(LLMProvider):
 
     def generate(self, messages, tools=None):
         raise ProviderUnavailable("This run is deterministic and makes no model call.")
+
+
+def _file_facts(file_actions, path: str) -> dict | None:
+    """Existence and size for verification, through the CONFINED file layer.
+
+    Returns None when the path is not one V.O.I.D may inspect, which the verifier reports as "could not
+    check" rather than as a failure. Verification is not a way around allowed roots: it sees exactly what
+    the owner already permitted the file tools to see.
+    """
+    try:
+        result = file_actions.stat(path)
+    except Exception:                                          # noqa: BLE001
+        return None
+    if not result.ok or not isinstance(result.data, dict):
+        return None
+    return {"exists": True, "size_bytes": int(result.data.get("size_bytes") or 0)}
 
 
 class Assistant:
@@ -124,6 +145,22 @@ class Assistant:
             if self.config.get("memory.propose_tool", True):
                 self.tools.register(make_memory_tool(self.memory))
 
+        # --- V3 orchestration (void/orchestration) -----------------------------------
+        # Built over the systems that already exist: the registry reads THIS catalog, the resolver uses
+        # THIS fast path, the verifier observes through THESE actions. Nothing here discovers, launches or
+        # authorizes anything - orchestration decides what to attempt, and every attempt still goes
+        # through Agent._run_call (kill switch -> risk -> RiskGate) unchanged.
+        self.events = EventLog()
+        self.applications = ApplicationRegistry(
+            catalog_entries=catalog.entries,
+            running_apps=lambda: (computer_actions.list_running_apps().data or []),
+            preferences=dict(self.config.get("preferences", {}) or {}))
+        self.verifier = Verifier(
+            list_windows=lambda: (computer_actions.list_windows().data or []),
+            running_processes=lambda: {str(row.get("name", "")).lower()
+                                       for row in (computer_actions.list_running_apps().data or [])},
+            active_window=lambda: computer_actions.get_active_window().data,
+            file_facts=lambda path: _file_facts(file_actions, path))
         # Providers
         self.providers = ProviderRegistry.from_config(self.config)
         # Deterministic fast path for plain "open <known app>" commands (no model call). Off switch: fast_path.enabled.
@@ -131,6 +168,9 @@ class Assistant:
                                answer_unknown=self.config.get("fast_path.answer_unknown_apps", True),
                                folders=self._folder_catalog(file_actions))
                       if self.config.get("fast_path.enabled", True) else None)
+        # Route resolution over the deterministic launcher and any open browser tabs. Providers are
+        # adapters over existing systems; the resolver only compares and chooses.
+        self.routes = RouteResolver([FastPathRoutes(self._fast), ExistingTabRoutes()])
 
     def _folder_catalog(self, file_actions):
         """A shallow index of the owner's folder names, or None when folder resolution is off.
@@ -265,6 +305,109 @@ class Assistant:
         task = Task(goal="[memory command]", id="(memory)", status=Status.COMPLETED, result=reply)
         return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0)
 
+    def _control_command(self, goal: str) -> AgentResult | None:
+        """"stop" / "pause" / "resume" / "cancel" / "instead of that ...", decided deterministically.
+
+        Runs BEFORE the fast path and before any model, the same way ``_memory_command`` does, because
+        whether the owner wants silence or wants the work abandoned is a control signal rather than a
+        semantic judgement - and getting it wrong is expensive in both directions.
+
+        The context comes from real state: whether TTS is actually speaking, and whether a task is actually
+        running. Never from the words. A bare "stop" can never reach CANCEL_TASK from any state; cancelling
+        needs an explicit cancel phrase. The kill switch is untouched and keeps its own deliberate full
+        phrase - this layer is about the task, not about halting V.O.I.D.
+        """
+        if self.kill_switch.engaged:
+            return None
+        command = classify_control(goal, self._control_context())
+        if not command.is_control:
+            return None
+        reply = self._apply_control(command)
+        if reply is None:
+            return None
+        task = Task(goal="[control command]", id="(control)", status=Status.COMPLETED, result=reply)
+        return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0,
+                           local_action=command.intent == ControlIntent.STOP_SPEAKING)
+
+    def _control_context(self) -> ControlContext:
+        """What V.O.I.D is doing right now, read from real state rather than inferred."""
+        speaking = False
+        speaker = getattr(self, "speaking_now", None)
+        if callable(speaker):
+            try:
+                speaking = bool(speaker())
+            except Exception:                                  # noqa: BLE001
+                speaking = False
+        running, paused = False, False
+        try:
+            for task in self.store.list(limit=10):
+                if task.status in (Status.RUNNING, Status.PLANNING, Status.REPLANNING,
+                                   Status.VERIFYING):
+                    running = True
+                elif task.status == Status.PAUSED:
+                    paused = True
+        except Exception:                                      # noqa: BLE001 - never block a control word
+            pass
+        return ControlContext(speaking=speaking, task_running=running, task_paused=paused)
+
+    def _apply_control(self, command) -> str | None:
+        """Carry out a control command against task state. Returns what to say, or None to fall through.
+
+        Speech is stopped by the voice runtime, which owns the TTS backend: ``stop_speaking`` is set by the
+        runtime when one exists. With no voice attached there is nothing speaking, so the answer is simply
+        an acknowledgement.
+        """
+        intent = command.intent
+        if intent == ControlIntent.STOP_SPEAKING:
+            stopper = getattr(self, "stop_speaking", None)
+            if callable(stopper):
+                try:
+                    stopper()
+                except Exception:                              # noqa: BLE001
+                    pass
+            return ""                                           # silence IS the response
+        if intent == ControlIntent.PAUSE_TASK:
+            changed = self._set_task_status(Status.PAUSED,
+                                            frm=(Status.RUNNING, Status.PLANNING,
+                                                 Status.REPLANNING, Status.VERIFYING))
+            return "Paused." if changed else "Nothing is running."
+        if intent == ControlIntent.RESUME_TASK:
+            resumed = self._set_task_status(Status.RUNNING, frm=(Status.PAUSED,))
+            return "Resuming." if resumed else "Nothing is paused."
+        if intent == ControlIntent.CANCEL_TASK:
+            cancelled = self._set_task_status(Status.CANCELLED,
+                                              frm=(Status.RUNNING, Status.PAUSED, Status.PLANNING,
+                                                   Status.REPLANNING, Status.VERIFYING))
+            return "Cancelled." if cancelled else "Nothing to cancel."
+        if intent == ControlIntent.MODIFY_TASK:
+            from void.orchestration.replan import apply_modification
+            for task in self.store.list(limit=10):
+                if task.status in Status.RESUMABLE:
+                    if apply_modification(task, command.modification) is not None:
+                        self.store.save(task)
+                        return "Changed - carrying on from there."
+                    break
+            # No live task to amend: this is a new request, so let the ordinary path handle it.
+            return None
+        return None
+
+    def _set_task_status(self, to: str, *, frm: tuple) -> bool:
+        """Move the most recent matching task to ``to``. Returns whether anything changed.
+
+        Deliberately only task STATUS: a control command never executes a capability, never reverses a
+        completed side effect, and never authorizes anything.
+        """
+        try:
+            for task in self.store.list(limit=10):
+                if task.status in frm:
+                    task.status = to
+                    task.touch()
+                    self.store.save(task)
+                    return True
+        except Exception:                                      # noqa: BLE001
+            return False
+        return False
+
     def _recall_route(self, goal: str) -> "AgentResult | str | bool":
         """Memory questions are answered from memory, not by searching the machine.
 
@@ -295,6 +438,10 @@ class Assistant:
         return False                               # personal-looking question with no memory: use the agent
 
     def run(self, goal: str) -> AgentResult:
+        # Control commands first: "stop" must not become a model call, and must not become a cancel.
+        control = self._control_command(goal)
+        if control is not None:
+            return control
         handled = self._memory_command(goal)
         if handled is not None:
             return handled

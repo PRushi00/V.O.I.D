@@ -32,9 +32,17 @@ class Status:
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"                 # owner-cancelled; not resumable
+    # --- V3 orchestration phases (void/orchestration) ---------------------
+    # Added for the V3 task engine, which needs to distinguish "deciding what to do" and "checking it
+    # worked" from "doing it". PENDING remains the created-but-not-started state the blueprint calls
+    # CREATED; AWAITING_CONFIRMATION remains WAITING_FOR_USER. Nothing was renamed: V2 statuses are
+    # persisted in the owner's existing database and in tests, so these are additions only.
+    PLANNING = "planning"                   # interpreting the goal / choosing a route
+    REPLANNING = "replanning"               # a failure or an owner change forced a new plan
+    VERIFYING = "verifying"                 # checking the intended state actually happened
 
     # Resumable = can still make progress (with owner input where needed).
-    RESUMABLE = {RUNNING, PAUSED, AWAITING_CONFIRMATION}
+    RESUMABLE = {RUNNING, PAUSED, AWAITING_CONFIRMATION, PLANNING, REPLANNING, VERIFYING}
     # Terminal = no further execution.
     TERMINAL = {COMPLETED, FAILED, CANCELLED}
     # Every recognized status. A persisted/in-memory value outside this set is
@@ -42,7 +50,10 @@ class Status:
     # code intentionally wrote - it must fail closed, never be treated as
     # implicitly resumable.
     ALL = {PENDING, RUNNING, PAUSED, AWAITING_CONFIRMATION, BLOCKED,
-           COMPLETED, FAILED, CANCELLED}
+           COMPLETED, FAILED, CANCELLED, PLANNING, REPLANNING, VERIFYING}
+    # Phases where V.O.I.D is deciding rather than executing. Useful to a UI, and to the control-command
+    # layer: "stop" during PLANNING pauses, exactly as it does during RUNNING.
+    DECIDING = {PLANNING, REPLANNING, VERIFYING}
 
 
 class CorruptedTaskState(ValueError):
@@ -90,6 +101,28 @@ class Task:
     # Engine-owned pointer to the current/most-recent logical step (index into
     # plan). Never set by the LLM.
     current_step: int = 0
+    # --- V3 orchestration state (void/orchestration) ----------------------
+    # One dict, persisted in one additional column, holding what the V3 task engine needs beyond the V2
+    # ledger. A dict rather than a dozen columns because these fields are read and written together, by
+    # one subsystem, and a schema change per field would be churn for no gain.
+    #
+    # Shape (every key optional; absent means "not known yet"):
+    #   {"intent":        str      - what V.O.I.D understood the goal to be (NOT the model's reasoning)
+    #    "route":         dict     - the selected route's inspectable form (Route.as_dict())
+    #    "applications":  [str]    - application names this task has touched
+    #    "artifacts":     [{"path": str, "kind": str, "verified": bool}]  - files produced
+    #    "checkpoints":   [{"step": int, "at": float, "label": str}]      - resume points
+    #    "verifications": [{"step": int, "ok": bool, "how": str, "detail": str}]
+    #    "modifications": [{"at": float, "asked": str, "from_step": int}] - owner changes mid-task
+    #    "failures":      [{"step": int, "at": float, "kind": str, "detail": str}]
+    #    "replans":       int      - how many times the plan has been rebuilt
+    #   }
+    #
+    # SECURITY: engine-owned, exactly like ``plan``. It is written by V.O.I.D from what actually happened,
+    # never by a model, and it carries no secrets, no tool arguments and no file contents - only paths the
+    # file layer already confined, program-controlled names, counts and short summaries. Task state is
+    # NOT memory and cannot authorize anything: nothing in here is ever read by RiskGate.
+    v3: dict = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -126,7 +159,8 @@ class TaskStore:
                     updated_at  REAL NOT NULL,
                     pending     TEXT,
                     plan        TEXT,
-                    current_step INTEGER
+                    current_step INTEGER,
+                    v3          TEXT
                 )
                 """
             )
@@ -140,6 +174,8 @@ class TaskStore:
                 conn.execute("ALTER TABLE tasks ADD COLUMN plan TEXT")
             if "current_step" not in cols:
                 conn.execute("ALTER TABLE tasks ADD COLUMN current_step INTEGER")
+            if "v3" not in cols:
+                conn.execute("ALTER TABLE tasks ADD COLUMN v3 TEXT")
 
     def save(self, task: Task) -> None:
         """Insert or update a task - this is the checkpoint operation."""
@@ -149,8 +185,8 @@ class TaskStore:
                 """
                 INSERT INTO tasks
                     (id, goal, status, messages, steps, result, error,
-                     created_at, updated_at, pending, plan, current_step)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     created_at, updated_at, pending, plan, current_step, v3)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     goal=excluded.goal,
                     status=excluded.status,
@@ -161,7 +197,8 @@ class TaskStore:
                     updated_at=excluded.updated_at,
                     pending=excluded.pending,
                     plan=excluded.plan,
-                    current_step=excluded.current_step
+                    current_step=excluded.current_step,
+                    v3=excluded.v3
                 """,
                 (
                     task.id, task.goal, task.status,
@@ -171,6 +208,7 @@ class TaskStore:
                     json.dumps(task.pending) if task.pending is not None else None,
                     json.dumps(task.plan) if task.plan else None,
                     task.current_step,
+                    json.dumps(task.v3) if task.v3 else None,
                 ),
             )
 
@@ -204,11 +242,21 @@ class TaskStore:
                 current_step = int(row["current_step"])
             except (ValueError, TypeError):
                 current_step = 0
+        # Malformed V3 state fails safely to empty, exactly as a malformed ledger does: a task whose
+        # orchestration state cannot be read is still a loadable, resumable task.
+        v3: dict = {}
+        if "v3" in keys and row["v3"]:
+            try:
+                loaded_v3 = json.loads(row["v3"])
+                if isinstance(loaded_v3, dict):
+                    v3 = loaded_v3
+            except (ValueError, TypeError):
+                v3 = {}
         return Task(
             id=row["id"], goal=row["goal"], status=status,
             messages=json.loads(row["messages"]), steps=row["steps"],
             result=row["result"], error=row["error"],
-            pending=pending, plan=plan, current_step=current_step,
+            pending=pending, plan=plan, current_step=current_step, v3=v3,
             created_at=row["created_at"], updated_at=row["updated_at"],
         )
 

@@ -547,6 +547,15 @@ class VoiceController:
                          health_sink=health_sink,
                          conversation=_ConversationPolicy.from_config(config))
         holder["controller"] = controller
+        # Give the Assistant's deterministic control pre-step (void/orchestration/commands.py) real
+        # access to the speech backend. Without these it can still classify "stop" correctly, but it has
+        # nothing to silence and no way to know whether anything is being said - so a bare "stop" could
+        # not be resolved by context. Bound here because the TTS belongs to the session, not the Assistant.
+        try:
+            assistant.stop_speaking = tts.stop
+            assistant.speaking_now = lambda: bool(tts.is_speaking)
+        except Exception:                                      # noqa: BLE001 - voice must still start
+            _log.exception("CONTROL_BINDING_FAILED")
         # PTT edges go through the controller: press is quick (mic open / barge-
         # in) and runs inline on the hook thread; release runs the blocking
         # STT/Assistant/TTS chain on the serial worker so the hook thread stays
