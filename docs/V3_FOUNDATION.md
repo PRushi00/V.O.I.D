@@ -11,6 +11,12 @@ failing**, guard floor raised 3157 → 3333.
 
 ---
 
+> **Superseded in part.** This document describes the V3 *orchestration foundation* (commit `ee4856b`).
+> The capability layers that sit under it — browser, desktop, perception, artifacts, research, reference
+> resolution, resources, device standing — were built afterwards. For the full V3 picture and the
+> completeness audit, read [`V3_REQUIREMENTS.md`](V3_REQUIREMENTS.md). Section 10 below ("Not built")
+> was accurate when written and is now largely out of date; the requirement ledger supersedes it.
+
 ## 1. The one-line summary
 
 V2 answers *"what can V.O.I.D do, and may it do this?"* — tools, RiskGate, the kill switch, the single

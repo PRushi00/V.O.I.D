@@ -129,6 +129,64 @@ security:
   # Deletes go to the Recycle Bin, never a hard unlink, in V1.
   delete_to_recycle_bin: true
 
+# Screen understanding (V3). SEPARATE from the camera on purpose: a webcam sees a room, a screen holds
+# passwords, private messages and documents. Being willing to send a webcam frame to a cloud model is not
+# the same decision as sending your screen, so these are their own switches and both default to false.
+screen:
+  enabled: false                 # master switch. false = V.O.I.D cannot read the screen at all.
+  allow_cloud_analysis: false    # may a screenshot leave this machine for a cloud vision model? Default
+                                 # no. Re-checked, with the kill switch, immediately before any bytes go.
+  foreground_only: true          # capture the window in front rather than the whole desktop: it is both
+                                 # the better answer to "what is on my screen?" and the smaller footprint
+                                 # (a second monitor showing something private is not captured at all).
+  max_width: 1280                # captures are downscaled to this before anything reads them
+
+# Browser automation (V3). Playwright drives the owner's INSTALLED browser; nothing is downloaded.
+browser:
+  enabled: false                 # master switch. false = every browser tool refuses.
+  # Attach to a browser the owner already has running, over the Chrome DevTools Protocol. This is the
+  # only way to reuse their real tabs, cookies and signed-in sessions - a freshly launched browser has
+  # none of them and would have to sign in again. Start your browser with
+  # --remote-debugging-port=9222 to enable it. 0 disables attaching.
+  cdp_port: 9222
+  allow_launch: true             # launch a browser when none can be attached to. false = V.O.I.D only
+                                 # ever drives a browser you started yourself (most conservative).
+  headless: false                # a browser acting on your behalf should be visible to you
+  timeout_s: 20                  # per-operation deadline (1..120)
+
+# Desktop automation through Windows UI Automation (V3). This is the most powerful capability in
+# V.O.I.D: unlike a browser, which is confined to a page, UI Automation can read and press controls in
+# ANY window - including a password manager or a banking app. Hence deny-by-default, and hence the
+# per-window scoping, the protected-process refusal and the refusal to type into password fields, none
+# of which are configurable.
+desktop:
+  enabled: false                 # master switch. false = every desktop tool refuses.
+  timeout_s: 5                   # per-operation deadline; UI Automation can block on a hung window
+  max_controls: 150              # controls collected per window read (10..400)
+  max_depth: 12                   # how deep into the control tree to walk (2..30)
+  # Processes never automated are the engine's own list (the shell, the security processes, V.O.I.D
+  # itself) PLUS anything in security.protected_processes. Nothing can remove an engine entry.
+
+# Research (V3). Reads public web pages through the browser layer above, so it needs browser.enabled.
+research:
+  max_sources: 4                 # pages read per lookup (1..10). Each one is a real page load.
+  # Where to search, tried in order until one returns usable results. Measured against the live web:
+  # Google, Bing and DuckDuckGo all refuse automated navigation, and V.O.I.D does NOT try to defeat
+  # that - so the defaults are endpoints that permit programmatic access. Public instances come and go;
+  # if you run your own SearXNG, point this at it, which is both more reliable and more private.
+  # Each entry must contain {query}.
+  search_endpoints:
+    - "https://searxng.site/search?q={query}"
+    - "https://search.marginalia.nu/search?query={query}"
+
+# Doing something about a slow machine (V3). The ONLY thing this permits is lowering a program's CPU
+# priority, reversibly. There is no raise-above-normal (that starves everything else, V.O.I.D included),
+# no close, no kill, no suspend, and no way to run a command. Programs not running as you, and the
+# engine's protected processes, are refused regardless of this setting.
+resources:
+  enabled: false                 # master switch. false = ease_process/restore_process refuse.
+  floor: "below_normal"          # how far down a program may be eased: below_normal, or idle
+
 # Camera (V2 domain 5). Deny-by-default: while `enabled` is false the capability does not exist -
 # not for the model, not for a confirmed tool call, not for MCP. Turning it on is an edit to YOUR
 # local_config.yaml, which no part of V.O.I.D can write.

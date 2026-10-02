@@ -12,7 +12,20 @@ from void import perf
 from void.actions.apps import AppActions
 from void.actions.computer import AppCatalog, ComputerActions, make_backend
 from void.actions.files import FileActions, PathNotAllowed
+from void.actions.browser import BrowserActions
 from void.actions.observe import ObserveActions
+from void.actions.screen import ScreenActions
+from void.actions.desktop import DesktopActions
+from void.actions.artifacts import ArtifactActions
+from void.actions.research import ResearchActions
+from void.actions.reference import ReferenceActions
+from void.actions.resources import ResourceActions
+from void.research import ResearchEngine
+from void.system.devices import snapshot as device_snapshot
+from void.system.resources import ResourceManager, ResourcePolicy
+from void.orchestration.reference import ReferenceResolver
+from void.orchestration.referents import (RecentThings, recent_candidates, tab_candidates,
+                                          window_candidates)
 from void.actions.folders import DEFAULT_DEPTH, FolderCatalog, scan_roots
 from void.actions.vision import VisionActions
 from void.actions.registry import ToolRegistry
@@ -53,6 +66,68 @@ class _NoProvider(LLMProvider):
 
     def generate(self, messages, tools=None):
         raise ProviderUnavailable("This run is deterministic and makes no model call.")
+
+
+def _build_browser(config):
+    """The V.O.I.D browser adapter, or None when browser automation is switched off.
+
+    Lazy by construction: PlaywrightBrowser starts nothing until a tool is actually used, so holding one
+    costs nothing for an owner who never asks V.O.I.D to use a browser.
+    """
+    from void.browser import BrowserPolicy
+    policy = BrowserPolicy.from_config(config)
+    if not policy.enabled:
+        return None
+    try:
+        from void.browser.playwright_adapter import PlaywrightBrowser
+        return PlaywrightBrowser(policy)
+    except Exception:                                          # noqa: BLE001 - never block startup
+        _log.exception("BROWSER_ADAPTER_UNAVAILABLE")
+        return None
+
+
+def _device_registry(state_dir):
+    """The EXISTING pairing registry, read for its trust records.
+
+    Opened read-only in effect: ``device_trust`` only ever calls ``list()``. Pairing, granting and revoking
+    stay where they were - the ``void device`` CLI commands, which the owner runs deliberately. There is no
+    tool that pairs a device, because pairing is an authorization and authorizations are not something a
+    model should be able to reach.
+
+    Returns None when there is no registry file yet, so an owner who has never paired anything sees "no
+    devices are paired" rather than an error.
+    """
+    try:
+        from void.device.identity import DeviceRegistry
+        path = state_dir / "devices" / "devices.json"
+        if not path.exists():
+            path = state_dir / "devices.json"
+        if not path.exists():
+            return None
+        return DeviceRegistry(path)
+    except Exception:                                          # noqa: BLE001
+        _log.info("DEVICE_REGISTRY_UNAVAILABLE")
+        return None
+
+
+def _build_desktop(config):
+    """The V.O.I.D desktop adapter, or None when UI Automation is switched off.
+
+    Returns None rather than raising when ``uiautomation`` is missing, so a machine without the dependency
+    still starts and simply reports desktop automation as unavailable. Like the browser, nothing is
+    initialised until a tool is used - the COM apartment is created on the adapter's own thread on first
+    call, not here.
+    """
+    from void.desktop import DesktopPolicy
+    policy = DesktopPolicy.from_config(config)
+    if not policy.enabled:
+        return None
+    try:
+        from void.desktop.uia_adapter import UiaDesktop
+        return UiaDesktop(policy)
+    except Exception:                                          # noqa: BLE001 - never block startup
+        _log.exception("DESKTOP_ADAPTER_UNAVAILABLE")
+        return None
 
 
 def _file_facts(file_actions, path: str) -> dict | None:
@@ -136,6 +211,53 @@ class Assistant:
                                     providers=lambda: getattr(self, "providers", None),
                                     kill_switch=self.kill_switch)
         self.tools.register_all(self.vision.tools())
+        # Screen understanding (V3). SEPARATE switches from the camera: a screen holds passwords and
+        # documents, so screen.enabled and screen.allow_cloud_analysis are their own decisions. The
+        # vision TRANSPORT is reused from the provider layer rather than duplicated.
+        self.screen = ScreenActions(config=self.config,
+                                    providers=lambda: getattr(self, "providers", None),
+                                    kill_switch=self.kill_switch)
+        self.tools.register_all(self.screen.tools())
+        # Browser (V3). Deny-by-default like the camera: while browser.enabled is false every tool here
+        # refuses, so registration grants nothing. Playwright lives only in void/browser/.
+        self.browser = _build_browser(self.config)
+        self.tools.register_all(BrowserActions(browser=lambda: self.browser).tools())
+        # Desktop automation through UI Automation (V3). The most powerful capability in V.O.I.D and the
+        # most tightly gated: deny-by-default behind desktop.enabled, scoped to one window at a time,
+        # protected processes refused, no typing into password fields. See void/desktop/__init__.py.
+        self.desktop = _build_desktop(self.config)
+        self.tools.register_all(DesktopActions(desktop=lambda: self.desktop).tools())
+        # Artifact generation (V3). Writes through ``file_actions``, so the owner's allowed roots, the
+        # protected roots and the overwrite confirmation all apply to a generated document exactly as they
+        # do to any other write. Every document is reopened and counted before success is reported.
+        self.artifacts = ArtifactActions(file_actions=file_actions,
+                                         recent=lambda: getattr(self, "recent", None))
+        self.tools.register_all(self.artifacts.tools())
+        # Research (V3). Composes the browser and artifact layers; opens no network path of its own.
+        self.research = ResearchEngine.from_config(self.config, browser=lambda: self.browser)
+        self.tools.register_all(ResearchActions(engine=lambda: self.research,
+                                                artifacts=self.artifacts).tools())
+        # What V.O.I.D has recently produced or the owner recently referred to, so that "this chart" and
+        # "the document I was looking at" have something to resolve against. References only: labels and
+        # targets, never content and never permissions.
+        self.recent = RecentThings()
+        self.references = ReferenceResolver([
+            recent_candidates(self.recent),
+            tab_candidates(lambda: self.browser),
+            window_candidates(lambda: self.desktop),
+        ])
+        self.tools.register_all(
+            ReferenceActions(resolver=lambda: self.references, recent=self.recent).tools())
+        # Resource control (V3) and device standing. The resource manager is deny-by-default and can only
+        # lower a process's CPU priority, reversibly - see void/system/resources.py for why that is the
+        # whole of it. Device standing composes the EXISTING pairing registry with the EXISTING hardware
+        # reading; it builds no second registry and can grant nothing.
+        self.resources = ResourceManager(ResourcePolicy.from_config(self.config))
+        self.tools.register_all(ResourceActions(
+            manager=lambda: self.resources,
+            registry=lambda: _device_registry(state_dir),
+            devices=lambda: device_snapshot(),
+        ).tools())
 
         # Persistent memory (V2.0). Lazy: no file and no key exist until the first write.
         # Memory is DATA - it never feeds RiskGate. The model may only SUGGEST via
@@ -171,6 +293,37 @@ class Assistant:
         # Route resolution over the deterministic launcher and any open browser tabs. Providers are
         # adapters over existing systems; the resolver only compares and chooses.
         self.routes = RouteResolver([FastPathRoutes(self._fast), ExistingTabRoutes()])
+
+    def world_state(self) -> WorldState:
+        """What V.O.I.D can observe about the computer right now, for route resolution.
+
+        Everything here is READ, never asserted: running applications come from the window list, open tabs
+        from the browser adapter, preferences from the owner's config. A model cannot put an application
+        into the running set or invent a tab.
+
+        Capabilities are reported as present only when the machinery actually exists, so a route that
+        requires a browser is dropped before selection on a machine where browser automation is off -
+        rather than being chosen and then failing.
+        """
+        capabilities = {"native_app", "desktop"}
+        tabs: tuple = ()
+        if self.browser is not None and self.browser.available():
+            capabilities.add("browser")
+            try:
+                tabs = tuple((tab.browser, tab.url, tab.title) for tab in self.browser.tabs())
+            except Exception:                                  # noqa: BLE001 - stale beats crashing
+                tabs = ()
+        if getattr(self, "screen", None) is not None and self.screen.policy.enabled:
+            capabilities.add("screen")
+        running: frozenset = frozenset()
+        try:
+            running = frozenset(application.name.lower()
+                                for application in self.applications.running())
+        except Exception:                                      # noqa: BLE001 - stale beats crashing
+            pass
+        return WorldState(running_apps=running, open_tabs=tabs,
+                          capabilities=frozenset(capabilities),
+                          preferences=dict(self.applications.preferences))
 
     def _folder_catalog(self, file_actions):
         """A shallow index of the owner's folder names, or None when folder resolution is off.

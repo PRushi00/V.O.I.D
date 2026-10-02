@@ -34,6 +34,12 @@ _SYSTEM_NOISE_DIRS = {
     "Recovery", "ProgramData",
 }
 _MAX_READ_BYTES = 200_000
+
+# Binary reads (reopening a generated document to inspect it) need a far larger cap than text
+# reads: a real deck or workbook easily exceeds 200 KB, and a truncated read would make a
+# perfectly good file look corrupt. Still bounded - these bytes are counted, never shown to the
+# model, so the cap only has to be larger than a plausible document.
+_MAX_BINARY_READ_BYTES = 20_000_000
 _MAX_LIST_ENTRIES = 200  # cap on entries returned by list_directory
 # find_directory bounds (fixed for this phase; not configurable).
 _FIND_DEFAULT_RESULTS = 25
@@ -529,6 +535,57 @@ class FileActions:
             return ToolResult.failure(f"Could not write {p}: {exc}", error=str(exc))
         verb = "Updated" if existed else "Created"
         return ToolResult.success(f"{verb} {p} ({len(content)} chars).", data=str(p))
+
+    def write_bytes(self, path: str, payload: bytes, overwrite: bool = True) -> ToolResult:
+        """Create or replace a file from raw bytes, under exactly the same confinement as ``write``.
+
+        Exists because a generated document (docx/pptx/xlsx/pdf) is a ZIP or a byte stream, and routing it
+        through the text ``write`` would corrupt it - Windows translates ``\\n`` to ``\\r\\n`` in text mode,
+        which breaks a ZIP container. The alternative would be for the artifact layer to open files itself,
+        which would put a second, unconfined write path in V.O.I.D. One confinement implementation is worth
+        more than avoiding this method.
+
+        **Not exposed as a tool.** There is no ``write_bytes`` in :meth:`tools`, so the model cannot ask for
+        an arbitrary byte write anywhere; only V.O.I.D's own artifact generator reaches this.
+
+        ``overwrite`` defaults to True because the caller has already passed the RiskGate, which grades an
+        existing path HIGH and so has already asked the owner. It is a parameter rather than a constant so a
+        caller that has not been gated can keep the create-only behaviour.
+        """
+        try:
+            p = self._confine(path, write=True)
+        except PathNotAllowed as exc:
+            return ToolResult.failure(str(exc), error=str(exc))
+        if not isinstance(payload, (bytes, bytearray)):
+            return ToolResult.failure("Internal error: byte write called with non-bytes.")
+        existed = p.exists()
+        if existed and not overwrite:
+            return ToolResult.failure(f"{p} already exists. Set overwrite=true to replace it.")
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(bytes(payload))
+        except OSError as exc:
+            return ToolResult.failure(f"Could not write {p}: {exc}", error=str(exc))
+        verb = "Updated" if existed else "Created"
+        return ToolResult.success(f"{verb} {p} ({len(payload)} bytes).", data=str(p))
+
+    def read_bytes(self, path: str, max_bytes: int = _MAX_BINARY_READ_BYTES) -> ToolResult:
+        """Read raw bytes under the same confinement as ``read``, for reopening a generated document.
+
+        Also not exposed as a tool: it backs ``inspect_document``, which reports structure rather than
+        handing bytes to the model.
+        """
+        try:
+            p = self._confine(path)
+        except PathNotAllowed as exc:
+            return ToolResult.failure(str(exc), error=str(exc))
+        if not p.is_file():
+            return ToolResult.failure(f"Not a file: {p}")
+        try:
+            data = p.read_bytes()[:max_bytes]
+        except OSError as exc:
+            return ToolResult.failure(f"Could not read {p}: {exc}", error=str(exc))
+        return ToolResult.success(f"Read {len(data)} bytes from {p}.", data=data)
 
     def delete(self, path: str) -> ToolResult:
         """Delete a file by sending it to the Recycle Bin (recoverable)."""
