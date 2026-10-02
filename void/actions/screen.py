@@ -33,6 +33,8 @@ from void.actions.base import Tool, ToolResult
 from void.perception import ObservationKind, clean_text
 from void.perception import screen as screen_source
 from void.providers.base import ProviderUnavailable, VisionBusy
+from void.providers.policy import Capability, DataClass, ProviderPolicy
+from void.providers.policy import Request as PolicyRequest
 from void.security.risk import RiskLevel
 
 _log = logging.getLogger(__name__)
@@ -74,13 +76,17 @@ class ScreenActions:
     a capture is in hand should prevent the upload that has not happened yet.
     """
 
-    def __init__(self, policy=None, config=None, *, providers=None, kill_switch=None):
+    def __init__(self, policy=None, config=None, *, providers=None, kill_switch=None,
+                 provider_policy=None):
         if policy is None:
             policy = (screen_source.ScreenPolicy.from_config(config) if config is not None
                       else screen_source.ScreenPolicy())
         self._policy = policy
         self._providers = providers
         self._kill_switch = kill_switch
+        #: The owner's provider policy (or a callable returning it). Governs WHICH provider may receive a
+        #: screen image, which is a separate question from whether screenshots may leave at all.
+        self._policy_source = provider_policy
         self._captures = 0
         self._cloud_calls = 0
         # Deliberately no capture is kept on this object: nothing for a later call to re-send.
@@ -103,6 +109,22 @@ class ScreenActions:
         return providers
 
     # -- the free, structured answer --
+    def _provider_policy(self):
+        """The owner's provider policy, or None when none is wired.
+
+        Injected rather than constructed so the same policy object governs every capability. None means
+        only the screen switch applies - the behaviour before the policy layer existed - which keeps this
+        module usable in isolation without quietly becoming permissive in the running assistant, where
+        the policy is always supplied.
+        """
+        policy = self._policy_source
+        if callable(policy):
+            try:
+                policy = policy()
+            except Exception:                                  # noqa: BLE001
+                return None
+        return policy
+
     def describe_windows(self) -> ToolResult:
         """Which window is in front and what else is open. Reads no pixels at all."""
         observation = screen_source.window_state()
@@ -141,6 +163,25 @@ class ScreenActions:
             provider = registry.vision()                        # never a text-only fallback
         except ProviderUnavailable as unavailable:
             return None, f"no vision model is available ({unavailable}), so nothing was sent.", 0
+
+        # Second, independent gate: the provider POLICY, asked specifically about a screen image.
+        #
+        # ``screen.allow_cloud_analysis`` (checked in _egress_refusal) answers "may screenshots ever leave
+        # this machine?". This answers "may THIS provider receive one?" - a different question, and the one
+        # that stops an owner who enabled cloud screen analysis for a provider they trust from having the
+        # screenshot go to whichever provider happened to be first in the fallback order. Both must say yes.
+        policy = self._provider_policy()
+        if policy is not None:
+            decision = policy.authorize(
+                getattr(provider, "name", ""),
+                PolicyRequest(capability=Capability.VISION,
+                              data_classes={DataClass.SCREEN_IMAGE},
+                              purpose="describe the screen"))
+            if not decision.allowed:
+                _log.info("SCREEN_POLICY_REFUSED provider=%s", getattr(provider, "name", "?"))
+                return None, (f"the provider policy does not allow sending your screen to "
+                              f"{decision.provider or 'that provider'} - {decision.reason}; "
+                              f"nothing was sent."), 0
         try:
             payload = screen_source.encode_jpeg(image)
         except Exception:                                      # noqa: BLE001 - never put pixels in a message

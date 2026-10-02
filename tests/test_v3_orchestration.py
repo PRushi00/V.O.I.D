@@ -1013,8 +1013,54 @@ def test_the_existing_perf_stream_is_not_replaced():
     assert "void.perf" not in code and "perf.emit" not in code
 
 
-def test_no_telemetry_dependency_was_added():
-    """The OpenTelemetry API was already present transitively; the SDK is the deployer's choice."""
-    import pathlib
-    requirements = pathlib.Path(__file__).resolve().parent.parent / "requirements.txt"
-    assert "opentelemetry" not in requirements.read_text(encoding="utf-8").lower()
+def test_telemetry_is_never_required_for_ordinary_execution():
+    """Replaces an assertion that no OpenTelemetry dependency existed.
+
+    That premise was deliberately retired: V3 added the official SDK and OTLP exporter so spans can
+    actually be collected. The invariant that matters now is not "no dependency" but "no requirement" -
+    V.O.I.D must run identically with telemetry off, missing, or broken. Three cases, all of which must
+    leave the caller unaffected.
+    """
+    from void.obs import TelemetryPolicy, configure
+    from void.orchestration.trace import Span, span
+
+    # Off: nothing configured, nothing opened, and spans still work as no-ops.
+    status = configure(TelemetryPolicy(enabled=False))
+    assert status.enabled is False and status.exporting is False and status.degraded is False
+    with span(Span.TASK, **{"void.task_id": "t1"}):
+        pass
+
+    # Broken exporter: degradation, not an exception, and the body of a span still runs.
+    class _Exploding:
+        def export(self, spans):
+            raise RuntimeError("collector exploded")
+
+        def shutdown(self):
+            raise RuntimeError("no")
+
+        def force_flush(self, timeout_millis=0):
+            raise RuntimeError("no")
+
+    configure(TelemetryPolicy(enabled=True, service_name="t"), exporter=_Exploding())
+    ran = False
+    with span(Span.ACTION, **{"void.tool": "x"}):
+        ran = True
+    assert ran, "a failing exporter must not prevent the measured work from running"
+
+    from void.obs import shutdown as telemetry_shutdown
+    telemetry_shutdown()
+
+
+def test_the_telemetry_dependency_is_pinned_and_official():
+    """A floating telemetry version is a supply-chain risk and a data-model mismatch risk.
+
+    The SDK and exporter must agree with the already-installed API, so the version is pinned in one place
+    and asserted here against what is actually importable.
+    """
+    from void.obs import OTEL_VERSION
+    from importlib.metadata import version
+
+    assert OTEL_VERSION == "1.45.0"
+    for package in ("opentelemetry-api", "opentelemetry-sdk",
+                    "opentelemetry-exporter-otlp-proto-http"):
+        assert version(package) == OTEL_VERSION, f"{package} must match the pinned API version"

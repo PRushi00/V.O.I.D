@@ -45,6 +45,10 @@ V3_MODULES = (
     "actions/browser.py", "actions/desktop.py", "actions/screen.py",
     "actions/artifacts.py", "actions/research.py", "actions/reference.py",
     "actions/resources.py",
+    # Governance, observability and interoperability. The protocol adapters matter most here: they are
+    # the surfaces that speak to something outside V.O.I.D.
+    "providers/policy.py", "research/providers.py", "obs/__init__.py",
+    "ui/agui.py", "ui/a2ui.py", "a2a/__init__.py",
 )
 
 
@@ -82,11 +86,40 @@ def test_no_v3_module_elevates_privileges(relative):
 
 @pytest.mark.parametrize("relative", V3_MODULES)
 def test_no_v3_module_bypasses_the_gate_or_the_kill_switch(relative):
-    """Nothing may call into RiskGate or disengage the kill switch. Both belong to the funnel."""
+    """Nothing may reach into RiskGate or disengage the kill switch. Both belong to the funnel.
+
+    ``.authorize(`` alone is no longer a usable signal: V3 added
+    :meth:`void.providers.policy.ProviderPolicy.authorize`, which is a different decision entirely - it
+    answers "may this provider receive this data?" and has no power to permit an action. So the gate is
+    named directly instead, which is also the stricter check: a module cannot construct, import or call
+    one at all.
+    """
     code = _code_of(relative)
-    for forbidden in (".authorize(", "RiskGate(", ".disengage(", "kill_switch.clear",
-                      "confirm_at_or_above", "deny_all"):
+    for forbidden in ("RiskGate", "risk_gate", ".disengage(", "kill_switch.clear",
+                      "confirm_at_or_above", "deny_all", "owner_decision"):
         assert forbidden not in code, f"{relative} touches {forbidden}"
+
+
+@pytest.mark.parametrize("relative", V3_MODULES)
+def test_the_only_authorize_a_v3_module_may_call_is_the_provider_policys(relative):
+    """Two different ``authorize`` methods now exist, and only one of them is permitted here.
+
+    ``ProviderPolicy.authorize`` decides which provider may see which data. ``RiskGate.authorize``
+    decides whether an action may happen. A capability layer may consult the first; only
+    ``Agent._run_call`` may consult the second. This pins that distinction so a future edit cannot blur
+    the two by reaching for whichever ``authorize`` is in scope.
+    """
+    if relative == "providers/policy.py":
+        return                   # the module that DEFINES the method, and calls its own
+    code = _code_of(relative)
+    if ".authorize(" not in code:
+        return
+    allowed_receivers = ("policy.authorize(", "_policy.authorize(", "self._policy.authorize(")
+    for line in code.splitlines():
+        if ".authorize(" not in line:
+            continue
+        assert any(receiver in line for receiver in allowed_receivers), (
+            f"{relative} calls authorize on something other than a provider policy: {line.strip()}")
 
 
 @pytest.mark.parametrize("relative", V3_MODULES)

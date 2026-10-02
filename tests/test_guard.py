@@ -93,9 +93,18 @@ def test_limits_validation_rejects_garbage(tmp_path):
 
 def test_pytest_is_scoped_to_this_repositorys_own_tests():
     """Bare `pytest` from the repository root once collected the untracked wakeword-training/tests package, whose
-    `tests` name collides with ours, and aborted the whole run. Collection must stay scoped to tests/."""
-    import configparser
+    `tests` name collides with ours, and aborted the whole run. Collection must stay scoped to tests/.
 
-    cfg = configparser.ConfigParser()
-    cfg.read(ROOT / "pytest.ini", encoding="utf-8")
-    assert cfg["pytest"]["testpaths"].strip() == "tests"
+    Asserts the PROPERTY rather than the mechanism. The previous version read ``pytest.ini`` from the root
+    and broke when the owner deliberately moved their configuration into ``workspace/`` - it was testing
+    where a file lived, not whether collection was actually scoped. Scoping now comes from the root
+    ``conftest.py``, which is pytest's own mechanism for this and, unlike ``testpaths``, also holds when a
+    path argument is given. Checking the ignore list directly keeps the test true under either mechanism.
+    """
+    import conftest
+
+    ignored = {Path(entry).name for entry in getattr(conftest, "collect_ignore", ())}
+    assert "wakeword-training" in ignored, (
+        "the sibling project's colliding tests package must be excluded from collection")
+    # Scoping must not be accidental: the module has to say what it excludes and why.
+    assert "wakeword-training" in conftest.NOT_OURS

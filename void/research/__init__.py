@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from urllib.parse import parse_qs, quote_plus, urlparse
 
 from void.browser import UnsafeUrl, safe_url
+from void.providers.policy import Locality
+from void.research.providers import SearchProvider, SearchProviderSet
 from void.perception import clean_text
 
 _log = logging.getLogger(__name__)
@@ -323,16 +325,35 @@ class ResearchEngine:
     network path of its own.
     """
 
-    def __init__(self, browser=None, max_sources: int = MAX_SOURCES, endpoints=None):
+    def __init__(self, browser=None, max_sources: int = MAX_SOURCES, endpoints=None,
+                 providers=None, policy=None):
         self._browser = browser
         self._max_sources = max(1, min(int(max_sources), 10))
+        # ``endpoints`` is the older, simpler form: a list of URL templates. Still accepted, and turned
+        # into named providers, so an existing configuration or test keeps working unchanged.
         self._endpoints = tuple(endpoints) if endpoints else SEARCH_ENDPOINTS
+        if providers is not None:
+            self._providers = providers
+        elif endpoints:
+            self._providers = SearchProviderSet(
+                providers=[SearchProvider(name=f"endpoint-{index}", endpoint=template,
+                                          priority=100 + index, note="passed in directly")
+                           for index, template in enumerate(self._endpoints)],
+                policy=policy)
+        else:
+            self._providers = SearchProviderSet(
+                providers=[SearchProvider(name=f"endpoint-{index}", endpoint=template,
+                                          priority=100 + index, note="shipped default")
+                           for index, template in enumerate(SEARCH_ENDPOINTS)],
+                policy=policy)
+        #: Which provider answered the last search. Provenance for the result.
+        self.last_provider = ""
         #: Why the last search found nothing, so the caller can report it instead of a bare "no results".
         #: Declared here and cleared on every search, so a later pass cannot report a stale reason.
         self.last_search_problems: tuple[str, ...] = ()
 
     @classmethod
-    def from_config(cls, config, browser=None) -> "ResearchEngine":
+    def from_config(cls, config, browser=None, policy=None) -> "ResearchEngine":
         def get(key, default):
             try:
                 return config.get(key, default)
@@ -345,7 +366,8 @@ class ResearchEngine:
             limit = int(get("research.max_sources", MAX_SOURCES))
         except (TypeError, ValueError):
             limit = MAX_SOURCES
-        return cls(browser=browser, max_sources=limit, endpoints=endpoints or None)
+        return cls(browser=browser, max_sources=limit, endpoints=endpoints or None,
+                   providers=SearchProviderSet.from_config(config, policy=policy), policy=policy)
 
     def _adapter(self):
         adapter = self._browser
@@ -356,8 +378,17 @@ class ResearchEngine:
                 return None
         return adapter
 
-    def search_links(self, topic: str, limit: int) -> tuple[str, ...]:
-        """Run the search and return candidate source URLs."""
+    def search_links(self, topic: str, limit: int,
+                     locality: str = Locality.ANY) -> tuple[str, ...]:
+        """Ask the configured search providers in order until one returns usable links.
+
+        Each provider is policy-authorized before it is asked (so a local-only lookup cannot reach a
+        remote index), its latency and outcome are recorded against its health, and the provider that
+        answered is remembered as provenance. A provider that refuses or fails is recorded with the reason
+        and the next one is tried - which is the whole point of having a set rather than one endpoint.
+
+        No retry of a provider that refused: an access control that said no has said no.
+        """
         adapter = self._adapter()
         if adapter is None:
             raise ResearchError(
@@ -367,32 +398,46 @@ class ResearchEngine:
         if not query:
             raise ResearchError("Tell me what to research.")
         encoded = quote_plus(query)
-        problems: list[str] = []
+        problems: list[str] = list(self._providers.refusals(locality))
         self.last_search_problems = ()
-        for template in self._endpoints:
+        self.last_provider = ""
+
+        chain = self._providers.ordered(locality)
+        for provider in chain:
+            health = self._providers.health(provider.name)
             try:
-                url = safe_url(template.format(query=encoded))
+                url = safe_url(provider.endpoint.format(query=encoded))
             except (UnsafeUrl, KeyError, IndexError):
-                problems.append("a configured search endpoint is not a usable https URL")
+                health.record_failure("endpoint is not a usable https URL")
+                problems.append(f"{provider.name} has an endpoint that is not a usable https URL")
                 continue
+            started = time.time()
             try:
                 state = adapter.navigate(url)
             except Exception as exc:                            # noqa: BLE001
-                # A blocked or unreachable provider is expected, not exceptional. Move to the next one
-                # rather than failing the whole pass - that is the reason there is a chain.
-                problems.append(f"{urlparse(url).netloc} did not respond ({type(exc).__name__})")
+                # A blocked or unreachable provider is expected, not exceptional.
+                elapsed = (time.time() - started) * 1000
+                health.record_failure(type(exc).__name__, elapsed)
+                problems.append(f"{provider.name} did not respond ({type(exc).__name__})")
                 continue
+            elapsed = (time.time() - started) * 1000
             # The provider's own host is skipped as a source: a search engine's about and help pages are
             # not research, and a live pass did return one.
-            provider = urlparse(url).netloc.lower()
-            links = _result_links(getattr(state, "links", ()), limit, skip_hosts={provider})
+            host = urlparse(url).netloc.lower()
+            links = _result_links(getattr(state, "links", ()), limit, skip_hosts={host})
             if links:
-                _log.info("RESEARCH_SEARCH provider=%s results=%d", urlparse(url).netloc, len(links))
+                health.record_success(elapsed, len(links))
+                self.last_provider = provider.name
                 return links
-            problems.append(f"{urlparse(url).netloc} returned no usable results")
-        _log.info("RESEARCH_SEARCH_EXHAUSTED tried=%d", len(self._endpoints))
+            health.record_failure("no usable results", elapsed)
+            problems.append(f"{provider.name} returned no usable results")
+        _log.info("RESEARCH_SEARCH_EXHAUSTED tried=%d", len(chain))
         self.last_search_problems = tuple(problems)
         return ()
+
+    def provider_report(self) -> list[dict]:
+        """Every search provider with its configuration and measured health."""
+        return self._providers.report()
 
     def research(self, topic: str, max_sources: int | None = None,
                  urls: tuple[str, ...] = ()) -> ResearchResult:

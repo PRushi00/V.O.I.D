@@ -20,6 +20,11 @@ from void.actions.artifacts import ArtifactActions
 from void.actions.research import ResearchActions
 from void.actions.reference import ReferenceActions
 from void.actions.resources import ResourceActions
+from void.obs import TelemetryPolicy, configure as configure_telemetry
+from void.providers.policy import ProviderPolicy
+from void.a2a import A2aGateway, A2aPolicy
+from void.ui.a2ui import A2uiSession
+from void.ui.agui import AgUiAdapter
 from void.research import ResearchEngine
 from void.system.devices import snapshot as device_snapshot
 from void.system.resources import ResourceManager, ResourcePolicy
@@ -110,6 +115,12 @@ def _device_registry(state_dir):
         return None
 
 
+def _short_goal(goal: object, limit: int = 40) -> str:
+    """A task's goal, shortened for naming it back to the owner when asking which one they meant."""
+    text = " ".join(str(goal or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def _build_desktop(config):
     """The V.O.I.D desktop adapter, or None when UI Automation is switched off.
 
@@ -177,6 +188,14 @@ class Assistant:
         # Persistence
         self.store = TaskStore(state_dir / "tasks.sqlite")
 
+        # Provider governance (V3). WHICH provider may perform WHICH capability using WHICH data.
+        # Built FIRST, before any capability that could reach a provider, because several of them consult
+        # it: the screen tool asks whether this provider may receive a screen image, research asks whether
+        # a search provider may be used at all. Deliberately independent of the provider registry - the
+        # policy decides, the registry executes - and nothing a model produces is an input to it.
+        # See void/providers/policy.py.
+        self.provider_policy = ProviderPolicy.from_config(self.config)
+
         # Tools (actions)
         file_actions = FileActions(
             allowed_roots=self.config.allowed_roots(),
@@ -216,7 +235,8 @@ class Assistant:
         # vision TRANSPORT is reused from the provider layer rather than duplicated.
         self.screen = ScreenActions(config=self.config,
                                     providers=lambda: getattr(self, "providers", None),
-                                    kill_switch=self.kill_switch)
+                                    kill_switch=self.kill_switch,
+                                    provider_policy=lambda: getattr(self, "provider_policy", None))
         self.tools.register_all(self.screen.tools())
         # Browser (V3). Deny-by-default like the camera: while browser.enabled is false every tool here
         # refuses, so registration grants nothing. Playwright lives only in void/browser/.
@@ -234,7 +254,8 @@ class Assistant:
                                          recent=lambda: getattr(self, "recent", None))
         self.tools.register_all(self.artifacts.tools())
         # Research (V3). Composes the browser and artifact layers; opens no network path of its own.
-        self.research = ResearchEngine.from_config(self.config, browser=lambda: self.browser)
+        self.research = ResearchEngine.from_config(self.config, browser=lambda: self.browser,
+                                                   policy=self.provider_policy)
         self.tools.register_all(ResearchActions(engine=lambda: self.research,
                                                 artifacts=self.artifacts).tools())
         # What V.O.I.D has recently produced or the owner recently referred to, so that "this chart" and
@@ -252,6 +273,23 @@ class Assistant:
         # lower a process's CPU priority, reversibly - see void/system/resources.py for why that is the
         # whole of it. Device standing composes the EXISTING pairing registry with the EXISTING hardware
         # reading; it builds no second registry and can grant nothing.
+        # --- V3 interoperability surfaces -------------------------------------------
+        # All three are adapters over systems that already exist, all three are off by default, and none
+        # of them is an authority. See void/ui/agui.py, void/ui/a2ui.py, void/a2a/__init__.py.
+        #
+        # AG-UI publishes task events to a front end. Outbound only - subscribing to the event log cannot
+        # become a way to drive V.O.I.D, because this adapter has no method that acts.
+        self.agui = (AgUiAdapter(event_log=self.events,
+                                 thread_id=self.config.get("agui.thread_id", "void"))
+                     if self.config.get("agui.enabled", False) else None)
+        # A2UI mints and resolves approval tokens for dynamic surfaces. A returned token is evidence that
+        # a human clicked on a specific pending action; it is an INPUT to the RiskGate, never a bypass.
+        self.a2ui = A2uiSession()
+        # A2A is the untrusted external-agent boundary. It decides and returns; it never executes. An
+        # accepted request still goes through Assistant.run and the whole funnel, with the skill's tool
+        # ceiling on top.
+        self.a2a = A2aGateway(A2aPolicy.from_config(self.config))
+
         self.resources = ResourceManager(ResourcePolicy.from_config(self.config))
         self.tools.register_all(ResourceActions(
             manager=lambda: self.resources,
@@ -273,6 +311,13 @@ class Assistant:
         # authorizes anything - orchestration decides what to attempt, and every attempt still goes
         # through Agent._run_call (kill switch -> risk -> RiskGate) unchanged.
         self.events = EventLog()
+        # Observability (V3). Configures the official OpenTelemetry SDK so the spans already emitted
+        # through the API in void/orchestration/trace.py reach a collector. Off by default; a failure here
+        # is reported as degradation on self.telemetry and never raised, because a collector being down
+        # must not fail a task. See void/obs/__init__.py.
+        self.telemetry = configure_telemetry(TelemetryPolicy.from_config(self.config))
+        if self.telemetry.degraded:
+            _log.warning("TELEMETRY_DEGRADED reason=%s", self.telemetry.reason)
         self.applications = ApplicationRegistry(
             catalog_entries=catalog.entries,
             running_apps=lambda: (computer_actions.list_running_apps().data or []),
@@ -528,10 +573,12 @@ class Assistant:
             resumed = self._set_task_status(Status.RUNNING, frm=(Status.PAUSED,))
             return "Resuming." if resumed else "Nothing is paused."
         if intent == ControlIntent.CANCEL_TASK:
-            cancelled = self._set_task_status(Status.CANCELLED,
-                                              frm=(Status.RUNNING, Status.PAUSED, Status.PLANNING,
-                                                   Status.REPLANNING, Status.VERIFYING))
-            return "Cancelled." if cancelled else "Nothing to cancel."
+            # Asks rather than guessing when several jobs are running: cancelling the wrong one is not
+            # recoverable, and "cancel that" does not identify which. See _destructive_status_change.
+            return self._destructive_status_change(
+                Status.CANCELLED, verb="cancel",
+                frm=(Status.RUNNING, Status.PAUSED, Status.PLANNING,
+                     Status.REPLANNING, Status.VERIFYING))
         if intent == ControlIntent.MODIFY_TASK:
             from void.orchestration.replan import apply_modification
             for task in self.store.list(limit=10):
@@ -544,22 +591,48 @@ class Assistant:
             return None
         return None
 
+    def _candidate_tasks(self, frm: tuple) -> list:
+        """Tasks currently in one of ``frm``, most recent first."""
+        try:
+            return [task for task in self.store.list(limit=10) if task.status in frm]
+        except Exception:                                      # noqa: BLE001 - never block a control word
+            return []
+
     def _set_task_status(self, to: str, *, frm: tuple) -> bool:
         """Move the most recent matching task to ``to``. Returns whether anything changed.
 
         Deliberately only task STATUS: a control command never executes a capability, never reverses a
         completed side effect, and never authorizes anything.
         """
-        try:
-            for task in self.store.list(limit=10):
-                if task.status in frm:
-                    task.status = to
-                    task.touch()
-                    self.store.save(task)
-                    return True
-        except Exception:                                      # noqa: BLE001
-            return False
+        for task in self._candidate_tasks(frm):
+            try:
+                task.status = to
+                task.touch()
+                self.store.save(task)
+                return True
+            except Exception:                                  # noqa: BLE001
+                return False
         return False
+
+    def _destructive_status_change(self, to: str, *, frm: tuple, verb: str) -> str:
+        """Change one task's status, or ASK when more than one task could be the one meant.
+
+        Cancelling is not recoverable the way pausing is, and "cancel that" with two jobs running does not
+        identify either of them. Taking the most recent would be a guess with a real cost: abandoning work
+        the owner never mentioned. So when several tasks qualify, V.O.I.D names them and asks - the same
+        rule the reference resolver follows for "open that chart", applied to the one control command that
+        cannot be undone.
+
+        With exactly one candidate there is no ambiguity and nothing to ask about.
+        """
+        candidates = self._candidate_tasks(frm)
+        if not candidates:
+            return f"Nothing to {verb}."
+        if len(candidates) > 1:
+            listed = ", ".join(f"'{_short_goal(task.goal)}'" for task in candidates[:3])
+            return (f"You have {len(candidates)} jobs going - {listed}. "
+                    f"Which one should I {verb}?")
+        return "Cancelled." if self._set_task_status(to, frm=frm) else f"Nothing to {verb}."
 
     def _recall_route(self, goal: str) -> "AgentResult | str | bool":
         """Memory questions are answered from memory, not by searching the machine.

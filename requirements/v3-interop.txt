@@ -1,0 +1,20 @@
+# V3 observability and interoperability.
+# Additive to workspace/requirements.txt. All official PyPI packages, pinned.
+
+# OpenTelemetry. The API was already present transitively and V.O.I.D's spans are emitted against it;
+# these two make the spans collectable. All three MUST stay on the same version - a skew between API,
+# SDK and exporter is a data-model mismatch.
+# http/protobuf is used by default: it needs only urllib3 (already present) and traverses proxies
+# that gRPC does not. Add opentelemetry-exporter-otlp-proto-grpc to use protocol: grpc.
+opentelemetry-api==1.45.0
+opentelemetry-sdk==1.45.0
+opentelemetry-exporter-otlp-proto-http==1.45.0
+
+# AG-UI protocol types. Pinned rather than tracking latest because an event schema that changes under a
+# running front end is a broken front end. Pure types; adds no transitive dependencies.
+ag-ui-protocol==1.0.0
+
+# A2A protocol types (official SDK). Used for the agent card and message types only - V.O.I.D does not
+# start the SDK's server, because supporting the protocol is a separate decision from opening a port.
+# Adds only json-rpc.
+a2a-sdk==1.2.1

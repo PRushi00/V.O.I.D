@@ -1,0 +1,18 @@
+# V3 capability layers: browser, desktop, artifacts.
+# Additive to workspace/requirements.txt. All official PyPI packages, pinned.
+
+# Browser automation. Drives the owner's INSTALLED Edge/Chrome/Opera GX; no Chromium is downloaded.
+# A real browser is not reimplementable and a custom engine is explicitly out of scope.
+playwright==1.63.0
+
+# Windows UI Automation. A thin wrapper over the UIA COM API; hand-written COM plumbing would be
+# more code and more risk for no gain. Windows only.
+uiautomation==2.0.29
+
+# Document generation. OOXML and PDF by hand are large, well-solved problems.
+# Note: no PDF *parser* is installed, so artifact inspection of a PDF is structural
+# (header, EOF marker, page count) rather than a full parse.
+python-docx==1.2.0
+python-pptx==1.0.2
+openpyxl==3.1.5
+reportlab==5.0.1

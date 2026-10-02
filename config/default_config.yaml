@@ -175,9 +175,89 @@ research:
   # that - so the defaults are endpoints that permit programmatic access. Public instances come and go;
   # if you run your own SearXNG, point this at it, which is both more reliable and more private.
   # Each entry must contain {query}.
+  # Search providers, asked in `priority` order (lowest first) until one returns usable results.
+  # Each is authorized through the provider policy below before it is asked, its latency and outcome are
+  # recorded, and one that keeps failing is rested rather than retried. V.O.I.D does NOT work around a
+  # provider that declines automated access - it records the reason and uses one that permits it.
+  # `kind: local` means nothing leaves the machine, so a local-only lookup can still be served.
+  providers:
+    searxng-local:
+      enabled: false               # set true if you run your own SearXNG - the best setup here
+      endpoint: "http://127.0.0.1:8888/search?q={query}"
+      kind: local
+      priority: 10
+      note: "your own SearXNG; nothing leaves the machine"
+    searxng:
+      enabled: true
+      endpoint: "https://searxng.site/search?q={query}"
+      kind: cloud
+      priority: 20
+      note: "public SearXNG instance; aggregates the major engines"
+    marginalia:
+      enabled: true
+      endpoint: "https://search.marginalia.nu/search?query={query}"
+      kind: cloud
+      priority: 30
+      note: "independent index; good for documents, weak for news"
+  # Older, simpler form. Still honoured when `providers` above is absent.
   search_endpoints:
     - "https://searxng.site/search?q={query}"
     - "https://search.marginalia.nu/search?query={query}"
+
+# Provider governance (V3). WHICH provider may perform WHICH capability using WHICH data.
+#
+# This is a security boundary, not a preference list. It sits BELOW the model: a capability layer declares
+# the data it actually holds (the screen tool says "screen_image"), and this decides. Nothing a model
+# produces is an input, so no model output can widen what a provider may receive.
+#
+# Deny-by-default. A provider with no entry here can do nothing. A data class not listed for a provider is
+# refused for that provider. `credential` is refused to EVERY provider and cannot be granted here.
+#
+# Fallback may only preserve or strengthen privacy: every provider in a fallback chain is authorized
+# against the same request, so a local-only task can never fail over to a cloud model, and a provider not
+# permitted `screen_image` never receives a screenshot however unavailable the permitted one is.
+#
+# data_classes: public_web, user_text, screen_image, camera_image, private_file, memory_content,
+#               device_information, browser_content, messaging_content
+# capabilities:  text, vision, search, embedding, audio
+providers:
+  default_locality: "any"          # or "local_only" to keep everything on this machine by default
+  policy:
+    local:
+      kind: local                  # runs here, so using it discloses nothing
+      capabilities: [text, vision, embedding]
+      data_classes: [public_web, user_text, screen_image, camera_image, private_file,
+                     memory_content, device_information, browser_content, messaging_content]
+    gemini:
+      kind: cloud
+      capabilities: [text, vision]
+      # Deliberately NOT screen_image / private_file / memory_content. Add one only if you want that
+      # kind of content sent to this provider; `screen.allow_cloud_analysis` must also be on.
+      data_classes: [public_web, user_text]
+    openai:
+      kind: cloud
+      capabilities: [text, embedding]
+      data_classes: [public_web, user_text]
+    anthropic:
+      kind: cloud
+      capabilities: [text, vision]
+      data_classes: [public_web, user_text]
+    agentrouter:
+      kind: cloud
+      capabilities: [text]
+      data_classes: [public_web, user_text]
+    searxng:
+      kind: cloud
+      capabilities: [search]
+      data_classes: [public_web, user_text]
+    marginalia:
+      kind: cloud
+      capabilities: [search]
+      data_classes: [public_web, user_text]
+    searxng-local:
+      kind: local
+      capabilities: [search]
+      data_classes: [public_web, user_text, private_file, memory_content]
 
 # Doing something about a slow machine (V3). The ONLY thing this permits is lowering a program's CPU
 # priority, reversibly. There is no raise-above-normal (that starves everything else, V.O.I.D included),
@@ -186,6 +266,53 @@ research:
 resources:
   enabled: false                 # master switch. false = ease_process/restore_process refuse.
   floor: "below_normal"          # how far down a program may be eased: below_normal, or idle
+
+# Observability (V3). V.O.I.D already emits spans through the OpenTelemetry API; this decides whether
+# anything collects them. Off by default: while disabled, no SDK is configured and no socket is opened.
+# Telemetry is NEVER required for ordinary execution - if the collector is unreachable or the exporter
+# fails to build, V.O.I.D reports observability as degraded and carries on.
+# Span attributes are allowlisted twice (at creation and on export), so no goal text, transcript, tool
+# argument, page content, screen content, memory content or credential can travel.
+observability:
+  enabled: false
+  endpoint: "http://127.0.0.1:4318/v1/traces"   # OTLP. Default is a collector on this machine.
+  protocol: "http/protobuf"      # http/protobuf (needs nothing extra) or grpc (needs the grpc exporter)
+  timeout_s: 10                  # per-export deadline (1..120)
+  sample_ratio: 1.0              # fraction of traces recorded (0.0..1.0)
+  service_name: "void"
+  console: false                 # also print spans to the log; for checking instrumentation with no collector
+  # Headers for a collector that authenticates. Prefer `headers_env`: it names an environment variable
+  # holding "Key=value,Key2=value2" so a token never has to be written into a config file.
+  # Header VALUES are never logged, and never appear in a span.
+  headers: {}
+  headers_env: ""
+
+# AG-UI (V3). Publishes V.O.I.D's existing task events in the AG-UI protocol so a front end can follow a
+# task. OUTBOUND ONLY: there is no inbound path, so a UI cannot use this to make V.O.I.D do anything.
+# Only engine-minted fields travel (task id, tool name, step, outcome) - never goal text, transcripts,
+# tool arguments or page content. Protocol package: ag-ui-protocol 1.0.0, pinned.
+agui:
+  enabled: false
+  thread_id: "void"              # identifies this assistant's event stream to a front end
+
+# A2A (V3). Lets ANOTHER agent ask this one for something. The most exposed boundary in V.O.I.D, so:
+# deny-by-default, an EMPTY agent list means nobody, and every advertised skill is read-only. There is no
+# skill identifier for writing a file, driving the desktop or browser, sending a message, touching a
+# device, reading memory or running a command - a remote agent cannot even express those requests.
+# A remote agent is never the owner: a request that would need the owner's confirmation is refused, not
+# queued. Official SDK: a2a-sdk 1.2.1, pinned.
+a2a:
+  enabled: false
+  allow_listener: false          # supporting the protocol does not imply opening a port
+  max_request_bytes: 8192
+  rate_per_minute: 20
+  advertised_skills: ["void.status"]   # void.status, void.research, void.answer
+  # Allowed agents, by id. Each may use only the skills listed for it, intersected with the advertised
+  # set above. An agent not listed here is refused.
+  agents: {}
+  #  example-partner:
+  #    skills: ["void.status", "void.research"]
+  #    note: "my other assistant"
 
 # Camera (V2 domain 5). Deny-by-default: while `enabled` is false the capability does not exist -
 # not for the model, not for a confirmed tool call, not for MCP. Turning it on is an edit to YOUR
