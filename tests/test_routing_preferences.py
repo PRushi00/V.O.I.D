@@ -84,10 +84,22 @@ def test_only_roles_the_registry_understands_are_overridable():
 
 
 def test_roles_without_capability_data_are_not_claimed():
-    """Recognising an override for a role V.O.I.D cannot act on would be a promise it cannot keep."""
+    """Recognising an override for a role V.O.I.D cannot act on would be a promise it cannot keep.
+
+    Asserts the PROPERTY rather than the membership list. The previous version pinned the set to
+    exactly ``{"browser"}``, which was the truth when browsers were the only role with a layer
+    behind them; ``messaging`` joined it when :mod:`void.orchestration.messaging` gained the ability
+    to actually reach a conversation. A test that had to be edited for each new role would be
+    recording history, not protecting the rule - so the rule is what is checked: every claimed role
+    is a known preference key with a real vocabulary, and a role with no layer stays absent.
+    """
     vocabularies = role_vocabularies()
-    assert set(vocabularies) == {"browser"}
-    assert vocabularies["browser"], "the one claimed role must actually have a vocabulary"
+    assert set(vocabularies) <= PREFERENCE_KEYS
+    assert all(entries for entries in vocabularies.values()), "an empty vocabulary must be dropped"
+    assert "browser" in vocabularies and "messaging" in vocabularies
+    for unclaimed in ("editor", "terminal", "music", "mail"):
+        assert unclaimed not in vocabularies, (
+            f"{unclaimed!r} has no capability layer, so an override for it would be a dead promise")
 
 
 # --------------------------------------------------------------------------- precedence

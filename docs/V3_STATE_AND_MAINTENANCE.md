@@ -192,26 +192,56 @@ changed", and none of those need the contents.
 
 ## 7. Scheduling
 
-Deliberately **no new scheduler and no Windows task was registered.** The runner self-gates, so any
-trigger works and firing it often is harmless:
+The runner self-gates, so Windows only has to **ask**; the database decides whether anything happens.
 
 ```bash
-python -m void maintenance run          # runs only if due (Sunday, not yet done)
-python -m void maintenance run --force  # try now; still at most once per week
+python -m void maintenance schedule install   # register the Sunday trigger
+python -m void maintenance schedule status     # what is registered, enabled, elevated?
+python -m void maintenance schedule remove
+python -m void maintenance run                 # runs only if due (Sunday, not yet done)
+python -m void maintenance run --force         # try now; still at most once per week
 python -m void maintenance run --dry-run --scopes BROWSER_METADATA
 python -m void maintenance status
 python -m void maintenance changes
 ```
 
-`void/runtime/scheduled_task.py` already registers Windows tasks, but its triggers and description are
-hardcoded for the voice runtime and that file is **frozen** for this milestone, so it was neither
-modified nor reused with a misleading description. Pointing Task Scheduler at
-`void maintenance run` is a one-line owner action; the weekly semantics are already guaranteed in SQL.
+`void/maintenance/schedule.py` registers one per-user task, `VOID_SundayMaintenance`, whose action is
+`pythonw.exe <absolute void/maintenance/launcher.py>`. Read back from Windows' own XML:
+
+| setting | value | why |
+| --- | --- | --- |
+| trigger | `ScheduleByWeek`, `<Sunday />`, `WeeksInterval 1` | the requirement is Sunday |
+| repetition | `PT2H` for `P1D` | a machine switched off at 11:00 still catches Sunday later |
+| `LogonType` | `InteractiveToken` | runs as the owner; **no stored password** |
+| `RunLevel` | absent → LeastPrivilege | **no elevation** |
+| `MultipleInstancesPolicy` | `IgnoreNew` | a duplicate firing dies before Python starts |
+| `StartWhenAvailable` | `true` | a slept-through trigger is retried |
+| `ExecutionTimeLimit` | `PT1H` | a wedged run cannot sit forever |
+
+**Why a second task rather than the voice runtime's.** `void/runtime/scheduled_task.py` already
+registers a per-user task, and reusing it was considered and rejected: its triggers (logon, unlock,
+15-minute re-check) and its description are specific to keeping a long-lived voice process alive.
+Registering maintenance there would have meant either a misleading description on the voice task or
+a second action smuggled into it. Two tasks with honest descriptions is the correct answer, and the
+voice task was not touched.
+
+**The launcher exists because Task Scheduler supplies no working directory.** `pythonw.exe -m void
+maintenance run` would depend on the repository happening to be the current directory;
+`launcher.py` resolves the repository from its own absolute path, exactly as
+`void/runtime/voice_startup.py` does and for the same reason. It holds no maintenance logic — it
+runs `maintenance run`, never `--force`, so a trigger firing twelve times on a Sunday still produces
+at most one pass.
+
+**Known limitation.** A machine that is off for the whole of Sunday misses that week. This follows
+from the requirement being *Sunday* maintenance rather than *weekly-ish* maintenance: Monday's
+retry correctly answers "today is not Sunday". Relaxing that belongs in `due()` as an owner
+decision, not in the trigger.
 
 ## 8. What was not built
 
 - **No migration** — the memory store already satisfied the requirement (§1).
-- **No second scheduler**, no server database, no vector store, no ORM, **no new dependency**
+- **No second scheduler.** Windows Task Scheduler triggers the existing CLI (§7); the weekly
+  semantics stayed in SQL. No server database, no vector store, no ORM, **no new dependency**
   (`sqlite3` is standard library).
 - **No voice/runtime change** — 29 files hash-verified byte-identical before and after.
 - **No preference inference** — the `explicit`/`confidence` columns exist for a future one; nothing

@@ -16,6 +16,7 @@ from void.actions.browser import BrowserActions
 from void.actions.observe import ObserveActions
 from void.actions.screen import ScreenActions
 from void.actions.desktop import DesktopActions
+from void.actions.messaging import MessagingActions
 from void.actions.artifacts import ArtifactActions
 from void.actions.research import ResearchActions
 from void.actions.reference import ReferenceActions
@@ -43,6 +44,8 @@ from void.core.fast_path import FastPath
 from void.orchestration.apps import ApplicationRegistry
 from void.orchestration.commands import ControlContext, ControlIntent, classify as classify_control
 from void.orchestration.events import EventLog
+from void.orchestration.messaging import (ConversationRoutes, installed_via_catalog,
+                                          observed_conversations)
 from void.orchestration.routes import ExistingTabRoutes, FastPathRoutes, RouteResolver, WorldState
 from void.orchestration.verify import Verifier
 from void.core.kill_switch import KillSwitch
@@ -256,6 +259,12 @@ class Assistant:
         # protected processes refused, no typing into password fields. See void/desktop/__init__.py.
         self.desktop = _build_desktop(self.config)
         self.tools.register_all(DesktopActions(desktop=lambda: self.desktop).tools())
+        # Conversations with people (V3). Composes the desktop adapter above and the EXISTING
+        # validated launcher - it opens no window and starts no program by any other route, and it
+        # cannot send: a control that would act rather than open is refused before it is clicked.
+        self.messaging = MessagingActions(desktop=lambda: self.desktop, catalog=catalog,
+                                          launch=app_actions.launch_app)
+        self.tools.register_all(self.messaging.tools())
         # Artifact generation (V3). Writes through ``file_actions``, so the owner's allowed roots, the
         # protected roots and the overwrite confirmation all apply to a generated document exactly as they
         # do to any other write. Every document is reopened and counted before success is reported.
@@ -353,9 +362,15 @@ class Assistant:
                                answer_unknown=self.config.get("fast_path.answer_unknown_apps", True),
                                folders=self._folder_catalog(file_actions))
                       if self.config.get("fast_path.enabled", True) else None)
-        # Route resolution over the deterministic launcher and any open browser tabs. Providers are
-        # adapters over existing systems; the resolver only compares and chooses.
-        self.routes = RouteResolver([FastPathRoutes(self._fast), ExistingTabRoutes()])
+        # Route resolution over the deterministic launcher, any open browser tabs, and conversations
+        # with people. All three are adapters over systems that already exist; the resolver only
+        # compares and chooses. The conversation provider's two sources are callables so that an
+        # ordinary goal costs nothing - neither the catalog nor the window list is read unless the
+        # utterance is actually about a conversation.
+        self.routes = RouteResolver([FastPathRoutes(self._fast), ExistingTabRoutes(),
+                                     ConversationRoutes(
+                                         installed=lambda: installed_via_catalog(catalog),
+                                         conversations=self._open_conversations)])
 
     def world_state(self, goal: str = "") -> WorldState:
         """What V.O.I.D can observe about the computer right now, for route resolution.
@@ -378,6 +393,16 @@ class Assistant:
                 tabs = ()
         if getattr(self, "screen", None) is not None and self.screen.policy.enabled:
             capabilities.add("screen")
+        # UI Automation is a separate capability from V2's lightweight window list: "desktop" is
+        # being able to see and activate windows, "desktop_ui" is being able to reach inside one.
+        # A route that needs the second is dropped when desktop.enabled is false, which is how
+        # "open Rushi's chat" reports honestly instead of failing mid-way.
+        if getattr(self, "desktop", None) is not None:
+            try:
+                if self.desktop.available():
+                    capabilities.add("desktop_ui")
+            except Exception:                                  # noqa: BLE001 - absent beats crashing
+                _log.debug("DESKTOP_UI_PROBE_FAILED", exc_info=True)
         running: frozenset = frozenset()
         try:
             running = frozenset(application.name.lower()
@@ -397,6 +422,24 @@ class Assistant:
         return WorldState(running_apps=running, open_tabs=tabs,
                           capabilities=frozenset(capabilities),
                           preferences=preferences, overrides=overrides)
+
+    def _open_conversations(self):
+        """Conversation windows open right now, for the messaging route provider.
+
+        Read through the UI Automation adapter, and only when it is actually available - this is on
+        the path of a conversation request, so it must not pay for a disabled capability or raise
+        into route resolution. Window titles are untrusted data; they are compared, never believed.
+        """
+        desktop = getattr(self, "desktop", None)
+        if desktop is None:
+            return ()
+        try:
+            if not desktop.available():
+                return ()
+            return observed_conversations(desktop.windows())
+        except Exception:                                      # noqa: BLE001 - no candidates is a
+            _log.debug("CONVERSATIONS_UNAVAILABLE", exc_info=True)   # fine answer; crashing is not
+            return ()
 
     def _folder_catalog(self, file_actions):
         """A shallow index of the owner's folder names, or None when folder resolution is off.

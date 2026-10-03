@@ -6,9 +6,11 @@ Task Scheduler, the owner typing the command, or a future runtime tick - and non
 know what day it is. ``run`` is the safe default (does nothing unless due); ``--force`` is for trying
 it now, and still cannot run twice in a week; ``--dry-run`` collects and diffs without writing.
 
-Deliberately NOT a scheduler of its own. V.O.I.D already registers Windows tasks in
-:mod:`void.runtime.scheduled_task`; this adds no second mechanism, and because the runner self-gates,
-pointing anything at ``void maintenance run`` is enough.
+Deliberately NOT a scheduler of its own. ``schedule install`` registers ONE Windows Task Scheduler
+trigger (see :mod:`void.maintenance.schedule`) that fires this same ``run`` command; it owns no
+weekly logic, so what Windows contributes is the word "now" and nothing else. The voice runtime's
+task (:mod:`void.runtime.scheduled_task`) is a separate task with its own honest description and was
+not touched.
 """
 from __future__ import annotations
 
@@ -32,6 +34,11 @@ def add_parser(sub) -> None:
     actions.add_parser("status", help="When it last ran, what changed, and whether it is due")
     p_changes = actions.add_parser("changes", help="Changes detected by recent runs")
     p_changes.add_argument("--limit", type=int, default=40)
+    p_sched = actions.add_parser(
+        "schedule", help="Register, inspect or remove the Windows Sunday trigger")
+    p_sched.add_argument("operation", nargs="?", default="status",
+                         choices=["status", "install", "remove"],
+                         help="status (default), install, or remove")
 
 
 def _build(config):
@@ -109,5 +116,67 @@ def run(args, config) -> int:
             print(f"  {when}  {change.kind:24} {change.identity[:44]}  {change.detail}")
         return 0
 
-    print("Usage: python -m void maintenance [run|status|changes]")
+    if action == "schedule":
+        return _schedule(getattr(args, "operation", "status") or "status")
+
+    print("Usage: python -m void maintenance [run|status|changes|schedule]")
     return 1
+
+
+def _schedule(operation: str) -> int:
+    """The Windows trigger, as three plain answers.
+
+    Kept in its own function because it is the one maintenance command that touches something outside
+    the database. It imports Task Scheduler support lazily: ``void maintenance status`` must keep
+    working on a machine without pywin32, and on a non-Windows host.
+    """
+    try:
+        from void.maintenance import schedule
+    except Exception as exc:                                   # noqa: BLE001
+        print(f"Windows scheduling support is unavailable ({type(exc).__name__}).")
+        return 1
+
+    if operation == "install":
+        try:
+            command = schedule.install()
+        except Exception as exc:                               # noqa: BLE001
+            # Almost always a missing pywin32 or a policy-restricted Task Scheduler. Report it; do
+            # not retry, and do not fall back to anything that would need elevation.
+            print(f"Could not register the task ({type(exc).__name__}: {exc}).")
+            print("The weekly pass still works when run by hand: python -m void maintenance run")
+            return 1
+        print(f"Registered '{schedule.TASK_NAME}' (per-user, no elevation).")
+        print(f"  runs:    {command}")
+        print(f"  trigger: Sunday from {schedule.MAINTENANCE_HOUR:02d}:00, re-checked every "
+              f"{schedule.REPEAT_INTERVAL[2:].lower()} through the day")
+        print("  The database decides whether a firing does anything, so extra firings are harmless.")
+        return 0
+
+    if operation == "remove":
+        try:
+            removed = schedule.remove()
+        except Exception as exc:                               # noqa: BLE001
+            print(f"Could not remove the task ({type(exc).__name__}).")
+            return 1
+        print("Removed." if removed else "Nothing was registered.")
+        return 0
+
+    try:
+        info = schedule.status()
+    except Exception as exc:                                   # noqa: BLE001
+        print(f"Could not read the task ({type(exc).__name__}).")
+        return 1
+    if info is None:
+        print("No Windows trigger is registered.")
+        print("Install it with:  python -m void maintenance schedule install")
+        return 0
+    print(f"'{schedule.TASK_NAME}' is registered.")
+    print(f"  runs:     {info['command']}")
+    print(f"  enabled:  {'yes' if info['enabled'] else 'no'}")
+    print(f"  elevated: {'yes' if info['elevated'] else 'no (runs as you, least privilege)'}")
+    if not info["runs_maintenance"]:
+        # A task under this name that runs something else is worse than no task, because it looks
+        # like scheduling is handled.
+        print("  WARNING: the registered action does not point at the maintenance launcher.")
+        return 1
+    return 0

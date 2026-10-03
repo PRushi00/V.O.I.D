@@ -8,10 +8,12 @@ piece of precedence the route resolver could not express before: it knew the sto
 This module extracts that contradiction, deterministically, with no model involved.
 
 **Why it is not a pile of special cases.** The only domain knowledge here is a vocabulary of role
-words, and for the one role the project has real data about - browsers - the vocabulary is
-:data:`void.browser.playwright_adapter._BROWSERS`, the same table the browser layer already uses to
-launch one. So "Edge" is recognised because V.O.I.D genuinely knows how to drive Edge, not because a
-branch was written for it. Adding a role means adding its vocabulary, not editing the resolver.
+words, and each vocabulary is read from the layer that can actually act on it - browsers from
+:data:`void.browser.playwright_adapter._BROWSERS`, the same table the browser layer uses to launch
+one, and messengers from :data:`void.orchestration.messaging.MESSAGING_APPS`. So "Edge" is
+recognised because V.O.I.D genuinely knows how to drive Edge, and "Discord" because it genuinely
+knows how to reach a conversation inside it - not because a branch was written for either. Adding a
+role means adding its vocabulary, not editing the resolver.
 
 **Why it refuses more than it accepts.** An override changes which application runs, so a false
 positive is worse than a miss: "open the invoice in Documents" must not be read as an application
@@ -95,14 +97,36 @@ ALIASES = {
 }
 
 
+def messaging_vocabulary() -> frozenset[str]:
+    """Messaging application names V.O.I.D can recognise and reach.
+
+    Read from :data:`void.orchestration.messaging.MESSAGING_APPS` for the same reason the browser
+    vocabulary is read from the browser layer's own table: one list, owned by the layer that can
+    actually act, so the two cannot drift apart. Imported lazily so this module stays importable
+    when the messaging layer is not.
+    """
+    try:
+        from void.orchestration.messaging import messaging_vocabulary as surfaces
+        return surfaces()
+    except Exception:                                          # noqa: BLE001 - vocabulary is optional
+        _log.debug("MESSAGING_VOCABULARY_UNAVAILABLE", exc_info=True)
+        return frozenset()
+
+
 def role_vocabularies() -> dict[str, frozenset[str]]:
     """Role -> the application names that count for it.
 
-    Only ``browser`` is populated, because it is the only role for which the repository holds real
-    capability data. The others stay empty on purpose: recognising an override for a role V.O.I.D
-    cannot act on would be a promise it could not keep.
+    A role appears here only when the repository holds real capability data for it: ``browser``
+    because the browser layer can drive one, and ``messaging`` because
+    :mod:`void.orchestration.messaging` can reach a conversation inside one. The remaining
+    preference keys stay absent on purpose - recognising an override for a role V.O.I.D cannot act on
+    would be a promise it could not keep.
+
+    An empty vocabulary is dropped rather than offered, so a layer that fails to import costs the
+    owner that role's overrides and nothing else.
     """
-    return {"browser": browser_vocabulary()}
+    claimed = {"browser": browser_vocabulary(), "messaging": messaging_vocabulary()}
+    return {role: entries for role, entries in claimed.items() if entries}
 
 
 def _canonical(name: str, vocabulary) -> str | None:

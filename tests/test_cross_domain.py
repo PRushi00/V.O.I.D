@@ -19,6 +19,8 @@ not get retried into succeeding. A chain is not a credential either.
 """
 import json
 
+import re
+
 import pytest
 
 from tests.helpers import FakeProvider, tool_call
@@ -66,7 +68,20 @@ def test_why_is_my_laptop_slow_collects_real_observations_and_answers(tmp_path):
 
 
 def test_the_slowness_answer_is_built_from_measurements_not_invented(tmp_path):
-    """The model is handed what was actually measured; nothing is fabricated upstream of it."""
+    """The model is handed what was actually measured; nothing is fabricated upstream of it.
+
+    Asserts that a MEASUREMENT reached the model, which is what the title claims, rather than that
+    this particular machine is currently under strain. The previous version looked for one of
+    "overloaded", "busy" or "nearly full", and that was testing the host's mood instead of the
+    plumbing: ``host.pressure`` also emits notes containing none of those words - "Drive C: is 92%
+    full", "The battery is low at 15%", and "Busiest right now: ..." (which contains "Busi", not
+    "busy"). Any of those makes ``notes`` non-empty, which skips the "nothing looks overloaded"
+    fallback the assertion depended on.
+
+    It therefore passed on an idle machine and failed on a loaded one - reproducibly, inside a full
+    regression run, where pytest itself pushes individual processes over the 10% threshold. Every
+    branch does report a figure with a unit, so that is what is checked.
+    """
     a = make_assistant(tmp_path)
     provider = _script(a, _call("diagnose_slowness"), LLMResponse(text="ok"))
     a.run("why is my laptop slow?")
@@ -74,7 +89,7 @@ def test_the_slowness_answer_is_built_from_measurements_not_invented(tmp_path):
     tool_messages = [m for turn in provider.seen_messages for m in turn if m.get("role") == "tool"]
     assert tool_messages, "the model was never shown the measurement"
     blob = " ".join(m.get("content") or "" for m in tool_messages)
-    assert ("overloaded" in blob or "busy" in blob or "nearly full" in blob), blob[:200]
+    assert re.search(r"\d+(\.\d+)?\s?(%|GB)", blob), f"no measured figure reached the model: {blob[:200]}"
 
 
 def test_a_deeper_investigation_can_chain_processes_after_the_diagnosis(tmp_path):

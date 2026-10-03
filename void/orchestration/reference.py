@@ -316,6 +316,48 @@ def _name_score(candidate: Candidate, qualifier: str) -> tuple[float, str]:
     return W_NAME_PART * len(shared), f"its name mentions {', '.join(sorted(shared))}"
 
 
+def identifies(candidate: "Candidate", reference: "Reference") -> bool:
+    """Is there positive evidence that this candidate is the thing the owner described?
+
+    The distinction this draws is between **pointing** and **describing**, and it exists because of a
+    real wrong-answer bug. "Open Rushi's chat" used to resolve, with full confidence, to a PowerPoint
+    V.O.I.D had just produced: the kind mismatch cost it W_KIND/2, recency and "I made it" paid for
+    more than that, the total came out positive, and a lone positive candidate is chosen. So a
+    request for a person's conversation returned a revenue deck.
+
+    The flaw was treating recency as identification. Being recent is *corroboration* - it helps
+    choose between things that already fit - and it cannot establish that a document is a
+    conversation with Rushi.
+
+    So:
+
+    * **Pointing** - "this", "that", "the one I was just looking at" - means the owner is indicating
+      something by its presence rather than by its properties. Recency and foreground are exactly the
+      right evidence, and anything recent is eligible.
+    * **Describing** - "Rushi's chat", "the budget spreadsheet" - means the owner named properties.
+      At least one of them has to actually match: the kind, the qualifier, or the noun. Nothing
+      matching means V.O.I.D has not found what was described, and should say so rather than offer
+      the nearest recent thing.
+
+    Deliberately permissive within "pointing", and deliberately not a hard kind filter: ``score``
+    keeps treating a kind mismatch as evidence against rather than disqualifying, because "open this
+    file" can reasonably mean a document shown in a tab.
+    """
+    if reference.deictic or reference.recency:
+        return True
+    if not (reference.kind or reference.qualifier or reference.noun):
+        return True
+    if reference.kind and candidate.kind == reference.kind:
+        return True
+    if reference.qualifier and _name_score(candidate, reference.qualifier)[0] > 0:
+        return True
+    if reference.noun:
+        haystack = f"{candidate.label} {candidate.detail}".lower()
+        if reference.noun in haystack or reference.noun in _extension_nouns(haystack):
+            return True
+    return False
+
+
 def score(candidate: Candidate, reference: Reference, now: float | None = None) -> tuple[float, list[str]]:
     """Score one candidate against a reference, with the reasons.
 
@@ -419,6 +461,11 @@ class ReferenceResolver:
 
         ranked = []
         for candidate in self.candidates():
+            # A positive score is not enough: it can be accumulated entirely from recency and
+            # "I produced it", neither of which says the candidate IS what was described. See
+            # :func:`identifies`.
+            if not identifies(candidate, reference):
+                continue
             value, reasons = score(candidate, reference, now=now)
             if value > 0:
                 ranked.append((value, candidate, reasons))

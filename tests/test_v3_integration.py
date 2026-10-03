@@ -50,7 +50,19 @@ def test_the_assistant_exposes_the_orchestration_layer(assistant):
 
 
 def test_the_resolver_uses_the_existing_fast_path_and_tab_providers(assistant):
-    assert set(assistant.routes.providers) == {"fast_path", "existing_tabs"}
+    """One resolver, fed by adapters over systems that already exist - never a second routing engine.
+
+    The membership used to be pinned to exactly ``{"fast_path", "existing_tabs"}``. That was the
+    whole set when routes came only from the V2 launcher and the browser's tabs; ``conversations``
+    joined it when "open Rushi's chat" became reachable. Pinning the set meant the test had to be
+    edited for each new adapter, which records history rather than protecting the rule - so the rule
+    is asserted instead: the two original adapters are still there, nothing was replaced, and there
+    is still exactly ONE resolver doing the choosing.
+    """
+    providers = set(assistant.routes.providers)
+    assert {"fast_path", "existing_tabs"} <= providers, "an existing adapter was dropped"
+    assert "conversations" in providers
+    assert len(providers) == len(assistant.routes.providers), "a provider was registered twice"
 
 
 def test_the_registry_reads_the_catalog_the_rest_of_void_uses(assistant):

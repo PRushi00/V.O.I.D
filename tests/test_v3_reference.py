@@ -9,10 +9,13 @@ several things, V.O.I.D asks. A test that accepted a confident guess here would 
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from void.actions.reference import ReferenceActions
 from void.orchestration.reference import (DECISIVE_MARGIN, Candidate, Reference, ReferenceResolver,
+                                          identifies,
                                           parse_reference, score)
 from void.orchestration.referents import (RecentThings, recent_candidates, tab_candidates,
                                           window_candidates)
@@ -313,3 +316,69 @@ def test_remember_reference_refuses_an_invented_kind():
     assert not actions.remember_reference(kind="credential", label="x", target="y").ok
     assert not actions.remember_reference(kind="document", label="x", target="").ok
     assert actions.remember_reference(kind="document", label="x", target="y").ok
+
+
+# --------------------------------------------------------------------------- describing vs pointing
+
+def _recent_document(label="Q3 revenue chart.pptx"):
+    """A document V.O.I.D produced a moment ago - the most attractive candidate there is."""
+    store = RecentThings()
+    store.note(kind="document", label=label, target="C:/tmp/q3.pptx", source="artifacts",
+               produced=True)
+    return ReferenceResolver([recent_candidates(store)])
+
+
+def test_a_described_thing_that_matches_nothing_is_not_answered_with_the_nearest_recent_one():
+    """The bug this guards against produced a genuinely wrong action.
+
+    "Open Rushi's chat" used to resolve - with no ambiguity reported - to a PowerPoint V.O.I.D had
+    just created. The kind mismatch cost W_KIND/2, recency and "I produced it" paid for more than
+    that, the total was positive, and a lone positive candidate is chosen. A request for a person's
+    conversation returned a revenue deck.
+    """
+    resolution = _recent_document().resolve("Open Rushi's chat")
+    assert not resolution.resolved
+    assert resolution.empty, "nothing described the owner's request, so there is nothing to offer"
+
+
+def test_pointing_at_something_recent_still_works():
+    """The fix must not cost the owner deixis, which is the whole point of the module."""
+    for phrase in ("open that one", "open this", "open the document I was looking at",
+                   "the one I was just looking at"):
+        assert _recent_document().resolve(phrase).resolved, phrase
+
+
+def test_a_description_that_does_match_still_resolves():
+    assert _recent_document().resolve("open this chart").resolved
+    assert _recent_document().resolve("open the Q3 revenue chart").resolved
+
+
+def test_recency_corroborates_but_cannot_identify():
+    """Stated directly, because it is the rule the bug broke."""
+    recent = Candidate(kind="document", label="Budget.xlsx", target="b", at=time.time(),
+                       produced=True)
+    described = Reference(phrase="rushi's chat", kind="conversation", qualifier="rushi", noun="chat")
+    pointed = Reference(phrase="that one", deictic=True)
+    assert not identifies(recent, described)
+    assert identifies(recent, pointed)
+    # It is not the SCORE that rejects it - the score is positive. It is the evidence test.
+    value, _reasons = score(recent, described)
+    assert value > 0, "the score alone would have accepted this, which is why the gate exists"
+
+
+@pytest.mark.parametrize("kind, label, matches", [
+    ("conversation", "Rushi - WhatsApp", True),      # kind agrees
+    ("document", "Rushi's notes.docx", True),        # the qualifier appears in the name
+    ("tab", "Budget spreadsheet", False),            # neither
+])
+def test_identification_accepts_a_kind_match_or_a_name_match(kind, label, matches):
+    candidate = Candidate(kind=kind, label=label, target="t")
+    reference = Reference(phrase="rushi's chat", kind="conversation", qualifier="rushi", noun="chat")
+    assert identifies(candidate, reference) is matches
+
+
+def test_a_reference_with_nothing_to_match_on_accepts_anything():
+    """A phrase with no kind, qualifier or noun has nothing to check, so the gate must not block it
+    and leave the owner with no answer at all."""
+    candidate = Candidate(kind="document", label="anything", target="t")
+    assert identifies(candidate, Reference(phrase="open it"))
