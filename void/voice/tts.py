@@ -109,7 +109,20 @@ class _ResilientTTS(TTS):
 #   register_tts_provider("piper", lambda: PiperTTS(...))
 #   register_tts_provider("elevenlabs", lambda: ElevenLabsTTS(...))
 #   register_tts_provider("onecore", lambda: WinRTOneCoreTTS(...))
+def _sapi_stream() -> TTS:
+    """Imported lazily so this module keeps importing on a machine without the voice stack."""
+    from void.voice.sapi_stream import SapiStreamTTS
+    return SapiStreamTTS()
+
+
 _PROVIDERS: dict[str, Callable[[], TTS]] = {
+    # SAPI synthesis played through V.O.I.D's own PortAudio output. The default on Windows, because
+    # SAPI's own device enumeration does not necessarily contain the endpoint the owner listens
+    # through - measured on the owner's machine, it contained only the laptop speakers while the
+    # USB-C earphones carrying their audio were absent from it entirely. See void/voice/sapi_stream.py.
+    "sapi_stream": _sapi_stream,
+    # SAPI rendering straight to its own chosen device. The previous default, kept as the rollback:
+    # set voice.tts_provider to "sapi" to restore it.
     "sapi": SapiTTS,        # local Windows SAPI (SpVoice); surfaces installed voices
     "null": NullTTS,
 }
@@ -126,7 +139,13 @@ def available_providers() -> list[str]:
 
 def _default_provider_name() -> str:
     # Local Windows speech where available; a silent, safe null elsewhere.
-    return "sapi" if sys.platform.startswith("win") else "null"
+    #
+    # "sapi_stream" rather than "sapi": letting SAPI choose the output device sent speech to whatever
+    # was in its legacy enumeration, which on the owner's machine did not include the endpoint they
+    # were listening on - so V.O.I.D talked to the laptop speakers while they wore earphones and heard
+    # nothing, with a perfectly healthy-looking log. Synthesising to memory and playing through the
+    # audio layer the capture broker already uses follows the owner's actual Windows default.
+    return "sapi_stream" if sys.platform.startswith("win") else "null"
 
 
 def create_tts_provider(config=None, *, provider: str | None = None) -> TTS:

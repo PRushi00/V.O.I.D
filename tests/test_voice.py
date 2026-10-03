@@ -740,11 +740,32 @@ def test_null_tts_is_safe_noop():
     assert t.spoke == ["nothing comes out"] and t.stops == 1
 
 
-def test_factory_defaults_to_sapi_on_windows(monkeypatch):
+def test_factory_defaults_to_local_windows_speech(monkeypatch):
+    """Windows defaults to LOCAL Windows speech - never null, never anything remote.
+
+    The provider NAME changed from "sapi" to "sapi_stream" (2026-10-02). Both are local Windows SAPI
+    synthesis; what differs is who picks the output device. Letting SAPI pick it sent speech to its own
+    legacy enumeration, which on the owner's machine held only the laptop speakers while the USB-C
+    earphones carrying their audio were absent from it entirely - so V.O.I.D talked to the wrong device
+    with a perfectly healthy-looking log. "sapi_stream" synthesises to memory and plays through the
+    audio layer the capture broker already uses, which follows the owner's actual Windows default.
+
+    The behavioural requirement this test exists to protect is unchanged and still asserted: on Windows
+    the default must be a working local speech backend, not silence.
+    """
+    from void.voice.sapi_stream import SapiStreamTTS
     monkeypatch.setattr(ttsmod.sys, "platform", "win32")
     t = create_tts_provider()            # no config, no explicit provider
-    assert isinstance(t, _ResilientTTS) and t.name == "sapi"
-    assert isinstance(t.delegate, SapiTTS)   # Windows provider behind interface
+    assert isinstance(t, _ResilientTTS) and t.name == "sapi_stream"
+    assert isinstance(t.delegate, SapiStreamTTS)   # Windows provider behind interface
+    assert not isinstance(t.delegate, NullTTS), "Windows must not default to silence"
+
+
+def test_the_previous_sapi_provider_is_still_selectable_as_a_rollback(monkeypatch):
+    """Letting SAPI choose the device is wrong on this machine, not wrong everywhere."""
+    monkeypatch.setattr(ttsmod.sys, "platform", "win32")
+    t = create_tts_provider(_StubConfig({"voice.tts_provider": "sapi"}))
+    assert t.name == "sapi" and isinstance(t.delegate, SapiTTS)
 
 
 def test_factory_defaults_to_null_off_windows(monkeypatch):

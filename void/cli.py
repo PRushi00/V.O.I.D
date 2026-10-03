@@ -431,6 +431,53 @@ def cmd_singularity() -> int:
     return launch()
 
 
+def cmd_voice_detached() -> int:
+    """Start the voice runtime in its own process and return immediately.
+
+    A ``void voice`` started from a terminal is a child of that terminal's console, so closing the
+    PowerShell window takes the runtime with it - which is exactly what the owner observed: the tray
+    disappeared the moment the launching window was closed. That is ordinary Windows console behaviour,
+    not a V.O.I.D fault, but it meant there was no way to get an independent runtime by hand; only the
+    scheduled task produced one.
+
+    This spawns the SAME launcher Task Scheduler uses (``pythonw.exe voice_startup.py``) with
+    ``DETACHED_PROCESS`` and its own process group, so it has no console to be closed and does not
+    receive this terminal's Ctrl-C or close events. The single-instance mutex in
+    :mod:`void.runtime.voice_startup` still applies, so this cannot produce a second microphone owner,
+    and an engaged stop is still refused by the child exactly as before - this changes process
+    lifetime, not authority.
+    """
+    import subprocess
+    from void.runtime import exit_codes
+    from void.runtime.autostart import default_pythonw_path, voice_startup_path
+
+    launcher = voice_startup_path()
+    exe = default_pythonw_path()
+    # DETACHED_PROCESS: no console at all. CREATE_NEW_PROCESS_GROUP: this terminal's Ctrl-C/close
+    # never reaches it. CREATE_BREAKAWAY_FROM_JOB is deliberately NOT used - it is not needed here and
+    # would weaken the job-object containment some launchers rely on.
+    creation = 0
+    for flag in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP"):
+        creation |= int(getattr(subprocess, flag, 0))
+    try:
+        process = subprocess.Popen(
+            [exe, launcher],
+            creationflags=creation,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            close_fds=True,
+            cwd=str(Path(launcher).resolve().parents[2]),
+        )
+    except OSError as exc:
+        print(f"Could not start the detached runtime: {exc}")
+        _log.warning("VOICE_DETACH_FAILED kind=%s", type(exc).__name__)
+        return exit_codes.FATAL
+    _log.info("VOICE_DETACHED_LAUNCHED pid=%s", process.pid)
+    print(f"V.O.I.D voice runtime started (pid {process.pid}). "
+          f"It keeps running after this window closes.\n"
+          f"Logs: ~/.void/void.log    Stop it from the tray, or with 'python -m void stop'.")
+    return exit_codes.OK
+
+
 def cmd_voice() -> int:
     """Launch the headless, voice-first runtime.
 
@@ -453,15 +500,25 @@ def cmd_voice() -> int:
     install_console_diagnostics()
     _log.info("VOICE_RUNTIME_STARTING")
     assistant = Assistant(on_event=_event)  # no confirm_fn -> HIGH-risk deferred
+    # Each refusal gets its OWN exit code, because Windows Task Scheduler surfaces only this number as
+    # "Last Result". Returning 1 for everything is what left the owner's scheduled task reading
+    # "Last Result: 1" for days while the real cause was an engaged stop - a safety control working
+    # correctly, indistinguishable from a crash. See void/runtime/exit_codes.py. Nothing here changes
+    # what is PERMITTED: an engaged stop still blocks the runtime, it is only legible now.
+    from void.runtime import exit_codes
     if not assistant.config.get("voice.enabled", False):
         print("Voice is disabled. Set 'voice.enabled: true' in "
               "config/local_config.yaml, then install the optional voice stack:\n"
               "  pip install -r requirements-voice.txt")
-        return 1
+        _log.info("VOICE_RUNTIME_REFUSED code=%d reason=%s", exit_codes.VOICE_DISABLED,
+                  exit_codes.describe(exit_codes.VOICE_DISABLED))
+        return exit_codes.VOICE_DISABLED
     if assistant.kill_switch.engaged:
         print("A stop is currently engaged. Run 'python -m void clear-stop' "
               "first.")
-        return 1
+        _log.info("VOICE_RUNTIME_REFUSED code=%d reason=%s", exit_codes.STOP_ENGAGED,
+                  exit_codes.describe(exit_codes.STOP_ENGAGED))
+        return exit_codes.STOP_ENGAGED
 
     from void.voice.adapters import VoiceDependencyError
     from void.voice.runtime import VoiceController
@@ -830,7 +887,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("clear-stop", help="Clear an engaged stop")
     sub.add_parser("ui", help="Launch the circular widget")
-    sub.add_parser("voice", help="Launch the headless voice-first runtime")
+    p_voice = sub.add_parser("voice", help="Launch the headless voice-first runtime")
+    p_voice.add_argument(
+        "--detached", action="store_true",
+        help="Start the runtime in its own console-less process and return immediately, so it "
+             "survives this terminal closing")
     sub.add_parser(
         "app", help="Launch the persistent desktop application (orb + voice)")
     sub.add_parser(
@@ -946,6 +1007,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "ui":
         return cmd_ui()
     if args.command == "voice":
+        if getattr(args, "detached", False):
+            return cmd_voice_detached()
         return cmd_voice()
     if args.command == "app":
         return cmd_app()

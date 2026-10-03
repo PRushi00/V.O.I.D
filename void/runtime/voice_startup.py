@@ -68,9 +68,10 @@ def main(cli_main: Callable[[list[str]], int] | None = None) -> int:
     _install_background_logging()
     log = logging.getLogger("void.voice_startup")
     log.info("STARTUP_REQUESTED")
+    from void.runtime import exit_codes
     if not _acquire_single_instance_lock():
         log.info("DUPLICATE_INSTANCE_DETECTED exiting without starting voice")
-        return 0
+        return exit_codes.ALREADY_RUNNING
     if cli_main is None:
         from void.cli import main as cli_main
     log.info("VOICE_AUTOSTART_LAUNCHED")
@@ -78,8 +79,10 @@ def main(cli_main: Callable[[list[str]], int] | None = None) -> int:
         result = cli_main(["voice"])
     except Exception:
         log.exception("VOICE_AUTOSTART_FATAL")
-        return 1
-    log.info("VOICE_AUTOSTART_EXIT code=%s", result)
+        return exit_codes.FATAL
+    # The reason is logged next to the code, so "Last Result: 3" in Task Scheduler is traceable to a
+    # sentence without anyone having to read this source. See void/runtime/exit_codes.py.
+    log.info("VOICE_AUTOSTART_EXIT code=%s reason=%s", result, exit_codes.describe(result))
     return result
 
 
