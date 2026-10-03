@@ -100,6 +100,13 @@ EVENTS: dict[str, dict[str, object]] = {
     "conversation": {"op": _enum("open", "follow_up", "end"), "turns": _int, "window_s": _float,
                      "why": _enum("silence", "standby_phrase", "max_turns", "stopped", "shutdown",
                                   "no_speech", "aborted")},
+    # Sunday maintenance (V3). Counts, scope NAMES and exception CLASSES only - never an application
+    # name, a device name, a path or an observation. The question this has to answer is "did the weekly
+    # pass run, what did it look at, and how much changed?", and none of that needs the contents.
+    "maintenance": {"op": _enum("started", "scope_started", "scope_completed", "scope_failed",
+                                "snapshot", "diff", "memory_candidate", "finished", "failed"),
+                    "week": _name, "scope": _name, "scopes": _int, "observations": _int,
+                    "changes": _int, "proposals": _int, "error": _name},
 }
 
 COMMON = {"interaction_id": _id}

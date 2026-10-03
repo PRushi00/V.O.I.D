@@ -949,6 +949,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     from void.memory import cli as memory_cli
     memory_cli.add_parser(sub)
+    # Structured local state (V3): routing preferences and the weekly maintenance pass. Each module
+    # contributes its own subcommands, the same way memory does.
+    from void.state import cli as prefs_cli
+    prefs_cli.add_parser(sub)
+    from void.maintenance import cli as maintenance_cli
+    maintenance_cli.add_parser(sub)
 
     p_perf = sub.add_parser("perf", help="Performance telemetry tools (read-only)")
     perf_sub = p_perf.add_subparsers(dest="perf_action")
@@ -973,7 +979,8 @@ def main(argv: list[str] | None = None) -> int:
     known = {"run", "resume", "clarify", "approve", "deny", "set-key",
              "list-keys", "remove-key", "set-pin", "tasks", "stop",
              "clear-stop", "ui", "voice", "app", "singularity", "autostart",
-             "roots", "protect", "device", "perf", "doctor", "memory", "-h", "--help"}
+             "roots", "protect", "device", "perf", "doctor", "memory",
+             "prefs", "maintenance", "-h", "--help"}
     if argv and argv[0] not in known:
         return cmd_run(" ".join(argv))
 
@@ -1024,6 +1031,14 @@ def main(argv: list[str] | None = None) -> int:
         from void.config import Config
         from void.memory import cli as memory_cli
         return memory_cli.run(args, Config.load())
+    if args.command == "prefs":
+        from void.config import Config
+        from void.state import cli as prefs_cli
+        return prefs_cli.run(args, Config.load())
+    if args.command == "maintenance":
+        from void.config import Config
+        from void.maintenance import cli as maintenance_cli
+        return maintenance_cli.run(args, Config.load())
     if args.command == "perf":
         if args.perf_action == "report":
             return cmd_perf_report(args.state_dir, args.legacy, args.as_json)

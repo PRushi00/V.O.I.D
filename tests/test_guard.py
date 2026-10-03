@@ -28,7 +28,14 @@ def _junit(tmp_path, cases):
 
 def test_baseline_file_is_well_formed_and_complete():
     ids = guard.read_baseline()
-    assert len(ids) == 883, "the V1 baseline had 883 collected tests"
+    # 883 at V1. One more since: test_factory_defaults_to_sapi_on_windows was renamed and split in two
+    # when the Windows TTS default changed from "sapi" to "sapi_stream" (2026-10-02), with both halves
+    # preserving the behavioural requirement it existed for - Windows defaults to local speech, never
+    # silence - plus a test that the previous provider stays selectable as a rollback.
+    #
+    # The number is an exact count on purpose: the guard's protection is that no baseline id ever
+    # disappears, and a count that drifted upward silently would hide a swap of one test for another.
+    assert len(ids) == 884, "the baseline is 883 V1 tests plus one documented rename-and-split"
     assert all("::" in i and i.startswith("tests/") for i in ids)
 
 

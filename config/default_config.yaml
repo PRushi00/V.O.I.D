@@ -492,3 +492,16 @@ memory:
   episode_ttl_days: 90          # episodic notes expire unless pinned
   max_proposals_per_task: 3
   recall_routing: true          # memory questions ("what project am I building?") are answered from memory with no tools
+
+# Owner preferences (V3). ROUTING SIGNALS, never permissions: a preference chooses between routes the
+# security layer has already allowed, and can neither grant a capability nor skip a confirmation.
+#
+# These are the shipped defaults. Anything the owner sets at runtime (`void prefs set ...`) lives in
+# the state database and WINS over this file, and an explicit instruction in the moment ("open Gmail in
+# Edge") outranks both - see WorldState.preferred() for the full precedence.
+#
+# Recognised keys are a closed set (void/orchestration/apps.py PREFERENCE_KEYS); an unknown key is
+# ignored rather than obeyed. Values name an application, matched against what is actually installed -
+# naming something absent changes nothing rather than breaking routing.
+preferences:
+  browser: "opera gx"            # preferred browser for ordinary web tasks

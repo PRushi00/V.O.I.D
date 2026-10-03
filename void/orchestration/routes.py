@@ -190,6 +190,15 @@ class WorldState:
     capabilities: frozenset[str] = frozenset()
     #: Owner preferences as data, NOT prompt text: {"browser": "opera gx"}. Policy, not persuasion.
     preferences: dict = field(default_factory=dict)
+    #: What the owner explicitly asked for IN THIS UTTERANCE, e.g. {"browser": "edge"} for "open Gmail
+    #: in Edge". Extracted deterministically by :mod:`void.orchestration.overrides`, never by a model.
+    #:
+    #: Separate from ``preferences`` because they answer different questions: a preference is the
+    #: owner's standing default, an override is them contradicting it right now. Keeping them apart is
+    #: what lets :meth:`preferred` put the instruction first without the instruction being remembered
+    #: as a new default - saying "in Edge" once must not change which browser V.O.I.D reaches for
+    #: tomorrow.
+    overrides: dict = field(default_factory=dict)
     observed_at: float = field(default_factory=time.time)
 
     def is_running(self, name: str) -> bool:
@@ -211,8 +220,35 @@ class WorldState:
                      if probe in (tab[1] or "").lower() or probe in (tab[2] or "").lower())
 
     def preferred(self, key: str) -> str | None:
-        value = self.preferences.get(key)
-        return value.strip().lower() if isinstance(value, str) and value.strip() else None
+        """The application to prefer for ``key``: what the owner just said, else their standing default.
+
+        An explicit instruction outranks a stored preference, which is the whole point of the
+        distinction - "open Gmail in Edge" must not be answered with Opera GX because Opera GX is the
+        usual choice. Precedence, highest first:
+
+            1. this utterance's override      (``overrides``)
+            2. the owner's stored preference  (``preferences``)
+            3. nothing - the resolver falls back on reliability and cost, as before
+
+        Security does NOT appear in that list because it is not in competition with it: a route whose
+        capability is absent is dropped from the field *before* scoring, and risk is a scoring term. So
+        neither an override nor a preference can select a route the machine cannot run or policy
+        forbids - they only choose between routes that were already permitted.
+        """
+        for source in (self.overrides, self.preferences):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
+        return None
+
+    def overridden(self, key: str) -> bool:
+        """True when the owner named an application for ``key`` in this utterance.
+
+        Lets a provider explain itself honestly ("because you asked for Edge") and lets replanning
+        know the choice was the owner's, not a default to be reconsidered.
+        """
+        value = self.overrides.get(key)
+        return isinstance(value, str) and bool(value.strip())
 
 
 @dataclass(frozen=True)

@@ -29,6 +29,9 @@ from void.research import ResearchEngine
 from void.system.devices import snapshot as device_snapshot
 from void.system.resources import ResourceManager, ResourcePolicy
 from void.orchestration.reference import ReferenceResolver
+from void.orchestration.overrides import extract_overrides
+from void.maintenance import Maintenance
+from void.state import StateStore
 from void.orchestration.referents import (RecentThings, recent_candidates, tab_candidates,
                                           window_candidates)
 from void.actions.folders import DEFAULT_DEPTH, FolderCatalog, scan_roots
@@ -194,6 +197,12 @@ class Assistant:
         # a search provider may be used at all. Deliberately independent of the provider registry - the
         # policy decides, the registry executes - and nothing a model produces is an input to it.
         # See void/providers/policy.py.
+        # Structured local state (V3): preferences, system snapshots, detected changes, maintenance
+        # runs. Separate file and separate concept from void.memory, which stays the encrypted,
+        # owner-reviewed store - this one holds plain knowledge about the COMPUTER and no secrets.
+        # See void/state/store.py for the boundary and what it refuses to hold.
+        self.state = StateStore(state_dir / "state.sqlite")
+
         self.provider_policy = ProviderPolicy.from_config(self.config)
 
         # Tools (actions)
@@ -290,6 +299,15 @@ class Assistant:
         # ceiling on top.
         self.a2a = A2aGateway(A2aPolicy.from_config(self.config))
 
+        # Weekly maintenance (V3). Constructed, NOT scheduled: the runner claims its own week in the
+        # state database, so whatever fires it cannot cause a second pass, and nothing here starts a
+        # timer. Deliberately not hooked into the voice runtime's monitor loop - that code is frozen for
+        # this milestone - so `void maintenance run` (or any scheduler pointed at it) is the trigger.
+        # It can only PROPOSE memory; see void/maintenance/__init__.py for the promotion boundary.
+        self.maintenance = Maintenance(
+            self.state, catalog=catalog, config=self.config,
+            memory=lambda: getattr(self, "memory", None))
+
         self.resources = ResourceManager(ResourcePolicy.from_config(self.config))
         self.tools.register_all(ResourceActions(
             manager=lambda: self.resources,
@@ -339,7 +357,7 @@ class Assistant:
         # adapters over existing systems; the resolver only compares and chooses.
         self.routes = RouteResolver([FastPathRoutes(self._fast), ExistingTabRoutes()])
 
-    def world_state(self) -> WorldState:
+    def world_state(self, goal: str = "") -> WorldState:
         """What V.O.I.D can observe about the computer right now, for route resolution.
 
         Everything here is READ, never asserted: running applications come from the window list, open tabs
@@ -366,9 +384,19 @@ class Assistant:
                                 for application in self.applications.running())
         except Exception:                                      # noqa: BLE001 - stale beats crashing
             pass
+        # Preferences come from BOTH sources, the durable one winning: config is the shipped default,
+        # the state store is what the owner has actually chosen since. Same flat shape either way, so
+        # routing consumes them through the mechanism it already had.
+        preferences = dict(self.applications.preferences)
+        try:
+            preferences.update(self.state.as_routing_map())
+        except Exception:                                      # noqa: BLE001 - a bad store must not
+            _log.debug("PREFERENCES_UNAVAILABLE", exc_info=True)   # stop routing; config still applies
+        # What the owner asked for in THIS utterance, which outranks any stored preference.
+        overrides = extract_overrides(goal) if goal else {}
         return WorldState(running_apps=running, open_tabs=tabs,
                           capabilities=frozenset(capabilities),
-                          preferences=dict(self.applications.preferences))
+                          preferences=preferences, overrides=overrides)
 
     def _folder_catalog(self, file_actions):
         """A shallow index of the owner's folder names, or None when folder resolution is off.
