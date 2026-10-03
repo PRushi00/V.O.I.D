@@ -48,16 +48,39 @@ _MAX_PHRASE = 40
 _PREFIX = re.compile(
     r"^(?:(?:hey|hi|hello|ok|okay)[ ,]+)?(?:(?:void|v\.?\s?o\.?\s?i\.?\s?d\.?)[ ,]+)?(?:please[ ,]+)?"
     r"(?:(?:can|could|would|will) you (?:please )?)?(?:i (?:want|need) you to )?(?:please[ ,]+)?")
+#: Determiners recognised after the launch verb. "the" was always here and is always dropped; the
+#: possessives were not recognised at all, so "open my Studies folder" - the most natural way anyone
+#: asks - left "my studies folder" as the name to look up, matched nothing, and fell through to the
+#: model. Measured on this machine: 41 s for a folder the deterministic catalog resolves in 0.01 ms.
+#:
+#: Recognising a possessive is not the same as dropping it; see :data:`_POSSESSIVES` for when it is.
+_DETERMINERS = r"(?:the|my|our|this)"
+#: Possessive determiners, which mean "the owner's own content" and are therefore only dropped when
+#: an entity noun says WHAT kind of thing is meant.
+#:
+#: "open my dashboard" must still reach the model: something belonging to the owner is theirs to
+#: find, and the application catalog has no business claiming it. "open my Studies folder" is
+#: different - "folder" names the kind, so "my" is grammar rather than ownership and the folder
+#: catalog can answer in 0.01 ms instead of 41 s. Keeping both rules is why the determiner is
+#: captured rather than merely skipped.
+_POSSESSIVES = frozenset({"my", "our", "this"})
+#: Nouns that may trail a name rather than belong to it. ``_readings`` returns BOTH readings - with
+#: and without - and the caller keeps whichever resolves, so a folder genuinely called "Work Folder"
+#: is still reachable. "app"/"application"/"program" were always here for "open the calculator app";
+#: "folder" and "directory" are the same situation for "open my Studies folder".
+_TRAILING_NOUN = r"(?:app|application|program|folder|directory)"
 _LAUNCH = re.compile(
-    r"^(?:open|launch|start)(?: up)? (?:the )?(?P<app>.+?)(?: (?P<noun>app|application|program))?(?: please)?$")
+    r"^(?:open|launch|start)(?: up)? (?P<det>" + _DETERMINERS + r" )?"
+    r"(?P<app>.+?)(?: (?P<noun>" + _TRAILING_NOUN + r"))?(?: please)?$")
 _APP_CHARS = re.compile(r"^[a-z0-9][a-z0-9 .+'\-]*$")
 _VERBS = ("open", "launch", "start")
 #: Items in a list of names, split on commas and "and". Both spellings of the same list separator.
 _SPLIT = re.compile(r"\s*,\s*|\s+and\s+")
 #: At most this many targets in one sentence: a bound on the work a single command can ask for.
 _MAX_TARGETS = 6
-#: The launch grammar already drops "the" after the verb; a list item needs the same ("and the calculator app").
-_ARTICLE = re.compile(r"^the ")
+#: The launch grammar already drops a determiner after the verb; a list item needs the same
+#: ("and the calculator app", "and my downloads folder").
+_ARTICLE = re.compile(r"^" + _DETERMINERS + r" ")
 
 # A compound or qualified request is not a plain launch. "and" is handled separately: it is the list separator
 # between names, so it is removed here and rejected inside each individual target instead.
@@ -215,7 +238,13 @@ def _launch_body(text: object) -> tuple[str, str | None] | None:
         m = _LAUNCH.match(gl) if gl else None
         if m is None:
             return None
-    return m.group("app").strip(), m.group("noun")
+    noun = m.group("noun")
+    determiner = (m.group("det") or "").strip()
+    if determiner in _POSSESSIVES and not noun:
+        # See _POSSESSIVES: the owner's own unnamed thing is for the model to find, not for the
+        # application catalog to claim.
+        return None
+    return m.group("app").strip(), noun
 
 
 def launch_phrases(text: object) -> tuple[str, ...]:

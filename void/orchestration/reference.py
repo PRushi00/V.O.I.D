@@ -37,6 +37,7 @@ import re
 import time
 from dataclasses import dataclass, field
 
+from void.actions.app_names import squash
 from void.perception import clean_text
 
 _log = logging.getLogger(__name__)
@@ -85,6 +86,11 @@ _FILLER = frozenset({
     # not, so "open their chat" parsed "their" as the person to look for and then failed to find
     # them - where the right answer is to ask whose conversation is meant.
     "their", "theirs", "his", "her", "hers", "its", "your", "our", "ours",
+    # Words from "...the folder you just found". They are how the owner refers to V.O.I.D's own
+    # recent action, never part of a name - and left in, they became a QUALIFIER ("you found") that
+    # no candidate could match, so the reference resolved to nothing once a named thing was
+    # required to match by name.
+    "you", "found", "opened", "showed", "mentioned", "we",
 })
 
 #: Verbs that mean "make a new one". Their presence cancels a reference, because "create a chart" names a
@@ -329,7 +335,15 @@ def _extension_nouns(haystack: str) -> frozenset[str]:
 
 
 def _name_score(candidate: Candidate, qualifier: str) -> tuple[float, str]:
-    """How well a candidate's name matches the qualifier."""
+    """How well a candidate's name matches the qualifier.
+
+    Includes the "same name spaced differently" tier, because the owner's spacing and the
+    filesystem's rarely agree: the folder is called "VibeCoding" and they say "vibe coding", which
+    matched neither as a substring nor by shared words, so the reference fell through to the model -
+    16 to 26 seconds for something already in hand. The rule comes from
+    :func:`void.actions.app_names.squash`, the same definition the application catalog and the
+    folder catalog use, rather than a third copy of it.
+    """
     if not qualifier:
         return 0.0, ""
     label = candidate.label.lower()
@@ -337,6 +351,9 @@ def _name_score(candidate: Candidate, qualifier: str) -> tuple[float, str]:
     needle = qualifier.lower()
     if needle and (needle in label or needle in detail):
         return W_NAME_FULL, f"its name contains '{qualifier}'"
+    tight = squash(qualifier)
+    if tight and (tight in squash(candidate.label) or tight in squash(candidate.detail)):
+        return W_NAME_FULL, f"its name is '{qualifier}' spaced differently"
     wanted = set(_WORD.findall(needle))
     if not wanted:
         return 0.0, ""
@@ -374,13 +391,20 @@ def identifies(candidate: "Candidate", reference: "Reference") -> bool:
     keeps treating a kind mismatch as evidence against rather than disqualifying, because "open this
     file" can reasonably mean a document shown in a tab.
     """
-    if reference.deictic or reference.recency:
-        return True
     if not (reference.kind or reference.qualifier or reference.noun):
         return True
-    if reference.kind and candidate.kind == reference.kind:
+    # A NAMED thing must be matched by name. Kind agreement alone is not identification when the
+    # owner said which one they meant: "open my Flurbleglorp folder" offered "VibeCoding" and
+    # "Studies" - two folders that matched the *kind* and nothing else, scored on recency, and tied
+    # into a question about the wrong things. A name that matches nothing has found nothing.
+    #
+    # Checked before deixis deliberately: "open that Flurbleglorp folder" names one just as
+    # definitely as the version without "that".
+    if reference.qualifier:
+        return _name_score(candidate, reference.qualifier)[0] > 0
+    if reference.deictic or reference.recency:
         return True
-    if reference.qualifier and _name_score(candidate, reference.qualifier)[0] > 0:
+    if reference.kind and candidate.kind == reference.kind:
         return True
     if reference.noun:
         haystack = f"{candidate.label} {candidate.detail}".lower()

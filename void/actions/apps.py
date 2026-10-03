@@ -7,6 +7,7 @@ named (Cursor, VS Code, etc.); anything else is resolved from PATH.
 """
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -17,6 +18,8 @@ from pathlib import Path
 from void.actions.base import Tool, ToolResult
 from void.actions.computer import AppCatalog, ComputerBackendError, is_app_user_model_id
 from void.actions.files import FileActions, PathNotAllowed
+
+_log = logging.getLogger(__name__)
 from void.security.risk import RiskLevel
 
 # Engine-defined alias set (friendly name -> candidate executables resolved on
@@ -35,7 +38,7 @@ _APP_ALIASES: dict[str, list[str]] = {
 
 class AppActions:
     def __init__(self, file_actions: FileActions, catalog: "AppCatalog | None" = None,
-                 launcher=None):
+                 launcher=None, recent=None):
         # Reuse the file layer's confinement for open_path on local files.
         self._files = file_actions
         # Engine-owned application catalog (from find_app discovery). launch_app
@@ -44,6 +47,15 @@ class AppActions:
         # Injectable launcher (entry) for testability; defaults to a no-shell
         # OS launch of a validated catalog target.
         self._launch = launcher or self._default_launch
+        # Where an opened path is recorded so it can be referred to next turn ("open the folder you
+        # just found"). Optional and null-safe: without it open_path behaves exactly as before.
+        #
+        # This is what was missing. A folder discovered by a search was opened and then forgotten,
+        # so the follow-up started a fresh filesystem search and - on the owner's machine - failed.
+        # It happened to work while the Explorer window stayed open, because the window list offers
+        # a candidate; closing it lost the reference. Recording the VERIFIED path fixes that at the
+        # source, and references are session state about what was mentioned - never personal memory.
+        self._recent = recent
 
     def _is_windows(self) -> bool:
         return sys.platform.startswith("win")
@@ -76,7 +88,24 @@ class AppActions:
                 subprocess.Popen(["xdg-open", str(p)])
         except OSError as exc:
             return ToolResult.failure(f"Could not open {p}: {exc}", error=str(exc))
+        self._note_opened(p)
         return ToolResult.success(f"Opened {p}.")
+
+    def _note_opened(self, path) -> None:
+        """Record an opened path as a referenceable thing. Never raises, never blocks the open."""
+        store = self._recent
+        if callable(store):
+            try:
+                store = store()
+            except Exception:                                  # noqa: BLE001
+                return
+        if store is None:
+            return
+        try:
+            kind = "folder" if path.is_dir() else "document"
+            store.note(kind=kind, label=path.name or str(path), target=str(path), source="opened")
+        except Exception:                                      # noqa: BLE001 - a lost reference is
+            _log.debug("OPEN_PATH_NOTE_FAILED", exc_info=True)   # not worth failing an open over
 
     def _default_launch(self, kind: str, target: str) -> None:
         """No-shell OS launch of a validated target: a resolved .exe via Popen, a Start-Menu .lnk via os.startfile,

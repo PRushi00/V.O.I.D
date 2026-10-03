@@ -610,9 +610,34 @@ class Agent:
         # A partial result must be HEARD, so it is not reported as a silent local action.
         return self._finish_direct(task, reply, messages, local_action=not unopened)
 
+    #: What to say for a terminal state that produced no text of its own. Constants, by status.
+    #:
+    #: ``task.result`` is only ever set on COMPLETED, so a FAILED, PAUSED or CANCELLED task returned
+    #: ``result=None`` and the owner was told nothing at all - the task simply vanished from the CLI
+    #: and the widget. The voice session was saved by its own constant phrases
+    #: (void/voice/status_phrases.py); every other surface was not.
+    TERMINAL_REPLIES = {
+        Status.FAILED: "That did not work, and I could not get further than this.",
+        Status.PAUSED: "Paused. Ask me to carry on when you want it finished.",
+        Status.CANCELLED: "Cancelled - nothing further was done.",
+        Status.BLOCKED: "I need one more thing from you before I can continue.",
+        Status.AWAITING_CONFIRMATION: "That needs your approval before I can do it.",
+    }
+
     def _result(self, task: Task) -> AgentResult:
-        """The run's outcome. Central so every exit reports ``local_action`` consistently."""
-        return AgentResult(task, task.status, task.result, task.steps,
+        """The run's outcome. Central so every exit reports ``local_action`` consistently.
+
+        Every terminal state leaves with something to say. The engine's own ``task.error`` is
+        preferred when there is one, because "Reached max_steps (12) without finishing" is a useful
+        sentence and "That did not work" is not - and those strings are written by the engine
+        (the step cap, the completion guard, the kill switch, a provider exception), never by a
+        model and never by a tool, so surfacing one hands the owner no untrusted text.
+        """
+        reply = task.result
+        if not reply and task.status != Status.COMPLETED:
+            reason = " ".join(str(task.error or "").split())[:300]
+            reply = reason or self.TERMINAL_REPLIES.get(task.status)
+        return AgentResult(task, task.status, reply, task.steps,
                            local_action=(self._completed_by_local_action
                                          and task.status == Status.COMPLETED))
 

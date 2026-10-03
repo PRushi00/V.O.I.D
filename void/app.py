@@ -29,7 +29,7 @@ from void.ui.agui import AgUiAdapter
 from void.research import ResearchEngine
 from void.system.devices import snapshot as device_snapshot
 from void.system.resources import ResourceManager, ResourcePolicy
-from void.orchestration.reference import ReferenceResolver
+from void.orchestration.reference import ReferenceResolver, parse_reference
 from void.orchestration.overrides import extract_overrides
 from void.maintenance import Maintenance
 from void.state import StateStore
@@ -48,6 +48,7 @@ from void.orchestration.messaging import (ConversationRoutes, MessagingAction,
                                           installed_via_catalog, observed_conversations)
 from void.orchestration.routes import ExistingTabRoutes, FastPathRoutes, RouteResolver, WorldState
 from void.orchestration.verify import Verifier
+from void.orchestration.websites import WebsiteRoutes, parse_target
 from void.core.kill_switch import KillSwitch
 from void.core.task import Status, Task, TaskStore
 from void.memory import intent as memory_intent
@@ -234,7 +235,10 @@ class Assistant:
         # nothing Windows-specific is imported until a computer tool is used.
         backend = make_backend()
         catalog = AppCatalog(backend)
-        app_actions = AppActions(file_actions, catalog=catalog)
+        # ``recent`` is read lazily: RecentThings is built further down, and a reference is
+        # only ever recorded at the moment a path is actually opened.
+        app_actions = AppActions(file_actions, catalog=catalog,
+                                 recent=lambda: getattr(self, "recent", None))
         computer_actions = ComputerActions(
             backend, catalog,
             protected_processes=self.config.protected_processes())
@@ -384,8 +388,12 @@ class Assistant:
         self._conversations = ConversationRoutes(
             installed=lambda: installed_via_catalog(catalog),
             conversations=self._open_conversations)
+        # Websites are a fourth entity kind, and the one that had no route at all: "Open YouTube"
+        # went to the application matcher, correctly found nothing installed, and was left to the
+        # model. ExistingTabRoutes still outranks this one, so a page already open is reused.
+        self._websites = WebsiteRoutes()
         self.routes = RouteResolver([FastPathRoutes(self._fast), ExistingTabRoutes(),
-                                     self._conversations])
+                                     self._conversations, self._websites])
 
     def world_state(self, goal: str = "") -> WorldState:
         """What V.O.I.D can observe about the computer right now, for route resolution.
@@ -605,7 +613,20 @@ class Assistant:
         if plan.irrelevant:
             return None                                        # not about a conversation at all
         if named_only and not plan.contact:
-            return None                                        # might be an application name
+            # No person named, so this could still be an application whose name happens to contain a
+            # conversation noun. Let the matcher win when it can genuinely RESOLVE one; claim the
+            # phrase when all it could offer is "not installed on this machine".
+            #
+            # This ordering became necessary when the launch grammar learned to drop "my": the
+            # matcher then accepted "my personal chat" as a name, found nothing, and answered
+            # "I can't find personal chat on this machine" - where the useful answer is to ask whose
+            # conversation is meant. A decision with a plan still takes precedence, so an
+            # application genuinely called "Chat" is unaffected.
+            try:
+                if self._fast is not None and self._fast.decide(goal).plan is not None:
+                    return None
+            except Exception:                                  # noqa: BLE001 - matcher is optional
+                return None
 
         if plan.action == MessagingAction.ASK:
             reply = plan.question()
@@ -636,6 +657,169 @@ class Assistant:
         perf.emit("route", provider="none", reason="conversation", kind=plan.action, llm_calls=0)
         task = Task(goal="[conversation]", id="(chat)", status=Status.COMPLETED, result=reply)
         return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0)
+
+    def _reference_route(self, goal: str) -> AgentResult | None:
+        """"Open the folder you just found" - answered from what was already resolved.
+
+        The failure this fixes, in the owner's words: V.O.I.D found the Vibe Coding folder, said so,
+        and then could not find it again when asked to open "the vibe coding folder you found". The
+        path had been verified once and thrown away, so the follow-up started another filesystem
+        search. It appeared to work only while the Explorer window stayed open, because the window
+        list offers a candidate of its own.
+
+        ``open_path`` now records every path it opens, so the reference resolver has the verified
+        path to hand and this opens it directly - no search, no model.
+
+        Deliberately narrow. It acts only when the phrase is genuinely referring (a deictic, a
+        recency phrase or a noun naming a kind - see ``Reference.resolvable``), the resolution is
+        DECISIVE rather than ambiguous, the referent is a folder or document, and the recorded path
+        still exists. Anything else returns None and the ordinary path runs unchanged; an ambiguous
+        reference in particular must stay a question rather than become a guess.
+        """
+        if self.kill_switch.engaged:
+            return None
+        try:
+            reference = parse_reference(goal)
+            if not reference.resolvable:
+                return None
+            resolution = self.references.resolve(goal)
+        except Exception:                                      # noqa: BLE001 - never block a goal
+            _log.debug("REFERENCE_ROUTE_UNAVAILABLE", exc_info=True)
+            return None
+        choice = resolution.choice
+        if choice is None:
+            # Ambiguous between things of this kind is not a failure and not a guess - it is a
+            # question, and the resolver already phrases it. Answering here keeps it instant and
+            # accurate: handing it to the model instead produced "I cannot proceed without knowing
+            # which folder you are referring to" after 15.8 seconds, which is the same question
+            # asked worse and slower.
+            openable = [c for c in resolution.alternatives if c.kind in ("folder", "document")]
+            if resolution.ambiguous and len(openable) > 1:
+                question = resolution.question()
+                if question:
+                    perf.emit("route", provider="none", reason="reference", kind="ambiguous",
+                              llm_calls=0)
+                    task = Task(goal="[reference]", id="(ref)", status=Status.COMPLETED,
+                                result=question)
+                    return AgentResult(task=task, status=Status.COMPLETED, result=question,
+                                       steps=0)
+            return None
+        if choice.kind not in ("folder", "document"):
+            return None                                        # not something with a path
+        target = str(choice.target or "")
+        if not target or not Path(target).exists():
+            # A recorded path that has since moved or been deleted is not an answer. Falling
+            # through lets the ordinary path search for it properly.
+            return None
+
+        with perf.ensure_interaction("cli"):
+            agent = Agent(provider=_NoProvider(), tools=self.tools, risk_gate=self.risk_gate,
+                          kill_switch=self.kill_switch, store=self.store, on_event=self.on_event,
+                          defer_confirmation=self._confirm_fn is None)
+            outcome = agent.invoke_tool("open_path", {"target": target})
+        if outcome.kind in ("unauthorized", "unknown"):
+            return None
+        if not outcome.ok:
+            reply = _sentence(outcome.summary) or f"I could not open {choice.label}."
+            task = Task(goal="[reference]", id="(ref)", status=Status.FAILED, result=reply,
+                        error=reply)
+            return AgentResult(task=task, status=Status.FAILED, result=reply, steps=1)
+        reply = f"Opened {choice.label}."
+        perf.emit("route", provider="none", reason="reference", kind=choice.kind, llm_calls=0)
+        task = Task(goal="[reference]", id="(ref)", status=Status.COMPLETED, result=reply)
+        return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=1)
+
+    def _website_route(self, goal: str) -> AgentResult | None:
+        """A request for a website, navigated and VERIFIED with no model call.
+
+        "Open YouTube" had no deterministic route: the application matcher answered "I can't find
+        youtube on this machine" (true - it is not an application) and the model was left to guess
+        that ``navigate`` with an invented URL was the move. Measured on this machine that cost
+        30-40 s of provider retries, succeeded only sometimes, and once produced the worst outcome
+        of all - "I have opened the Wikipedia page" when the navigation had actually been refused.
+
+        The destination comes from :mod:`void.orchestration.websites` - a table row or a hostname
+        the owner spoke - so there is nothing for a model to invent, and the result is checked
+        against what the browser reports rather than against what anything claims.
+        """
+        if self.kill_switch.engaged:
+            return None
+        target = parse_target(goal)
+        if not target.resolved:
+            return None
+
+        state = self.world_state(goal)
+        if "browser" not in state.capabilities:
+            # Honest refusal rather than a fabricated success. This is the exact case that produced
+            # the false "I have opened the Wikipedia page".
+            reply = (f"I can reach {target.display}, but browser automation is switched off. Set "
+                     f"browser.enabled in your local config and ask me again.")
+            task = Task(goal="[website]", id="(web)", status=Status.FAILED, result=reply,
+                        error=reply)
+            return AgentResult(task=task, status=Status.FAILED, result=reply, steps=0)
+
+        # A page already open wins: ExistingTabRoutes proposes EXISTING_STATE, which outscores the
+        # BROWSER route, so this picks reuse over opening another tab without knowing about tabs.
+        routes = [route for route in self.routes.candidates(goal, state) if route.executable]
+        routes = [route for route in routes
+                  if route.calls[0].name in (self._websites.NAVIGATE_TOOL,
+                                             ExistingTabRoutes.ACTIVATE_TOOL)]
+        if not routes:
+            return None
+        call = routes[0].calls[0]
+        with perf.ensure_interaction("cli"):
+            agent = Agent(provider=_NoProvider(), tools=self.tools, risk_gate=self.risk_gate,
+                          kill_switch=self.kill_switch, store=self.store, on_event=self.on_event,
+                          defer_confirmation=self._confirm_fn is None)
+            outcome = agent.invoke_tool(call.name, dict(call.arguments))
+        if outcome.kind in ("unauthorized", "unknown"):
+            return None                                        # the ordinary path owns confirmation
+        if not outcome.ok:
+            reply = _sentence(outcome.summary) or f"I could not open {target.display}."
+            task = Task(goal="[website]", id="(web)", status=Status.FAILED, result=reply,
+                        error=reply)
+            return AgentResult(task=task, status=Status.FAILED, result=reply, steps=1)
+
+        # -- verification: what did the browser actually load? --
+        #
+        # The tool returning ok means the call did not raise. What makes this COMPLETED is the page
+        # the browser reports, compared against the host that was asked for.
+        verified, detail = self._verify_page(target)
+        if verified:
+            reply = f"Opened {target.display}."
+        else:
+            reply = (f"I asked the browser to open {target.display}, but {detail} - so I cannot "
+                     f"confirm it loaded.")
+        status = Status.COMPLETED if verified else Status.FAILED
+        task = Task(goal="[website]", id="(web)", status=status, result=reply,
+                    error="" if verified else reply)
+        perf.emit("route", provider="none", reason="website", verified=bool(verified), llm_calls=0)
+        return AgentResult(task=task, status=status, result=reply, steps=1)
+
+    def _verify_page(self, target) -> tuple[bool, str]:
+        """``(loaded, why_not)`` for the page just navigated to, read from the browser.
+
+        Compares HOSTS rather than whole URLs: a site redirects ("youtube.com" ->
+        "www.youtube.com/"), appends a locale or a consent parameter, and a string comparison would
+        call every one of those a failure. A host match is the strongest claim available without
+        reading the page, and when the browser cannot say, this reports that it cannot say.
+        """
+        from urllib.parse import urlsplit
+
+        wanted = urlsplit(target.url).hostname or ""
+        browser = self.browser
+        if browser is None:
+            return False, "the browser layer is not available"
+        try:
+            state = browser.read()
+        except Exception as exc:                               # noqa: BLE001
+            return False, f"reading the page failed ({type(exc).__name__})"
+        got = urlsplit(str(getattr(state, "url", "") or "")).hostname or ""
+        if not got:
+            return False, "the browser did not report a page"
+        if got == wanted or got.endswith("." + wanted) or wanted.endswith("." + got):
+            return True, ""
+        return False, f"the browser is showing {got} instead"
 
     def _execute_conversation(self, goal: str) -> AgentResult | None:
         """Run the chosen conversation route with no model call, or None if there is none to run.
@@ -908,9 +1092,21 @@ class Assistant:
         named = self._conversation_route(goal, named_only=True)
         if named is not None:
             return named
+        # A website before the application matcher, for the same reason a named conversation goes
+        # first: "YouTube" is not an application, and the matcher answering "not installed on this
+        # machine" is a confidently wrong answer to a question about a website.
+        web = self._website_route(goal)
+        if web is not None:
+            return web
         fast = self._fast_route(goal)
         if fast is not None:
             return fast
+        # After the matchers, because a name V.O.I.D can resolve outright beats a reference to
+        # something it happens to remember; before the model, because re-searching for a path that
+        # was already verified is exactly the waste the owner reported.
+        referred = self._reference_route(goal)
+        if referred is not None:
+            return referred
         chat = self._conversation_route(goal)
         if chat is not None:
             return chat

@@ -64,6 +64,22 @@ MAX_CONTACT = 60
 CONVERSATION_NOUNS = frozenset(word for word, kind in KIND_WORDS.items() if kind == "conversation")
 
 
+#: Words that describe a KIND of conversation rather than name a person.
+#:
+#: "Open my personal chat" used to resolve to a contact called "Personal" and ask which application
+#: to look for them in - V.O.I.D inventing an identity out of an adjective. Nobody is called
+#: "personal", and if a real contact ever were, the cost of listing the word here is one
+#: clarification question, which is the safe direction to be wrong in.
+#:
+#: What "my personal chat" means is something only the owner can say, or something a stored
+#: preference would have to record. With neither, the correct answer is to ask.
+_NOT_A_PERSON = frozenset({
+    "personal", "private", "secret", "work", "official", "business", "main", "primary", "default",
+    "usual", "normal", "regular", "group", "family", "team", "old", "new", "recent", "latest",
+    "last", "first", "other", "another", "unread", "favourite", "favorite", "starred", "archived",
+})
+
+
 def spoken(name: str) -> str:
     """A contact name as it should be said back to the owner.
 
@@ -282,9 +298,14 @@ def _contact_from(qualifier: str, vocabulary) -> str:
     "open whatsapp chat with rushi" leaves "whatsapp rushi" as the qualifier when there is no
     possessive to latch onto. Searching a contact list for "whatsapp rushi" finds nobody, so the
     application words come out - they named the surface, not the person.
+
+    Words from :data:`_NOT_A_PERSON` come out for the same reason and a sharper one: "my personal
+    chat" described a kind of conversation, and treating "personal" as a name had V.O.I.D hunting
+    for a contact who does not exist instead of asking what was meant.
     """
     words = [bare_word(word) for word in re.findall(r"[\w.'+-]+", (qualifier or "").lower())]
-    words = [word for word in words if word and word not in CONVERSATION_NOUNS]
+    words = [word for word in words
+             if word and word not in CONVERSATION_NOUNS and word not in _NOT_A_PERSON]
     kept: list[str] = []
     index = 0
     while index < len(words):
