@@ -81,6 +81,10 @@ _FILLER = frozenset({
     "was", "i", "had", "been", "looking", "at", "reading", "working", "on", "just", "now", "and",
     "then", "with", "in", "of", "for", "from", "view", "see", "get", "find", "last", "previous",
     "earlier", "before", "current", "currently", "already", "moment", "ago", "display",
+    # Possessive PRONOUNS are never the name of a referent. "my" was already here; the others were
+    # not, so "open their chat" parsed "their" as the person to look for and then failed to find
+    # them - where the right answer is to ask whose conversation is meant.
+    "their", "theirs", "his", "her", "hers", "its", "your", "our", "ours",
 })
 
 #: Verbs that mean "make a new one". Their presence cancels a reference, because "create a chart" names a
@@ -114,6 +118,30 @@ EXTENSION_NOUNS = {
 _POSSESSIVE = re.compile(r"([\w][\w .-]{0,40}?)'s\b", re.IGNORECASE)
 
 _WORD = re.compile(r"[a-z0-9][a-z0-9'.-]*")
+
+#: Apostrophes a speech-to-text engine actually produces. Whisper emits U+2019, not the ASCII
+#: apostrophe :data:`_POSSESSIVE` was written for, so "Rushi’s chat" matched no possessive at all and
+#: the owner's name was split into "rushi" and "s".
+_APOSTROPHES = {"‘": "'", "’": "'", "ʼ": "'", "＇": "'", "´": "'"}
+
+#: Punctuation trimmed from the EDGES of a token before it is looked up.
+#:
+#: This is what made every spoken reference fail. ``_WORD`` has "." inside its character class so
+#: that "report.docx" stays one token - and that also swallowed the full stop at the end of a
+#: sentence, so "open this chart." tokenised to "chart." and matched nothing in KIND_WORDS. Real STT
+#: always punctuates, so reference resolution was systematically broken for voice while working
+#: perfectly for typed text. Trimming only the edges keeps "report.docx" intact.
+_EDGE_PUNCTUATION = ".,;:!?\"'()[]"
+
+
+def bare_word(word: str) -> str:
+    """A token with sentence punctuation trimmed from its edges.
+
+    Public because :mod:`void.orchestration.messaging` needs exactly the same rule and a second
+    copy would drift: both parsers see the same punctuated transcripts.
+    """
+    return word.strip(_EDGE_PUNCTUATION)
+
 
 #: How long a candidate stays plausible as "the one I was looking at". Beyond this, recency stops counting
 #: for anything - a tab from yesterday is not what "this" means.
@@ -256,10 +284,13 @@ def parse_reference(phrase: str) -> Reference:
     told V.O.I.D does not understand a sentence any person would.
     """
     text = clean_text(phrase, 300).lower()
+    for fancy, plain in _APOSTROPHES.items():
+        text = text.replace(fancy, plain)
     if not text:
         return Reference(phrase="")
     recency = any(marker in text for marker in RECENCY_PHRASES)
-    words = _WORD.findall(text)
+    words = [bare_word(word) for word in _WORD.findall(text)]
+    words = [word for word in words if word]
     word_set = set(words)
     deictic = bool(word_set & DEICTIC) or recency
 
@@ -271,9 +302,9 @@ def parse_reference(phrase: str) -> Reference:
             break
 
     def strip_filler(candidate_words) -> str:
-        kept = [word for word in candidate_words
-                if word not in _FILLER and word not in DEICTIC
-                and word.rstrip("s") not in KIND_WORDS and word not in KIND_WORDS]
+        kept = [bare for bare in (bare_word(word) for word in candidate_words)
+                if bare and bare not in _FILLER and bare not in DEICTIC
+                and bare.rstrip("s") not in KIND_WORDS and bare not in KIND_WORDS]
         return " ".join(kept)
 
     possessive = _POSSESSIVE.search(text)

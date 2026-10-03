@@ -380,7 +380,15 @@ voice:
   # Failures, clarifications ("I found more than one match"), "I can't find X" and every answer a model
   # writes are still spoken - only a COMPLETED local action is silent. true restores the confirmation.
   speak_successful_actions: false
-  tts_provider: "sapi"           # local TTS backend: "sapi" (Windows) or "null"
+  # Local TTS backend: "sapi_stream" (Windows default), "sapi" or "null".
+  # "sapi_stream" synthesises to memory and plays through the same audio layer the capture
+  # broker uses, which follows the owner's actual Windows output device. Plain "sapi" lets
+  # SAPI pick the device itself, which sent speech to an endpoint the owner was not listening
+  # on (see void/voice/sapi_stream.py); it is kept only as a rollback.
+  #
+  # This line previously read "sapi", which silently disabled the fix: create_tts_provider
+  # prefers a configured value over its own platform default, so the default never applied.
+  tts_provider: "sapi_stream"
   tts_rate: 1                    # SAPI speaking rate -10..10 (0 = normal); 1 ~= moderately faster
   # Wake word (Phase 9C-1: detector boundary only - NOT wired to the session
   # yet, and no microphone is opened). "Hey V.O.I.D." has no pretrained

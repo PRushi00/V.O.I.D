@@ -44,8 +44,8 @@ from void.core.fast_path import FastPath
 from void.orchestration.apps import ApplicationRegistry
 from void.orchestration.commands import ControlContext, ControlIntent, classify as classify_control
 from void.orchestration.events import EventLog
-from void.orchestration.messaging import (ConversationRoutes, installed_via_catalog,
-                                          observed_conversations)
+from void.orchestration.messaging import (ConversationRoutes, MessagingAction,
+                                          installed_via_catalog, observed_conversations)
 from void.orchestration.routes import ExistingTabRoutes, FastPathRoutes, RouteResolver, WorldState
 from void.orchestration.verify import Verifier
 from void.core.kill_switch import KillSwitch
@@ -161,6 +161,20 @@ def _file_facts(file_actions, path: str) -> dict | None:
     if not result.ok or not isinstance(result.data, dict):
         return None
     return {"exists": True, "size_bytes": int(result.data.get("size_bytes") or 0)}
+
+
+def _sentence(text: object) -> str:
+    """A plan's reason as something fit to say: capitalised, full-stopped.
+
+    The planner's reasons are written as fragments ("tell me whose conversation to open") because
+    they are also log and test material. This is presentation only - no text from a tool, a window
+    title or a model passes through it.
+    """
+    body = " ".join(str(text or "").split())
+    if not body:
+        return "I could not work out what to open."
+    body = body[0].upper() + body[1:]
+    return body if body.endswith((".", "?", "!")) else body + "."
 
 
 class Assistant:
@@ -367,10 +381,11 @@ class Assistant:
         # compares and chooses. The conversation provider's two sources are callables so that an
         # ordinary goal costs nothing - neither the catalog nor the window list is read unless the
         # utterance is actually about a conversation.
+        self._conversations = ConversationRoutes(
+            installed=lambda: installed_via_catalog(catalog),
+            conversations=self._open_conversations)
         self.routes = RouteResolver([FastPathRoutes(self._fast), ExistingTabRoutes(),
-                                     ConversationRoutes(
-                                         installed=lambda: installed_via_catalog(catalog),
-                                         conversations=self._open_conversations)])
+                                     self._conversations])
 
     def world_state(self, goal: str = "") -> WorldState:
         """What V.O.I.D can observe about the computer right now, for route resolution.
@@ -551,6 +566,121 @@ class Assistant:
                       targets=len(decision.plan.targets), missing=len(decision.failures), llm_calls=0)
             perf.emit("complete", status=result.status, total_s=round(time.monotonic() - t0, 3), steps=result.steps)
             return result
+
+    def _conversation_route(self, goal: str, *, named_only: bool = False) -> AgentResult | None:
+        """A request for a person's conversation, answered deterministically - no model call.
+
+        Why this exists. "Open my chat" used to take 24-49 seconds and end either in a
+        model-written clarification or in ``failed``, depending on how Gemini felt: the planner
+        correctly declined (no person is named), the messaging route was dropped because
+        ``desktop.enabled`` is false, and the model was then left to grope at
+        ``resolve_reference``, ``list_windows``, ``list_tabs``, ``get_active_window`` and
+        ``list_app_windows`` - several of which answer "not configured". All of that was reproduced.
+
+        Every one of those outcomes is already decided, exactly and instantly, by
+        :func:`void.orchestration.messaging.plan_conversation`. Handing the question to a model
+        could only add latency and variance to an answer the engine already had, and the two could
+        disagree. So this answers from the plan, and the request always reaches a terminal state
+        at once.
+
+        It uses the SAME provider instance the route resolver uses, so the deterministic answer and
+        the route can never disagree about what was decided. ``None`` means "not a conversation
+        request, or one that can genuinely be acted on" - and the ordinary path then runs unchanged.
+
+        **Why this is consulted twice, around the fast path.** With ``named_only`` it runs FIRST,
+        because a request that names a person is unambiguously about a conversation and the
+        application matcher would otherwise claim it: "Open Rushi's chat" was being answered "I
+        can't find rushi's chat on this machine", which is confidently wrong - it looked for an
+        application by that name. Without ``named_only`` it runs AFTER, so a bare "open chat" still
+        gets its turn at being an application that is genuinely installed under that name, and only
+        falls back to "whose conversation?" when it is not.
+        """
+        if self.kill_switch.engaged:
+            return None
+        try:
+            plan = self._conversations.plan(goal, self.world_state(goal))
+        except Exception:                                      # noqa: BLE001 - never block a goal
+            _log.debug("CONVERSATION_PLAN_UNAVAILABLE", exc_info=True)
+            return None
+        if plan.irrelevant:
+            return None                                        # not about a conversation at all
+        if named_only and not plan.contact:
+            return None                                        # might be an application name
+
+        if plan.action == MessagingAction.ASK:
+            reply = plan.question()
+        elif not plan.actionable:
+            reply = _sentence(plan.reason)
+        elif "desktop_ui" not in self.world_state(goal).capabilities:
+            # The plan can be carried out in principle, but this machine cannot reach inside an
+            # application. Saying so here - rather than letting the route be silently dropped and
+            # the model improvise - is the difference between "I cannot do that, here is why" and
+            # two minutes of working.
+            reply = (f"I can see {plan.display}, but reaching inside an application needs desktop "
+                     f"automation, which is switched off. Set desktop.enabled in your local config "
+                     f"and ask me again.")
+        else:
+            # Genuinely actionable. Execute the route deterministically, exactly as the fast path
+            # executes a launch: through Agent.run_direct, so the kill switch, the tool's effective
+            # risk and RiskGate.authorize all apply unchanged.
+            executed = self._execute_conversation(goal)
+            if executed is not None:
+                return executed
+            if not named_only:
+                return None                                    # ordinary path owns it
+            # run_direct declined (the step needs the owner's approval, or every alternative
+            # failed). A request that NAMES a person still must not fall through to the
+            # application matcher, which answers "I can't find rushi's whatsapp chat on this
+            # machine" - confidently wrong, and the exact mis-answer this ordering exists to stop.
+            return self._measured(lambda: self._agent().run(goal))
+        perf.emit("route", provider="none", reason="conversation", kind=plan.action, llm_calls=0)
+        task = Task(goal="[conversation]", id="(chat)", status=Status.COMPLETED, result=reply)
+        return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0)
+
+    def _execute_conversation(self, goal: str) -> AgentResult | None:
+        """Run the chosen conversation route with no model call, or None if there is none to run.
+
+        The resolver decides WHAT to call; ``Agent.invoke_tool`` runs it through the same funnel
+        every other call uses - kill switch, the tool's effective risk, ``RiskGate.authorize``,
+        audit, telemetry. Nothing here authorizes anything, and the arguments come from the plan
+        rather than from the sentence.
+
+        ``invoke_tool`` rather than ``run_direct``, and the reason is the whole point of this
+        method. ``run_direct`` treats the calls it is given as ALTERNATIVES and returns None when
+        every one of them fails, so that the ordinary agent can try something better - exactly
+        right for a launch, where another route may well exist. It is wrong here: when
+        ``open_conversation`` reports "I could not find Rushi in WhatsApp's visible list", that is
+        the complete and final answer, and discarding it sent the request to the model instead -
+        measured at 33 seconds, nine steps, ending in ``failed`` with nothing to tell the owner.
+        Keeping the tool's own sentence turns that into an immediate, accurate reply.
+
+        An ``unauthorized`` verdict is deliberately NOT answered here: the risk gate asked for the
+        owner's approval, and the ordinary path owns confirmation and its deferral.
+        """
+        state = self.world_state(goal)
+        routes = [route for route in self.routes.candidates(goal, state) if route.executable]
+        if not routes:
+            return None
+        call = routes[0].calls[0]
+        with perf.ensure_interaction("cli"):
+            agent = Agent(provider=_NoProvider(), tools=self.tools, risk_gate=self.risk_gate,
+                          kill_switch=self.kill_switch, store=self.store, on_event=self.on_event,
+                          defer_confirmation=self._confirm_fn is None)
+            outcome = agent.invoke_tool(call.name, dict(call.arguments))
+        if outcome.kind in ("unauthorized", "unknown"):
+            return None
+        reply = _sentence(outcome.summary) if outcome.summary else None
+        if outcome.ok:
+            task = Task(goal="[conversation]", id="(chat)", status=Status.COMPLETED,
+                        result=reply or call.reply)
+            return AgentResult(task=task, status=Status.COMPLETED,
+                               result=reply or call.reply, steps=1)
+        # A definitive failure, reported as one. FAILED rather than COMPLETED because nothing was
+        # opened - but with the tool's own explanation attached, so the owner is told why instead
+        # of being handed a status with no text.
+        task = Task(goal="[conversation]", id="(chat)", status=Status.FAILED,
+                    result=reply, error=reply or "the conversation could not be opened")
+        return AgentResult(task=task, status=Status.FAILED, result=reply, steps=1)
 
     def _measured(self, fn) -> AgentResult:
         """Run one agent operation inside a telemetry interaction (joining the
@@ -734,17 +864,56 @@ class Assistant:
             return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0)
         return False                               # personal-looking question with no memory: use the agent
 
+    #: What to say when a command arrives while the stop is engaged. A CONSTANT string: nothing from
+    #: the goal, a tool or an error is interpolated, so this can never become a channel for untrusted
+    #: text - the same rule void/voice/status_phrases.py follows.
+    STOPPED_REPLY = ("V.O.I.D is stopped. Rearm it from the tray menu - or run "
+                     "'python -m void clear-stop' - and I will pick things up again.")
+
     def run(self, goal: str) -> AgentResult:
-        # Control commands first: "stop" must not become a model call, and must not become a cancel.
+        # An engaged stop is answered here, before anything else, and WITHOUT clearing it.
+        #
+        # This was a silent dead end. Every path below is gated on the switch: _control_command
+        # returns None while engaged, and the agent's first act is raise_if_engaged(), so each
+        # command created a task, paused it, and returned an AgentResult whose `result` is None -
+        # because task.result is only ever set on COMPLETED. The owner therefore said something,
+        # saw and heard nothing, and had no way to find out why; "resume", "continue" and "rearm"
+        # behaved identically, since they are control commands and control commands were skipped.
+        # Recovery existed only through the tray's Rearm item or the CLI. Reproduced directly.
+        #
+        # Deliberately NOT a way out: this reports, it does not clear. The stop is a security
+        # control with its own full phrase and optional PIN, and letting any spoken sentence lift it
+        # would be exactly the weakening that protection exists to prevent. What was missing was the
+        # explanation, not an escape hatch.
+        if self.kill_switch.engaged:
+            # PAUSED, not COMPLETED: nothing the owner asked for happened, and a status of
+            # "completed" on a refused command would be its own small lie. What was missing was
+            # never the status - it was the sentence. Two existing security tests assert this
+            # status alongside the properties that matter (nothing executed, no provider call, the
+            # switch still engaged), and all of those continue to hold here: this path runs no
+            # tool, builds no agent and consults no model.
+            task = Task(goal="[stopped]", id="(stopped)", status=Status.PAUSED,
+                        result=self.STOPPED_REPLY)
+            return AgentResult(task=task, status=Status.PAUSED, result=self.STOPPED_REPLY,
+                               steps=0)
+        # Control commands next: "stop" must not become a model call, and must not become a cancel.
         control = self._control_command(goal)
         if control is not None:
             return control
         handled = self._memory_command(goal)
         if handled is not None:
             return handled
+        # A conversation that NAMES someone outranks the application matcher - see
+        # _conversation_route on why it is consulted on both sides of the fast path.
+        named = self._conversation_route(goal, named_only=True)
+        if named is not None:
+            return named
         fast = self._fast_route(goal)
         if fast is not None:
             return fast
+        chat = self._conversation_route(goal)
+        if chat is not None:
+            return chat
         route = self._recall_route(goal)
         if isinstance(route, AgentResult):
             return route

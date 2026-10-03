@@ -8,6 +8,7 @@ State is checkpointed after every step so the task is resumable.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -22,6 +23,11 @@ from void.core.task import CorruptedTaskState, Status, Task, TaskStore
 from void.providers.base import LLMProvider, ProviderUnavailable
 from void.providers import failures
 from void.security.risk import RiskGate, RiskLevel
+
+#: How often a model call in flight is re-checked against the kill switch. A Stop is cooperative, so
+#: this interval - not the provider's own timeout - is what bounds how long "Stop" takes to be felt.
+#: Small enough to feel immediate, large enough that polling costs nothing.
+_STOP_POLL_S = 0.25
 
 # Latency investigation: privacy-safe stage timing only - tool NAMES (engine-
 # defined identifiers, never model-supplied paths/commands) and durations,
@@ -220,6 +226,65 @@ class Agent:
         head = 1 if messages and messages[0].get("role") == "system" else 0
         return [*messages[:head], *self._memory_msgs, *messages[head:]]
 
+    def _generate_interruptibly(self, messages: list[dict], specs):
+        """One provider call that a Stop can actually interrupt.
+
+        The kill switch is cooperative by design: it stops the next step or tool call from
+        starting, and :class:`KillSwitch` says plainly that it cannot kill a syscall already in
+        flight. A model call *is* such a syscall - an HTTP request carrying the provider's own
+        deadline, which for the local model is 120 seconds. So a Stop pressed one second into that
+        call went unnoticed until the request finished, and the owner watched "working" for up to
+        two minutes after asking it to stop. That is the reported failure, reproduced.
+
+        The call therefore runs on a worker thread while this waits in :data:`_STOP_POLL_S` polls,
+        checking the switch each time. Stop is then felt within a quarter of a second regardless of
+        which provider is in use and what its timeout is.
+
+        **A late answer cannot resurrect the run.** When the switch is engaged this raises
+        ``StopRequested`` and never looks at ``box`` again; the orphaned request finishes into a
+        dict nobody reads, on a daemon thread that cannot hold the process open. The socket itself
+        is not aborted, because nothing in Python can abort another thread's blocking read - what is
+        guaranteed is that its result is discarded and no further step runs.
+        """
+        box: dict = {}
+
+        def work() -> None:
+            try:
+                box["response"] = self.provider.generate(messages, tools=specs)
+            except BaseException as exc:                        # noqa: BLE001 - re-raised below
+                box["error"] = exc
+
+        worker = threading.Thread(target=work, daemon=True, name="void-llm-call")
+        worker.start()
+        while True:
+            worker.join(_STOP_POLL_S)
+            if not worker.is_alive():
+                break
+            # Raising here abandons the wait. See the docstring on why that is safe.
+            self.kill_switch.raise_if_engaged()
+        if "error" in box:
+            raise box["error"]
+        if "response" not in box:
+            # The thread died without recording either outcome. Treat it as a provider failure so
+            # the existing retry/failover policy decides, rather than returning None upwards.
+            raise ProviderUnavailable("the model call ended without producing an answer")
+        return box["response"]
+
+    def _sleep_unless_stopped(self, seconds: float) -> None:
+        """Wait, but notice a Stop while waiting.
+
+        Used for retry backoff. ``time.sleep`` is uninterruptible, so a Stop arriving during a
+        backoff was not seen until the sleep ended - the same class of delay as a blocked model
+        call, and just as avoidable.
+        """
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while True:
+            self.kill_switch.raise_if_engaged()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(_STOP_POLL_S, remaining))
+
     def _generate_with_retry(self, messages: list[dict]):
         """One model answer, with bounded retries and - when the failure warrants it - another provider.
 
@@ -246,7 +311,7 @@ class Agent:
                 self.kill_switch.raise_if_engaged()
                 t0 = time.monotonic()
                 try:
-                    response = self.provider.generate(messages, tools=specs)
+                    response = self._generate_interruptibly(messages, specs)
                 except Exception as exc:
                     category = failures.classify(exc)
                     allowed, may_failover = failures.policy(category)
@@ -266,7 +331,9 @@ class Agent:
                         budget = self.max_retries + 1
                     if attempt < budget:
                         self.on_event(f"LLM call failed (attempt {attempt}): {exc}")
-                        time.sleep(failures.backoff_s(attempt - 1))
+                        # Interruptible: a Stop pressed during a backoff used to wait the whole
+                        # sleep out before being noticed.
+                        self._sleep_unless_stopped(failures.backoff_s(attempt - 1))
                         continue
                     if not may_failover:
                         raise                     # the request itself is wrong; another provider cannot help

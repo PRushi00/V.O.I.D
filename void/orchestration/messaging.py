@@ -49,7 +49,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from void.orchestration.reference import KIND_WORDS, parse_reference
+from void.orchestration.reference import KIND_WORDS, bare_word, parse_reference
 from void.orchestration.routes import DirectCall, Route, RouteKind, WorldState
 from void.perception import clean_text
 
@@ -230,7 +230,11 @@ def _attributive_app(text: str, vocabulary) -> str:
     *immediately* before a conversation noun - so that "WhatsApp is slow, open Rushi's chat" selects
     nothing, exactly as "Edge is slow, open Gmail" selects no browser.
     """
-    words = re.findall(r"[\w.+-]+", (text or "").lower())
+    # Punctuation trimmed per token, and for the same reason the reference parser trims it: a real
+    # transcript ends in a full stop, so "Rushi's WhatsApp chat." left "chat." as the next token and
+    # the application name immediately before it was never recognised.
+    words = [bare_word(word) for word in re.findall(r"[\w.+-]+", (text or "").lower())]
+    words = [word for word in words if word]
     for index, word in enumerate(words[:-1]):
         if words[index + 1] not in CONVERSATION_NOUNS:
             continue
@@ -279,8 +283,8 @@ def _contact_from(qualifier: str, vocabulary) -> str:
     possessive to latch onto. Searching a contact list for "whatsapp rushi" finds nobody, so the
     application words come out - they named the surface, not the person.
     """
-    words = [word for word in re.findall(r"[\w.'+-]+", (qualifier or "").lower())
-             if word not in CONVERSATION_NOUNS]
+    words = [bare_word(word) for word in re.findall(r"[\w.'+-]+", (qualifier or "").lower())]
+    words = [word for word in words if word and word not in CONVERSATION_NOUNS]
     kept: list[str] = []
     index = 0
     while index < len(words):
