@@ -656,7 +656,8 @@ class Assistant:
             return self._measured(lambda: self._agent().run(goal))
         perf.emit("route", provider="none", reason="conversation", kind=plan.action, llm_calls=0)
         task = Task(goal="[conversation]", id="(chat)", status=Status.COMPLETED, result=reply)
-        return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0)
+        return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0,
+                           engine_authored=True)
 
     def _reference_route(self, goal: str) -> AgentResult | None:
         """"Open the folder you just found" - answered from what was already resolved.
@@ -756,7 +757,8 @@ class Assistant:
                      f"browser.enabled in your local config and ask me again.")
             task = Task(goal="[website]", id="(web)", status=Status.FAILED, result=reply,
                         error=reply)
-            return AgentResult(task=task, status=Status.FAILED, result=reply, steps=0)
+            return AgentResult(task=task, status=Status.FAILED, result=reply, steps=0,
+                               engine_authored=True)
 
         # A page already open wins: ExistingTabRoutes proposes EXISTING_STATE, which outscores the
         # BROWSER route, so this picks reuse over opening another tab without knowing about tabs.
@@ -784,37 +786,53 @@ class Assistant:
         #
         # The tool returning ok means the call did not raise. What makes this COMPLETED is the page
         # the browser reports, compared against the host that was asked for.
-        verified, detail = self._verify_page(target)
+        verified, detail = self._verify_page(target, outcome.data)
         if verified:
             reply = f"Opened {target.display}."
         else:
-            reply = (f"I asked the browser to open {target.display}, but {detail} - so I cannot "
-                     f"confirm it loaded.")
+            # Engine-composed on purpose: ``detail`` names the host the BROWSER reported, which is
+            # external text and must not be spoken. It is kept on the task, where the command line
+            # can show it, and left out of the sentence the owner hears.
+            reply = (f"I asked the browser to open {target.display}, but could not confirm it "
+                     f"loaded.")
         status = Status.COMPLETED if verified else Status.FAILED
         task = Task(goal="[website]", id="(web)", status=status, result=reply,
-                    error="" if verified else reply)
+                    error="" if verified else f"{reply} ({detail})".strip())
         perf.emit("route", provider="none", reason="website", verified=bool(verified), llm_calls=0)
-        return AgentResult(task=task, status=status, result=reply, steps=1)
+        return AgentResult(task=task, status=status, result=reply, steps=1,
+                           engine_authored=True)
 
-    def _verify_page(self, target) -> tuple[bool, str]:
-        """``(loaded, why_not)`` for the page just navigated to, read from the browser.
+    def _verify_page(self, target, navigated: object = None) -> tuple[bool, str]:
+        """``(loaded, why_not)`` for the page just navigated to, as the browser reported it.
 
         Compares HOSTS rather than whole URLs: a site redirects ("youtube.com" ->
         "www.youtube.com/"), appends a locale or a consent parameter, and a string comparison would
         call every one of those a failure. A host match is the strongest claim available without
         reading the page, and when the browser cannot say, this reports that it cannot say.
+
+        The evidence is the URL the NAVIGATION itself returned (``navigate`` already reports
+        ``{"url", "title"}`` for the page it produced). An earlier version called ``browser.read()``
+        instead, which reads whichever page is current - so with two tabs open it compared the wrong
+        one and failed a navigation that had in fact succeeded: "open Wikipedia about artificial
+        intelligence" was reported unconfirmed while the page was loaded, because a YouTube tab from
+        the previous command answered the read. ``read()`` remains the fallback for a route that
+        reports no URL of its own, such as activating an existing tab.
         """
         from urllib.parse import urlsplit
 
         wanted = urlsplit(target.url).hostname or ""
-        browser = self.browser
-        if browser is None:
-            return False, "the browser layer is not available"
-        try:
-            state = browser.read()
-        except Exception as exc:                               # noqa: BLE001
-            return False, f"reading the page failed ({type(exc).__name__})"
-        got = urlsplit(str(getattr(state, "url", "") or "")).hostname or ""
+        reported = ""
+        if isinstance(navigated, dict):
+            reported = str(navigated.get("url") or "")
+        if not reported:
+            browser = self.browser
+            if browser is None:
+                return False, "the browser layer is not available"
+            try:
+                reported = str(getattr(browser.read(), "url", "") or "")
+            except Exception as exc:                           # noqa: BLE001
+                return False, f"reading the page failed ({type(exc).__name__})"
+        got = urlsplit(reported).hostname or ""
         if not got:
             return False, "the browser did not report a page"
         if got == wanted or got.endswith("." + wanted) or wanted.endswith("." + got):
@@ -1079,7 +1097,7 @@ class Assistant:
             task = Task(goal="[stopped]", id="(stopped)", status=Status.PAUSED,
                         result=self.STOPPED_REPLY)
             return AgentResult(task=task, status=Status.PAUSED, result=self.STOPPED_REPLY,
-                               steps=0)
+                               steps=0, engine_authored=True)
         # Control commands next: "stop" must not become a model call, and must not become a cancel.
         control = self._control_command(goal)
         if control is not None:

@@ -38,6 +38,7 @@ import time
 from dataclasses import dataclass, field
 
 from void.actions.app_names import squash
+from void.core.fast_path import strip_address_prefix
 from void.perception import clean_text
 
 _log = logging.getLogger(__name__)
@@ -289,7 +290,10 @@ def parse_reference(phrase: str) -> Reference:
     nothing and falls through to normal handling; the cost of missing a real reference is the owner being
     told V.O.I.D does not understand a sentence any person would.
     """
-    text = clean_text(phrase, 300).lower()
+    # "Hey V.O.I.D., open this chart." - the address is not part of what is being referred to. Left
+    # in, those words became the qualifier ("hey v.o.i.d"), and once a named thing had to match by
+    # name that qualifier matched nothing, so spoken references stopped resolving entirely.
+    text = clean_text(strip_address_prefix(phrase), 300).lower()
     for fancy, plain in _APOSTROPHES.items():
         text = text.replace(fancy, plain)
     if not text:

@@ -174,3 +174,80 @@ and those strings are written by the engine, never by a model or a tool.
   `Opera GX browser` all work.
 - **No filesystem index was added.** `FolderCatalog` already scans 244 directories in 0.28 s and
   answers in 0.01 ms; the problem was never the index.
+
+## 9. Why the same sentence worked typed and failed spoken
+
+Typing "Open YouTube" worked and verified. Saying *"Hey V.O.I.D., open YouTube."* answered **"That
+task failed, please check the cmd line for details."** Three separate causes, plus a deployment one.
+
+### 9.1 The running process had none of this code
+
+The voice runtime is long-lived: Task Scheduler started it at **16:00:01**, and
+`void/orchestration/websites.py` was written at **19:40** the same day. Python imports a module once;
+it does not hot-reload. So the live voice process was executing the code from before the website
+route existed, and "open YouTube" fell through to the model exactly as it had.
+
+**This is the first thing to check whenever voice and text disagree.** Nothing in the repository is
+wrong in that state, and no amount of reading the code reveals it — only the process start time does:
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" | Select ProcessId, CreationDate
+```
+
+The runtime is restarted through its own task, never by killing it:
+
+```
+schtasks /End /TN VOID_VoiceRuntime
+schtasks /Run /TN VOID_VoiceRuntime
+```
+
+### 9.2 The address was being treated as part of the goal
+
+Speech-to-text writes `Hey V.O.I.D., open YouTube.` The launch grammar had stripped that prefix for
+itself since V1 — and nothing else had:
+
+| parser | `Hey V.O.I.D., open this chart.` | why |
+| --- | --- | --- |
+| `fast_path` | correct | has `_PREFIX`, including the dotted spelling |
+| `websites` | **no site at all** | knew the literal `void`, not `V.O.I.D.` |
+| `reference` | qualifier `'hey v.o.i.d'` | kept the words, so a *named* thing matched nothing |
+
+Typing never hit any of this, because nobody types "hey void". The prefix is now one public
+definition — `fast_path.strip_address_prefix` — used by all three, for the same reason `squash` and
+`bare_word` are shared: every parser sees the same transcripts, and a second copy would drift.
+
+### 9.3 The engine's reason was discarded before it was spoken
+
+`status_phrases.py` speaks a fixed phrase for the attention-needing statuses, and its security
+reason is sound: text a model, tool, page or window produced must never be spoken, or whatever wrote
+it gains a voice channel. But the engine had already composed *"I can reach YouTube, but browser
+automation is switched off"* — and `session.py` threw it away for the generic phrase.
+
+The rule is now **narrowed, not relaxed**. `AgentResult.engine_authored` is set only where every
+part of the sentence came from engine constants, an engine vocabulary table, or the owner's own
+words. Absence means untrusted, so anything older or third-party still gets the constant phrase, and
+a tool summary never reaches the speaker. Four places set it; `_execute_conversation`'s tool text
+deliberately does not.
+
+One consequence worth stating: the unconfirmed-navigation message no longer names the host the
+browser reported. That host is external text, so it stays on `task.error` for the command line and
+out of the sentence the owner hears.
+
+### 9.4 Verification was reading the wrong tab
+
+`_verify_page` called `browser.read()`, which returns whichever page is **current**. With two tabs
+open it compared the wrong one and declared a successful navigation unconfirmed — *"open Wikipedia
+about artificial intelligence"* was reported unverified while the page was loaded, because a YouTube
+tab from the previous command answered the read.
+
+The `navigate` tool already reports `{"url", "title"}` for the page it produced. That is the
+evidence now; `read()` remains the fallback for a route that reports no URL of its own, such as
+activating an existing tab.
+
+### 9.5 What was confirmed about the two processes, again
+
+Unchanged from §8, re-measured: launcher 2.1 MB parented by `svchost.exe`, child 3.3 GB running the
+real interpreter. The voice task's `Last Result: -2147020576` (`0x800710E0`, "request refused") is
+what `MultipleInstancesPolicy: IgnoreNew` returns when the 15-minute recheck trigger fires while an
+instance is already running — the duplicate-suppression working, not a failure.
+

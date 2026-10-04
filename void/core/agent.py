@@ -136,6 +136,19 @@ class AgentResult:
     #: application launched, a folder opened. The reply is then a courtesy rather than information, which is why
     #: the voice session may stay silent. Never set for a failure, a clarification, or anything a model wrote.
     local_action: bool = False
+    #: True when ``result`` was composed by the ENGINE from its own constants, its own vocabulary tables and
+    #: the owner's own words - and from nothing a model, a tool, a window title, a page or the filesystem
+    #: supplied.
+    #:
+    #: This exists so that a FAILURE can be explained out loud. ``void/voice/status_phrases.py`` speaks a
+    #: fixed phrase for the attention-needing statuses, and the security reason is sound: untrusted text
+    #: spoken aloud hands an attacker a voice channel. But it meant the owner heard "That task failed, please
+    #: check the command line" even when the engine knew exactly why and had written the reason itself.
+    #:
+    #: The flag narrows that rule rather than relaxing it. Set it ONLY where every part of the sentence is
+    #: engine-owned; leave it false whenever a tool summary, a model sentence, a filesystem name or a page
+    #: title is interpolated, however harmless it looks.
+    engine_authored: bool = False
 
 
 class Agent:

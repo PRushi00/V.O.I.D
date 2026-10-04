@@ -351,8 +351,19 @@ class VoiceSession:
         self._last_result = result
         # D-13: a task that needs the owner (approval / input / failed / paused) is announced
         # with a CONSTANT phrase chosen by status alone - never the task, error or tool text.
+        #
+        # ...unless the ENGINE wrote the sentence itself. ``AgentResult.engine_authored`` is set
+        # only where every part of the reply came from engine constants, an engine vocabulary table
+        # or the owner's own words, and never from a model, a tool, a page, a window title or the
+        # filesystem. The security rule is unchanged for everything else; what it used to cost was
+        # the owner hearing "That task failed, please check the command line" for a failure the
+        # engine could explain in one sentence - "I can reach YouTube, but browser automation is
+        # switched off" - which it had already written and then discarded here.
+        engine_text = (getattr(result, "result", None) or "")             if getattr(result, "engine_authored", False) else ""
         status_phrase = phrase_for(getattr(result, "status", None))
-        if status_phrase is not None:
+        if engine_text:
+            text, kind = engine_text, "engine_status"
+        elif status_phrase is not None:
             text, kind = status_phrase, "engine_status"
         else:
             text = getattr(result, "result", None) or ""

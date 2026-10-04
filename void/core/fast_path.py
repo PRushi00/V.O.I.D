@@ -69,6 +69,31 @@ _POSSESSIVES = frozenset({"my", "our", "this"})
 #: is still reachable. "app"/"application"/"program" were always here for "open the calculator app";
 #: "folder" and "directory" are the same situation for "open my Studies folder".
 _TRAILING_NOUN = r"(?:app|application|program|folder|directory)"
+#: Case-insensitive twin of :data:`_PREFIX`, for callers that have not normalised their text.
+_PREFIX_RAW = re.compile(_PREFIX.pattern, re.IGNORECASE)
+
+
+def strip_address_prefix(text: object) -> str:
+    """Drop the part of an utterance that ADDRESSES V.O.I.D rather than asking for anything.
+
+    "Hey V.O.I.D., open YouTube." is how the owner actually speaks, and the wake words are not part
+    of the goal. This grammar already removed them for itself; nothing else did, and the result was a
+    whole class of voice-only failures:
+
+    * ``websites.parse_target`` knew the literal spelling "void" but not the dotted "V.O.I.D." that
+      speech-to-text produces, so "Hey V.O.I.D., open YouTube." resolved to no site at all;
+    * ``reference.parse_reference`` kept the words as a QUALIFIER - "hey v.o.i.d studies" - which,
+      once a named thing was required to match by name, meant it matched nothing.
+
+    Public and shared for the same reason ``squash`` and ``bare_word`` are: every parser sees the
+    same transcripts, and a second copy of this pattern would drift from this one. Returns the text
+    unchanged when it carries no address, and never raises.
+    """
+    if not isinstance(text, str):
+        return ""
+    return _PREFIX_RAW.sub("", text, count=1).strip()
+
+
 _LAUNCH = re.compile(
     r"^(?:open|launch|start)(?: up)? (?P<det>" + _DETERMINERS + r" )?"
     r"(?P<app>.+?)(?: (?P<noun>" + _TRAILING_NOUN + r"))?(?: please)?$")

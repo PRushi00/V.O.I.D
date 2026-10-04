@@ -36,6 +36,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from void.core.fast_path import strip_address_prefix
 from void.orchestration.routes import DirectCall, Route, RouteKind, WorldState
 from void.perception import clean_text
 
@@ -225,7 +226,11 @@ def parse_target(goal: object) -> WebTarget:
     Returns an unresolved target for everything that is not an "open <site>" request, which is the
     common case and the case in which routing behaves exactly as it did before this module existed.
     """
-    text = clean_text(goal, 300)
+    # The address comes off first, with the grammar the launch path already uses: a transcript says
+    # "Hey V.O.I.D., open YouTube." and the dotted spelling is what speech-to-text produces. The
+    # local pattern below knew only the literal "void", which is why every spoken website request
+    # resolved to nothing while the typed one worked.
+    text = strip_address_prefix(clean_text(goal, 300))
     if not text:
         return WebTarget()
     match = _OPEN.match(text)
