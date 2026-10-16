@@ -269,10 +269,18 @@ def test_a_route_reporting_no_url_falls_back_to_reading_the_page():
     assert ok is True
 
 
-def test_the_unconfirmed_reply_carries_no_text_the_browser_supplied():
+def test_the_unconfirmed_reply_carries_no_text_the_browser_supplied(monkeypatch):
     """The host the browser reported is external text. It belongs on the task, where the command
-    line can show it, and not in the sentence the owner hears."""
+    line can show it, and not in the sentence the owner hears.
+
+    ``cdp_available`` is forced true so this exercises the CONTROLLED path. Otherwise the route
+    would hand the URL to the owner's own browser instead - correct behaviour, but a different code
+    path from the one under test here.
+    """
+    import void.app as app_module
     from void.app import Assistant
+
+    monkeypatch.setattr(app_module, "cdp_available", lambda port: True)
 
     class Elsewhere:
         @staticmethod

@@ -22,6 +22,8 @@ therefore owns a single dedicated thread and marshals every call onto it - the s
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 import hashlib
 import re
 
@@ -237,6 +239,42 @@ class PlaywrightBrowser:
     def attached(self) -> bool:
         """True when driving a browser the OWNER started (so their sessions are available)."""
         return self._attached
+
+    def prefer(self, browser: object) -> bool:
+        """Ask for the NEXT launched browser to be ``browser``. True when that can be honoured.
+
+        ``_ensure`` resolves which browser to start from ``policy.preferred``, which is the owner's
+        CONFIGURED choice - so an explicit "open YouTube in Edge" never reached the launch at all,
+        and Opera GX started instead while the reply said only "Opened YouTube." The override was
+        reaching ``WorldState.preferred`` and the routing decision, and stopping there.
+
+        Returns False, changing nothing, when a session is already open: the running browser cannot
+        become a different browser, and closing the owner's controlled window to switch would be a
+        worse surprise than saying so. The caller then reports honestly rather than quietly using
+        the wrong one.
+        """
+        wanted = clean_text(browser, 60).lower()
+        if not wanted:
+            return False
+        if clean_text(self._policy.preferred, 60).lower() == wanted:
+            return True                                        # already what it would launch
+        if self._context is not None:
+            return False                                       # a session is open; cannot switch
+        self._policy = replace(self._policy, preferred=wanted)
+        _log.info("BROWSER_PREFERENCE_SET_FOR_LAUNCH")
+        return True
+
+    @property
+    def connected(self) -> bool:
+        """Is a browser session already open, WITHOUT starting one to find out?
+
+        Needed because every other question here has a side effect. ``tabs()`` runs ``_ensure()``,
+        which attaches or **launches**, so merely observing the world started a browser: V.O.I.D
+        built its ``WorldState`` for every goal, read the tab list to do it, and that launch is the
+        second Opera window the owner saw. Listing the tabs of a browser that has not been opened
+        yet cannot return anything useful anyway.
+        """
+        return self._context is not None
 
     def available(self) -> bool:
         """Can a browser be driven at all? Does not start one."""

@@ -251,3 +251,104 @@ real interpreter. The voice task's `Last Result: -2147020576` (`0x800710E0`, "re
 what `MultipleInstancesPolicy: IgnoreNew` returns when the 15-minute recheck trigger fires while an
 instance is already running — the duplicate-suppression working, not a failure.
 
+## 10. Test state must not reach the real desktop
+
+The owner saw V.O.I.D resolving
+`C:\Users\nanda\AppData\Local\Temp\pytest-of-nanda\pytest-953\test_memory_then_filesystem_th0\work\aurora`
+as if it were a folder on their computer.
+
+**It was not a database leak.** The suite isolates those correctly - `make_assistant` points
+`app.state_dir` at `tmp_path` - and a search of the production `state.sqlite`, `memory.sqlite`,
+`tasks.sqlite` and `recent_apps.json` found **zero** occurrences of `pytest-of-nanda`. That is what
+ruled persistence out and pointed at the desktop.
+
+**It was the desktop.** `open_path` really called `os.startfile`, so the suite left genuine File
+Explorer windows standing on pytest temporary folders. Reproduced precisely: before
+`test_memory_then_filesystem_then_launch` no window matched "aurora"; afterwards there was one,
+*"aurora - File Explorer"*, whose location was
+`file:///C:/Users/nanda/AppData/Local/Temp/pytest-of-nanda/pytest-954/.../work/aurora`.
+
+And the live runtime reads the window list as **observed truth**: `referents.window_candidates`
+offers every open window as something the owner can refer to, and `WorldState.running_apps` is built
+from the same list. A stray window from a test is therefore indistinguishable from a folder the owner
+opened. It was caught happening - a reference question listed *"ZqParityProbe - File Explorer"*, a
+pytest fixture folder, among the owner's real choices.
+
+### The fix is a boundary, not a blacklist
+
+An autouse fixture in `conftest.py` makes `os.startfile` and `webbrowser.open` inert for the whole
+suite. A production guard that refused paths under `%TEMP%` was rejected: it would break a folder the
+owner genuinely keeps there, it would not stop the next side effect that is not a path, and it would
+leave the suite still reaching out of its sandbox. A test asserts that no production module mentions
+any test-only name.
+
+Two things are deliberately **not** patched, because they are code under test rather than a way out:
+
+- `subprocess.Popen` - `subprocess.run` is built on it, and three tests spawn `tests/_memory_child.py`
+  to prove memory survives a real separate process.
+- `AppActions._default_launch` / `RealWindowsBackend.launch` - the first version patched these and
+  broke `test_computer.py`, which patches `Popen` itself and then asserts the exact argv
+  `_default_launch` builds. A launch cannot reach the desktop anyway without a resolved target from a
+  real catalog, and a test checks that `launch_app` refuses everything else.
+
+`@pytest.mark.real_os_launch` opts a test back in. It is currently unused.
+
+**Measured after**: the full 4317-test suite leaves 0 windows naming a pytest path, 0 File Explorer
+windows at all, and only the owner's own browser process.
+
+## 11. Using the browser the owner already has open
+
+Opera GX was running; "Open YouTube" worked, in a *second* V.O.I.D browser with none of their logins.
+
+### Three approaches, measured before anything was written
+
+| | result |
+| --- | --- |
+| **CDP attach** | Opera GX *does* speak CDP - with `--remote-debugging-port` and its own `--user-data-dir` it reported `Chrome/152.0.7977.120`, protocol 1.3. But a port **cannot be retrofitted onto a running browser**: relaunching with the flag only signalled the existing instance, the browser process was unchanged and 9222 stayed closed. An open CDP port also has no authentication - any local process gets the owner's cookies and sessions. |
+| **Windows UIA** | **Not viable.** UIA finds the Opera window and reads **zero** elements; Chromium does not publish its accessibility tree by default. No address bar, no tab strip. |
+| **OS default handler** | **Works.** Opera GX is the default `https` handler, and handing it the URL added only renderer processes - the browser process was unchanged. |
+
+### What was built
+
+The third, with precedence that keeps the strongest option first:
+
+1. **CDP, when something is listening** - it can read the page back and confirm the host.
+2. **The owner's own session** - hand the URL to the existing `open_path` tool, so the kill switch
+   and `RiskGate` apply unchanged. No port is opened, no browser flag is changed, no profile is read.
+3. **The controlled browser** - unchanged fallback, fully verifiable.
+
+Reuse requires **both** that the shell would land in the intended browser (matched with `squash`
+against the owner's own `UserChoice` ProgId - no second ProgId table) **and** that the browser is
+already running. So "in Edge" while Opera is the default correctly does *not* reuse.
+
+### Two measurement mistakes, both pinned as tests
+
+- **"Lowest pid" is not "the browser."** Windows reuses pids, so a helper started later took a lower
+  number and the check reported a brand-new session where there was none. The browser is the process
+  with **no `--type=`** argument.
+- **A new browser process is not a second browser.** Windows starts a transient `opera.exe` to carry
+  the URL, which signals the running instance and exits - and for that moment it has no `--type=`
+  either. Measured immediately it looked like a second browser *every time*. **Persistence** is the
+  test, not existence.
+
+### Honest about what is not known
+
+V.O.I.D cannot read that browser, so the reply says so: *"Opened YouTube in the Opera GX you already
+had open. I cannot read that browser, so I have not confirmed the page itself."* A persistent second
+browser is reported as a failure of reuse rather than dressed up as success.
+
+### Two defects found on the way
+
+- **Observing the world opened a browser.** `world_state` read the tab list for every goal; `tabs()`
+  runs `_ensure()`, which attaches or **launches**. That launch was the second Opera window, and it
+  happened before any routing decision. Tabs are now read only when a session already exists or CDP
+  is listening - a browser V.O.I.D has not opened has no tabs to report anyway.
+- **An explicit "in Edge" never reached the launch.** `_ensure` resolves the browser from
+  `policy.preferred`, the *configured* choice, so the override reached the routing decision and
+  stopped there: Opera GX started while the reply said only "Opened YouTube." `prefer()` now carries
+  it, and refuses to switch a session that is already open rather than closing the owner's window.
+
+**Measured**: `Open YouTube` 1.95 s, reused, no new browser (renderers 20->25). `Open Wikipedia about
+artificial intelligence` 1.47 s, reused. `Open YouTube in Edge` launched 12 `msedge.exe` processes and
+**zero** new Opera browsers.
+

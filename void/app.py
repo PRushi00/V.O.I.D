@@ -48,6 +48,7 @@ from void.orchestration.messaging import (ConversationRoutes, MessagingAction,
                                           installed_via_catalog, observed_conversations)
 from void.orchestration.routes import ExistingTabRoutes, FastPathRoutes, RouteResolver, WorldState
 from void.orchestration.verify import Verifier
+from void.browser.existing_session import Reuse, cdp_available, spoken_browser
 from void.orchestration.websites import WebsiteRoutes, parse_target
 from void.core.kill_switch import KillSwitch
 from void.core.task import Status, Task, TaskStore
@@ -410,10 +411,21 @@ class Assistant:
         tabs: tuple = ()
         if self.browser is not None and self.browser.available():
             capabilities.add("browser")
-            try:
-                tabs = tuple((tab.browser, tab.url, tab.title) for tab in self.browser.tabs())
-            except Exception:                                  # noqa: BLE001 - stale beats crashing
-                tabs = ()
+            # Only read the tab list when a session ALREADY exists, or when one is listening for us
+            # to attach. ``tabs()`` runs the adapter's ``_ensure()``, which attaches or **launches**
+            # - so building the world state used to start a browser, every goal, before any routing
+            # decision had been made. That launch is the second Opera window the owner reported, and
+            # it happened before the reuse logic below could have any say. A browser V.O.I.D has not
+            # opened has no tabs it could tell us about, so nothing is lost by not asking.
+            # ``getattr`` for the same reason the policy lookup below uses it: the adapter is
+            # injectable, and an adapter without this property must degrade to "no session yet"
+            # rather than raise out of world-state construction.
+            if getattr(self.browser, "connected", False) or cdp_available(
+                    getattr(getattr(self.browser, "policy", None), "cdp_port", 0)):
+                try:
+                    tabs = tuple((tab.browser, tab.url, tab.title) for tab in self.browser.tabs())
+                except Exception:                              # noqa: BLE001 - stale beats crashing
+                    tabs = ()
         if getattr(self, "screen", None) is not None and self.screen.policy.enabled:
             capabilities.add("screen")
         # UI Automation is a separate capability from V2's lightweight window list: "desktop" is
@@ -760,6 +772,26 @@ class Assistant:
             return AgentResult(task=task, status=Status.FAILED, result=reply, steps=0,
                                engine_authored=True)
 
+        # The owner's OWN browser first, when the controlled path cannot reach it.
+        reused = self._reuse_open_browser(target, state)
+        if reused is not None:
+            return reused
+
+        # An explicit "in Edge" must reach the LAUNCH, not just the routing decision. Without this
+        # the adapter resolved the browser from its configured preference and started Opera GX while
+        # the reply said only "Opened YouTube." - a quiet wrong action.
+        wanted = state.preferred("browser")
+        prefer = getattr(self.browser, "prefer", None) if self.browser is not None else None
+        if state.overridden("browser") and wanted and callable(prefer):
+            if not prefer(wanted):
+                reply = (f"I can open {target.display}, but a different browser is already running "
+                         f"for me and I cannot switch it to {spoken_browser(wanted)} without "
+                         f"closing it. Close it and ask me again.")
+                task = Task(goal="[website]", id="(web)", status=Status.FAILED, result=reply,
+                            error=reply)
+                return AgentResult(task=task, status=Status.FAILED, result=reply, steps=0,
+                                   engine_authored=True)
+
         # A page already open wins: ExistingTabRoutes proposes EXISTING_STATE, which outscores the
         # BROWSER route, so this picks reuse over opening another tab without knowing about tabs.
         routes = [route for route in self.routes.candidates(goal, state) if route.executable]
@@ -800,6 +832,81 @@ class Assistant:
                     error="" if verified else f"{reply} ({detail})".strip())
         perf.emit("route", provider="none", reason="website", verified=bool(verified), llm_calls=0)
         return AgentResult(task=task, status=status, result=reply, steps=1,
+                           engine_authored=True)
+
+    def _reuse_open_browser(self, target, state) -> AgentResult | None:
+        """Open the page in the browser the owner already has running, or None to use the
+        controlled one.
+
+        Why this exists. Opera GX was open, "Open YouTube" worked, and it worked in a *second*
+        browser with none of the owner's logins. The browser layer already prefers reuse - it
+        attaches over CDP before it launches - and the reason it never attached here is measured:
+
+        * Opera GX does speak CDP (``Chrome/152.0.7977.120``, protocol 1.3) when started with
+          ``--remote-debugging-port`` and its own ``--user-data-dir``;
+        * but a debugging port cannot be retrofitted onto a running browser. Launching the same
+          executable with the flag while Opera was open only signalled the existing instance: the
+          browser process was unchanged and port 9222 stayed closed;
+        * and Windows UI Automation reads **zero** elements from the Opera window, because Chromium
+          does not publish its accessibility tree by default - no address bar, no tab strip.
+
+        So the open session is unreachable by either automation route, and what remains is the
+        mechanism the owner's own desktop uses: hand the URL to Windows, which gives it to their
+        default handler. Measured - the browser process was unchanged and only renderer processes
+        appeared, which is what a new tab looks like from outside.
+
+        **Only when CDP is not listening.** With a debugging port available the controlled path is
+        better and keeps precedence: it can read the page back and confirm the host, where a
+        hand-off cannot be verified past the hand-off. This is the middle option, not the first.
+
+        **Nothing new is granted.** The URL goes through the existing ``open_path`` tool, so the
+        kill switch, the tool's risk level and ``RiskGate`` apply exactly as they do to any other
+        call. No debugging port is opened, no browser flag is changed, and the owner's profile,
+        cookies and sessions are never read - V.O.I.D cannot see into that browser, which is
+        precisely why the reply does not claim the page loaded.
+        """
+        browser = state.preferred("browser")
+        if not browser:
+            return None
+        policy = getattr(self.browser, "policy", None)
+        if cdp_available(getattr(policy, "cdp_port", 0)):
+            return None                                        # the verifiable path can attach
+        reuse = Reuse(browser)
+        if not reuse.possible:
+            # Either the shell would land somewhere else - "in Edge" when Opera is the default - or
+            # that browser is not running, so there is no session to reuse.
+            return None
+
+        reuse.before()
+        with perf.ensure_interaction("cli"):
+            agent = Agent(provider=_NoProvider(), tools=self.tools, risk_gate=self.risk_gate,
+                          kill_switch=self.kill_switch, store=self.store, on_event=self.on_event,
+                          defer_confirmation=self._confirm_fn is None)
+            outcome = agent.invoke_tool("open_path", {"target": target.url})
+        if outcome.kind in ("unauthorized", "unknown") or not outcome.ok:
+            return None                                        # let the controlled path try
+
+        reused, detail = reuse.after()
+        if not reused:
+            # The one outcome that must never be reported as reuse. Saying "opened in your Opera"
+            # while having started a second browser is the whole complaint, so it is reported.
+            reply = (f"I opened {target.display}, but not in the {spoken_browser(browser)} you "
+                     f"already had open - {detail}.")
+            task = Task(goal="[website]", id="(web)", status=Status.FAILED, result=reply,
+                        error=f"{reply} ({detail})")
+            perf.emit("route", provider="none", reason="website", reuse=False, llm_calls=0)
+            return AgentResult(task=task, status=Status.FAILED, result=reply, steps=1,
+                               engine_authored=True)
+
+        # Honest about what is and is not known. The hand-off happened, no second browser appeared,
+        # and a tab materialised in the session that was already there - but V.O.I.D cannot read
+        # that browser, so it does not say the page finished loading.
+        reply = (f"Opened {target.display} in the {spoken_browser(browser)} you already had open. "
+                 f"I cannot read that browser, so I have not confirmed the page itself.")
+        task = Task(goal="[website]", id="(web)", status=Status.COMPLETED, result=reply)
+        perf.emit("route", provider="none", reason="website", reuse=True, llm_calls=0)
+        _log.info("BROWSER_SESSION_REUSED image=%s detail=%s", reuse.image, detail)
+        return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=1,
                            engine_authored=True)
 
     def _verify_page(self, target, navigated: object = None) -> tuple[bool, str]:
