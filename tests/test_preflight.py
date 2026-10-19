@@ -69,7 +69,8 @@ def test_every_chain_that_matters_is_actually_probed(home):
                   "path confinement", "task store", "kill switch", "risk gate", "receipt judge",
                   "model refusal", "vault index", "vault recall", "vault honesty",
                   "notes question route", "vault capture", "memory round trip",
-                  "focus sessions", "provider credential",
+                  "focus sessions", "teardown kit", "teardown routes",
+                  "no stray browser", "provider credential",
                   "model reachable"):
         assert chain in names, f"{chain} is no longer probed"
 

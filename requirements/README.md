@@ -40,3 +40,18 @@ Everything here is pinned to an exact version, not a range.
 
 Every entry was checked for Python 3.14 compatibility on this machine before being added, and each is the
 official package from PyPI — no forks, no vendored copies, no git URLs.
+
+## Website teardown (optional, off by default)
+
+The teardown layer (`void/teardown/`) needs no Python package at all: its DevTools client is standard
+library. What it needs is outside pip:
+
+- **Node.js 22.19+** (or 24.11+), for the REA CLI.
+- **`rea-agents`, pinned** — `void/teardown/__init__.py` holds the version this integration was
+  drilled against. Install it with `python -m void teardown install`, which verifies the package's
+  repository URL against `github.com/morluto/rea` before fetching and passes `--ignore-scripts`.
+  V.O.I.D never installs it on its own.
+- **A Chromium-family browser** (Chrome, Edge or Chromium) for the investigation profile.
+
+`python -m void teardown diag` reports which of those are missing, and `python -m void preflight`
+carries the same three checks.

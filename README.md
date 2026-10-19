@@ -88,6 +88,7 @@ void/
     widget.py          minimal always-on-top circular widget (PySide6)
   vault/               the owner's own markdown notes, retrievable and cited
   focus/               the accountability timer, and the identities it never stores
+  teardown/            website teardown: a clean browser, REA, and a cited note
   preflight/           the live-chain harness behind `python -m void preflight`
 ```
 
@@ -156,6 +157,29 @@ nowhere else in the repository. `focus.name_the_distraction: false` derives no l
 The tab lane needs `browser.enabled`; without it a session locks the application only and says so. If
 the foreground cannot be read at all, the session is `blind`: it counts nothing and accuses you of
 nothing.
+
+### Taking a website apart
+
+Off by default. Turn on `teardown.enabled`, then:
+
+```powershell
+python -m void teardown diag                 # can it run here, and what is missing
+python -m void teardown install              # installs the pinned kit, on purpose, verifying it first
+python -m void teardown run igloo.inc --question "how does the scroll work?"
+```
+
+It opens a **brand-new browser profile** with none of your logins in it, lets REA watch the page for
+seconds while V.O.I.D scrolls it, reads the code and the browser's own asset log, names the stack from
+licence banners (which survive minification, so the versions are exact rather than guessed), writes a
+note into your vault, and deletes the profile. Every line of evidence says who saw it — REA, V.O.I.D's
+own browser read, or both — and the note ends with what the evidence *cannot* show.
+
+V.O.I.D never installs the kit by itself: `teardown install` is your deliberate act, it checks the
+package's repository URL before fetching anything, and it passes `--ignore-scripts` so no lifecycle
+script of a third-party package runs on your machine. The observation is read-only by construction —
+the DevTools client has no click, no typing and no navigation.
+
+Point it at public sites, open-source code and your own projects.
 
 ### Security & autonomy (V1)
 

@@ -557,12 +557,18 @@ class Vault:
         - with the next free id, so ids already cited keep their meaning - and is a candidate in the
         very next question.
         """
-        body = " ".join(str(text or "").split())
+        # Whitespace is normalised WITHIN each line and the line breaks are kept. A spoken capture
+        # is one line either way; a structured note (a teardown, a pasted outline) would otherwise
+        # arrive as one unreadable paragraph, which is a silent loss of the thing being captured.
+        body = "\n".join(" ".join(line.split()) for line in str(text or "").splitlines()).strip()
         if not body:
             return CaptureResult(False, None, "", "There was nothing to write down.")
         self._ensure()
-        name = (title or " ".join(body.split()[:8])).strip()
-        slug = re.sub(r"[^A-Za-z0-9 _-]", "", name).strip() or "capture"
+        first_line = next((line for line in body.splitlines() if line.strip()), "")
+        name = (title or " ".join(first_line.split()[:8])).strip()
+        # Dots are kept so a note about a host reads as "igloo.inc" rather than "iglooinc"; a
+        # leading dot is dropped, because a file that starts with one is a hidden file.
+        slug = re.sub(r"[^A-Za-z0-9 ._-]", "", name).strip(" .") or "capture"
         stamp = time.strftime("%Y-%m-%d", time.localtime(self._now()))
         target = Path(self.root) / CAPTURES_DIR / f"{slug[:60]}.md"
         n = 2

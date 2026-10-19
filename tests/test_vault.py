@@ -242,6 +242,22 @@ def test_a_captured_note_is_on_disk_with_a_title_and_todays_date(vault, tmp_path
     assert time.strftime("%Y-%m-%d") in body
 
 
+def test_a_structured_capture_keeps_its_line_breaks(vault):
+    """A spoken capture is one line; a note with headings must not arrive as one paragraph."""
+    markdown = "# Teardown\n\n**Verdict:** a Three.js scene.\n\n## The stack\n- Three.js r165\n"
+    out = vault.capture(markdown, title="teardowns example.com")
+    assert out.ok
+    body = Path(out.path).read_text(encoding="utf-8")
+    assert "## The stack" in body and "- Three.js r165" in body
+    assert body.count("\n") >= 5
+
+
+def test_a_note_name_keeps_the_dots_in_a_host(vault):
+    out = vault.capture("about a site", title="teardowns igloo.inc 2026-10-19")
+    assert out.ok and "igloo.inc" in Path(out.path).name
+    assert not Path(out.path).name.startswith(".")
+
+
 def test_a_captured_note_is_retrievable_by_the_very_next_question(vault):
     """Writing a file is not the same as indexing it - no reload, no restart, no re-scan."""
     before = vault.node_count

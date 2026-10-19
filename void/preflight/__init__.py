@@ -596,6 +596,65 @@ def _check_focus(ctx) -> None:
                    f"({line.split('.')[0]})", _ms(t0))
 
 
+def _check_teardown_kit(ctx) -> None:
+    """The three checks the REA pack asks preflight to grow: the kit is ready at the pinned version,
+    the offline checks pass, and no investigation browser was left running."""
+    from void.teardown import PINNED_REA, Kit
+    from void.teardown import address as teardown_address
+    from void.teardown import fingerprints
+    from void.teardown.browser import stray_profiles
+
+    enabled = bool(ctx.config.get("teardown.enabled", False))
+    root = ctx.config.get("teardown.kit_root", None)
+    kit = Kit(Path(str(root)) if root else None)
+    diag = kit.diag()
+    if not enabled:
+        ctx.report.add("teardown kit", WARN,
+                       "teardown.enabled is false" +
+                       ("; the kit is installed and ready if you turn it on"
+                        if diag["ready"] else f"; {'; '.join(diag['problems'])[:200]}"))
+    elif not diag["ready"]:
+        ctx.report.add("teardown kit", FAIL, "; ".join(diag["problems"])[:400])
+    elif diag["rea_installed"] != PINNED_REA:
+        ctx.report.add("teardown kit", FAIL,
+                       f"REA {diag['rea_installed']} is installed, pinned {PINNED_REA}: bump the "
+                       f"pin on purpose and re-run the drill")
+    else:
+        ctx.report.add("teardown kit", OK,
+                       f"REA {diag['rea_installed']} (pinned), node {diag['node']}, browser found")
+
+    # The offline checks: spoken addresses parse, a synthetic bundle fingerprints, and a sentence
+    # that names no site triggers nothing. None of these needs a browser or the kit.
+    cases = [("reverse engineer igloo dot inc", "igloo.inc"),
+             ("tear down stripe.com slash pricing", "stripe.com/pricing"),
+             ("what is example.com built with", "example.com"),
+             ("tear down the old shed", None),
+             ("how should I reverse engineer my pricing", None)]
+    wrong = [said for said, expected in cases
+             if teardown_address.parse(said) != expected]
+    signals = {s.name: s for s in fingerprints.fingerprint(
+        'Three.js Authors r165\n/*! GSAP 3.12.5 */ nearCoCBuffer')}
+    if wrong:
+        ctx.report.add("teardown routes", FAIL,
+                       f"{len(wrong)} of {len(cases)} route cases are wrong, including "
+                       f"{wrong[0]!r}")
+    elif signals.get("Three.js", None) is None or signals["Three.js"].version != "165":
+        ctx.report.add("teardown routes", FAIL,
+                       "a licence banner no longer yields an exact version: the stack would be "
+                       "guesses")
+    else:
+        ctx.report.add("teardown routes", OK,
+                       f"{len(cases)} route cases correct; a banner still names r165 exactly")
+
+    strays = stray_profiles()
+    if strays:
+        ctx.report.add("no stray browser", FAIL,
+                       f"{len(strays)} investigation profile(s) left on disk from a crashed run: "
+                       f"{strays[0]} - remove them")
+    else:
+        ctx.report.add("no stray browser", OK, "no investigation profile left on disk")
+
+
 def _check_optional_dependencies(ctx) -> None:
     """Which optional capability layers are installed here. Never a failure: each is opt-in."""
     wanted = {"playwright": "browser automation", "uiautomation": "desktop automation",
@@ -645,6 +704,7 @@ PROBES = (
     _check_vault_capture,
     _check_memory,
     _check_focus,
+    _check_teardown_kit,
     _check_optional_dependencies,
     _check_provider_credential,
     _check_model_is_reachable,

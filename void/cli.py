@@ -20,6 +20,8 @@ import getpass
 import json
 import logging
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -859,6 +861,136 @@ def cmd_preflight(offline: bool, read_only: bool, strict: bool, as_json: bool) -
     return preflight.exit_code(report, strict=strict)
 
 
+def cmd_teardown_diag(as_json: bool) -> int:
+    """Is a teardown possible on this machine, and if not, what is missing."""
+    from void.config import Config
+    from void.teardown import Kit
+
+    config = Config.load()
+    root = config.get("teardown.kit_root", None)
+    diag = Kit(Path(str(root)) if root else None).diag()
+    diag["capability_enabled"] = bool(config.get("teardown.enabled", False))
+    if as_json:
+        print(json.dumps(diag, indent=2))
+        return 0 if diag["ready"] else 1
+    print(f"REA kit:   {'ready' if diag['ready'] else 'NOT ready'}")
+    print(f"  capability   teardown.enabled = {diag['capability_enabled']}")
+    print(f"  rea          installed {diag['rea_installed'] or '(none)'}, "
+          f"pinned {diag['rea_pinned']}")
+    print(f"  node         {diag['node'] or '(not found)'} "
+          f"(minimum {diag['node_minimum']})")
+    print(f"  browser      {'found' if diag['chrome_found'] else 'NOT found'}")
+    if diag["stray_profiles"]:
+        print(f"  WARNING      {diag['stray_profiles']} investigation profile(s) left on disk")
+    for problem in diag["problems"]:
+        print(f"  - {problem}")
+    if not diag["ready"]:
+        print("\nInstall it with:  python -m void teardown install")
+    return 0 if diag["ready"] else 1
+
+
+def cmd_teardown_install() -> int:
+    """Install the REA kit, deliberately, after verifying where the package comes from.
+
+    V.O.I.D never does this on its own: running it is the owner's decision, the repository URL is
+    checked against the one the package is supposed to live at before anything is fetched, and
+    ``--ignore-scripts`` means no lifecycle script of a third-party package runs here.
+    """
+    from void.config import Config
+    from void.teardown import PINNED_REA, REA_REPOSITORY, Kit
+
+    config = Config.load()
+    root = config.get("teardown.kit_root", None)
+    kit = Kit(Path(str(root)) if root else None)
+    npm = shutil.which("npm")
+    if npm is None:
+        print("npm was not found on the PATH. Install Node.js "
+              f"{kit.diag()['node_minimum']} or newer first.")
+        return 2
+    print(f"Checking where rea-agents comes from (it must be {REA_REPOSITORY})...")
+    probe = subprocess.run([npm, "view", "rea-agents", "repository.url"],
+                           capture_output=True, text=True, timeout=120)
+    where = (probe.stdout or "").strip()
+    if probe.returncode != 0 or REA_REPOSITORY not in where:
+        print(f"REFUSED: rea-agents resolves to {where or '(nothing)'}, not {REA_REPOSITORY}. "
+              f"Copycat packages exist; nothing was installed.")
+        return 2
+    print(f"  {where}  ok")
+    kit.root.mkdir(parents=True, exist_ok=True)
+    argv = [npm, "install", f"rea-agents@{PINNED_REA}", "--save-exact", "--ignore-scripts",
+            "--no-audit", "--no-fund"]
+    print(f"Installing into {kit.root}:\n  {' '.join(argv)}")
+    out = subprocess.run(argv, cwd=str(kit.root), text=True, timeout=900)
+    if out.returncode != 0:
+        print("The install failed; nothing was changed in V.O.I.D.")
+        return 2
+    print(f"Installed rea-agents {kit.installed_version()}.")
+    return cmd_teardown_diag(as_json=False)
+
+
+def cmd_teardown_run(address: str, question: str, show: bool, as_json: bool) -> int:
+    """Take one website apart and write the note into the vault.
+
+    Long-running on purpose: a real browser opens, REA watches the page for seconds while V.O.I.D
+    scrolls it, and the brain writes the note. The spoken line is printed last, which is the one
+    sentence worth saying out loud.
+    """
+    from void.app import Assistant
+    from void.config import Config
+    from void.teardown import NOTE_SYSTEM_PROMPT, TeardownUnavailable, digest, write_note
+
+    config = Config.load()
+    if not config.get("teardown.enabled", False):
+        print("Website teardown is switched off. Set teardown.enabled: true in "
+              "config/local_config.yaml.")
+        return 2
+    assistant = Assistant(config=config)
+    if assistant.teardown is None:
+        print("Website teardown is switched off.")
+        return 2
+    if assistant.vault is None:
+        print("No notes folder is configured, so there is nowhere to write the teardown. "
+              "Set vault.notes_root in config/local_config.yaml.")
+        return 2
+    assistant.teardown.headless = not show
+    try:
+        evidence = assistant.teardown.capture(address, question=question)
+    except TeardownUnavailable as exc:
+        print(f"Cannot run a teardown: {exc}")
+        return 2
+    except Exception as exc:
+        print(f"The capture failed: {type(exc).__name__}: {exc}")
+        return 2
+
+    text = digest(evidence)
+    if as_json:
+        print(json.dumps({"url": evidence.url, "seconds": evidence.seconds,
+                          "page": evidence.page, "totals": evidence.totals(),
+                          "signals": [s.as_dict() for s in evidence.signals],
+                          "evidence_ids": evidence.evidence_ids,
+                          "limitations": evidence.limitations}, indent=2))
+    else:
+        print(text)
+
+    try:
+        provider = assistant.providers.select()
+    except Exception as exc:
+        print(f"\nThe evidence above is complete, but no brain is available to write the note "
+              f"({exc}). Nothing was written.")
+        return 1
+    reply = provider.generate([{"role": "system", "content": NOTE_SYSTEM_PROMPT},
+                               {"role": "user", "content": text}])
+    try:
+        written = write_note(evidence, reply.text, vault=assistant.vault)
+    except Exception as exc:
+        print(f"\nThe note was NOT written: {exc}")
+        return 1
+    print(f"\n{written.label}")
+    print(f"note:   {written.note_path} (indexed as note {written.note_id})")
+    print(f"spoken: {written.spoken or '(the reply carried no spoken line)'}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="void", description="V.O.I.D V1")
     sub = parser.add_subparsers(dest="command")
@@ -994,6 +1126,20 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Also exit non-zero when a probe only WARNS (for CI)")
     p_preflight.add_argument("--json", action="store_true", dest="as_json")
 
+    p_teardown = sub.add_parser(
+        "teardown", help="Take a website apart with the REA kit (off by default)")
+    teardown_sub = p_teardown.add_subparsers(dest="teardown_action")
+    p_td_diag = teardown_sub.add_parser("diag", help="Is a teardown possible here, and what is missing")
+    p_td_diag.add_argument("--json", action="store_true", dest="as_json")
+    teardown_sub.add_parser(
+        "install", help="Install the pinned REA kit (verifies its repository, runs no scripts)")
+    p_td_run = teardown_sub.add_parser("run", help="Take one website apart and write the note")
+    p_td_run.add_argument("address", help="The site, e.g. example.com or https://example.com/path")
+    p_td_run.add_argument("--question", default="", help="What you actually want to know about it")
+    p_td_run.add_argument("--show", action="store_true",
+                          help="Show the investigation browser instead of running it headless")
+    p_td_run.add_argument("--json", action="store_true", dest="as_json")
+
     p_doctor = sub.add_parser("doctor", help="Read-only health report (never repairs anything)")
     p_doctor.add_argument("--state-dir", default=None, help="Inspect a different state directory")
     p_doctor.add_argument("--no-probe", action="store_true",
@@ -1009,7 +1155,7 @@ def main(argv: list[str] | None = None) -> int:
     known = {"run", "resume", "clarify", "approve", "deny", "set-key",
              "list-keys", "remove-key", "set-pin", "tasks", "stop",
              "clear-stop", "ui", "voice", "app", "singularity", "autostart",
-             "roots", "protect", "device", "perf", "doctor", "preflight", "memory",
+             "roots", "protect", "device", "perf", "doctor", "preflight", "teardown", "memory",
              "prefs", "maintenance", "-h", "--help"}
     if argv and argv[0] not in known:
         return cmd_run(" ".join(argv))
@@ -1078,6 +1224,15 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_doctor(args.state_dir, args.no_probe)
     if args.command == "preflight":
         return cmd_preflight(args.offline, args.read_only, args.strict, args.as_json)
+    if args.command == "teardown":
+        if args.teardown_action == "diag":
+            return cmd_teardown_diag(args.as_json)
+        if args.teardown_action == "install":
+            return cmd_teardown_install()
+        if args.teardown_action == "run":
+            return cmd_teardown_run(args.address, args.question, args.show, args.as_json)
+        print("Usage: python -m void teardown {diag,install,run}")
+        return 1
     if args.command == "device":
         if args.device_action == "pair-start":
             return cmd_device_pair_start(args.name, args.minutes)

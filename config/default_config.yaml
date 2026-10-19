@@ -517,6 +517,29 @@ memory:
   max_proposals_per_task: 3
   recall_routing: true          # memory questions ("what project am I building?") are answered from memory with no tools
 
+# Website teardown: watch a site run, read its code, write down what is actually there.
+#
+# OFF BY DEFAULT, like the camera, the browser and the desktop layers. Turning it on grants nothing
+# on its own: the kit has to be installed too, and V.O.I.D does not install it for you.
+#
+# The kit is `rea-agents` (MIT, github.com/morluto/rea), pinned to the version this integration was
+# drilled against. V.O.I.D DETECTS it and never installs it: `python -m void teardown diag` prints
+# what is missing and the exact commands, and `python -m void teardown install` runs them only
+# because you asked - verifying the package's repository URL first and passing --ignore-scripts so
+# no lifecycle script of a third-party package runs on your machine.
+#
+# Every teardown opens a BRAND-NEW browser profile with none of your logins in it, and deletes it
+# afterwards. A reused profile also lies about weight: the same site measured 0.4 MB from cache and
+# 14.7 MB fresh. The observation is read-only - the DevTools client has no click, no typing and no
+# navigation - and every address goes through the same safe_url gate as the rest of V.O.I.D.
+#
+# Point it at public sites, open-source code and your own projects. A teardown of someone's site
+# without their permission is their call to make, not this file's.
+teardown:
+  enabled: false
+  headless: true                 # false shows the investigation browser, which films better
+  kit_root: null                 # null = ~/.void/tools/rea
+
 # Focus sessions: the accountability timer ("thirty minutes on this").
 #
 # It observes and accounts; it enforces nothing. There is no capability in this layer that can

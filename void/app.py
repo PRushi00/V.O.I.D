@@ -39,6 +39,8 @@ from void.state import StateStore
 from void.vault import Verdict as VaultVerdict, VaultUnavailable
 from void.vault import from_config as vault_from_config
 from void.vault import ask as vault_ask
+from void.teardown import address as teardown_address
+from void.teardown import from_config as teardown_from_config
 from void.focus import commands as focus_commands
 from void.focus import from_assistant as focus_from_assistant
 from void.orchestration.referents import (RecentThings, recent_candidates, tab_candidates,
@@ -348,6 +350,11 @@ class Assistant:
         # accepted request still goes through Assistant.run and the whole funnel, with the skill's tool
         # ceiling on top.
         self.a2a = A2aGateway(A2aPolicy.from_config(self.config))
+
+        # Website teardown (prompt packs, REA Part Two). Deny-by-default behind teardown.enabled,
+        # and even then it needs a kit V.O.I.D will not install for the owner. Lazy for the same
+        # reason the focus engine is: discovering Node and a browser costs nothing until asked.
+        self.teardown = teardown_from_config(self.config)
 
         # Focus sessions (prompt packs, Astra Part Two). Built LAZILY: the engine reads the
         # foreground through the tools registered above, and an owner who never starts a session
@@ -1074,6 +1081,39 @@ class Assistant:
         return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0,
                            engine_authored=True)
 
+    #: Said when a teardown is asked for and the capability is off, or the kit is missing.
+    TEARDOWN_OFF = ("Website teardown is switched off. Turn on teardown.enabled in "
+                    "config/local_config.yaml.")
+
+    def _teardown_route(self, goal: str) -> AgentResult | None:
+        """A spoken request to take a website apart.
+
+        Catches ONLY sentences that name a site - see void/teardown/address.py for why "tear down
+        the old shed" must trigger nothing. What it does here is deliberately narrow: it reports
+        whether a teardown CAN run, and refuses clearly when it cannot. The capture itself is a
+        long-running job with a model call in the middle of it, which belongs to a caller that can
+        wait for it (``python -m void teardown run``), not to a synchronous answer.
+        """
+        address = teardown_address.parse(goal)
+        if address is None:
+            return None
+        if self.teardown is None:
+            return self._engine_reply(goal, self.TEARDOWN_OFF, task_id="(teardown)")
+        problems = self.teardown.kit.problems()
+        if problems:
+            # One line, in order, naming what to install. The problems are the kit's own sentences
+            # about this machine - not a model's, and not a tool's.
+            return self._engine_reply(goal, " ".join(problems)[:600], task_id="(teardown)")
+        if self.teardown.running:
+            return self._engine_reply(goal, "I am already taking one apart.",
+                                      task_id="(teardown)")
+        if address == "this":
+            return self._engine_reply(
+                goal, "Name the site and I will take it apart.", task_id="(teardown)")
+        return self._engine_reply(
+            goal, f"Ready to take that apart. Run: python -m void teardown run {address}",
+            task_id="(teardown)")
+
     @property
     def focus(self):
         """The focus engine, built on first use. None when ``focus.enabled`` is false."""
@@ -1397,6 +1437,11 @@ class Assistant:
         session = self._focus_command(goal)
         if session is not None:
             return session
+        # A request to take a website apart, before the website route claims the address as
+        # something to open.
+        apart = self._teardown_route(goal)
+        if apart is not None:
+            return apart
         # A conversation that NAMES someone outranks the application matcher - see
         # _conversation_route on why it is consulted on both sides of the fast path.
         named = self._conversation_route(goal, named_only=True)
