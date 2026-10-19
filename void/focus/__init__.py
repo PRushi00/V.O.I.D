@@ -297,14 +297,20 @@ class FocusEngine:
 
         surface = self._reader.read()
         self._blind = not surface.readable
+        # The intent question is asked whenever the owner has not already said what they are working
+        # on - NOT only when the lock deferred. It was the second, and that made the question depend
+        # on whether the foreground happened to be readable: on a machine where it is, a session
+        # locked instantly and never learned its intent, so the first callout lost the line that
+        # makes the contrast audible ("X does not look like <the work> to me").
+        question = "" if self._intent else " And what are we focusing on?"
         if surface.readable and not surface.is_home:
             self._lock(surface)
-            return (f"{planned} minutes. Locked on." if not self._target_tab
-                    else f"{planned} minutes. Locked on this tab.")
+            locked = ("Locked on this tab." if self._target_tab else "Locked on.")
+            return f"{planned} minutes. {locked}{question}"
         self._deferred = True
         self._phase = Phase.DEFERRED
         return (f"{planned} minutes. Go to what you are working on and I will lock on there."
-                + (" And what are we focusing on?" if not self._intent else ""))
+                + question)
 
     def set_intent(self, intent: str) -> str:
         """Attach what the owner said they are working on. Never parroted back in full."""

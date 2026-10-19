@@ -75,12 +75,16 @@ def test_the_numbering_does_not_depend_on_the_order_the_filesystem_hands_files_o
 
 def test_an_excerpt_is_bounded_and_carries_no_markdown_scaffolding(tmp_path):
     body = "---\ntags: [x]\n---\n\n## Heading\n\n" + ("word " * 400)
-    v = Vault(write_notes(tmp_path / "notes", {"Long.md": body}))
+    root = write_notes(tmp_path / "notes", {"Long.md": body})
+    v = Vault(root)
     v.reload()
     note = v.notes()[0]
     assert len(note.excerpt) <= EXCERPT_CHARS
     assert "---" not in note.excerpt and "##" not in note.excerpt
-    assert note.chars == len(body)                           # the WHOLE note's size, not the excerpt's
+    # The WHOLE note's size, not the excerpt's - measured against the FILE rather than the string
+    # that was written, because on Windows write_text turns each \n into \r\n and the two differ.
+    on_disk = (root / "Long.md").read_text(encoding="utf-8")
+    assert note.chars == len(on_disk) >= len(body)
 
 
 def test_notes_are_linked_by_wikilink_and_by_naming_each_others_titles(vault):

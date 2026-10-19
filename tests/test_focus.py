@@ -691,6 +691,33 @@ def test_the_whole_session_is_driveable_by_sentence_with_no_model(tmp_path):
     a.focus.stop_ticking()
 
 
+@pytest.mark.parametrize("app, locks_immediately", [
+    ("editor", True),      # a readable, non-home foreground: the lock lands at once
+    ("pythonw", False),    # home base: the lock defers
+    (None, False),         # unreadable: the lock defers
+])
+def test_the_intent_is_asked_for_whichever_way_the_lock_went(app, locks_immediately):
+    """It was asked only on the deferred path, so the question depended on the machine.
+
+    On a desktop where the foreground reads cleanly, a session locked instantly and never learned
+    what the owner was working on - which silently cost the first callout the line that makes the
+    contrast audible. CI on Windows is what exposed it; this pins both branches.
+    """
+    desk = Desk(app=app)
+    eng = engine(desk)
+    line = eng.start(30, now=0.0)
+    assert "what are we focusing on" in line.lower()
+    assert eng.state(now=0.0).app_locked is locks_immediately
+
+
+def test_an_intent_given_up_front_is_not_asked_for_again():
+    desk = Desk(app="editor")
+    eng = engine(desk)
+    line = eng.start(30, now=0.0, intent="the thumbnail sprint")
+    assert "focusing on" not in line.lower()
+    assert eng.state(now=0.0).has_intent
+
+
 def test_the_answer_window_attaches_the_intent_and_then_closes(tmp_path):
     a = assistant(tmp_path)
     a.run("thirty minutes on this")

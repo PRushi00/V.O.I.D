@@ -60,7 +60,9 @@ DEBUG_PORT = 9333
 WINDOW = (1280, 820)
 
 #: How long to wait for the browser to answer /json/version, and how long for the page to settle.
-BROWSER_READY_S = 25.0
+#: 45 rather than 25: a cold Chrome or Edge on Windows can take most of half a minute to come up
+#: with a brand-new profile, and CI mistook that for a browser that would never answer.
+BROWSER_READY_S = 45.0
 LOAD_TIMEOUT_S = 30.0
 #: Extra settle after ``readyState`` is complete: an intro animation and a first render are not the
 #: same thing as a loaded document, and REA sees nothing that has not happened yet.

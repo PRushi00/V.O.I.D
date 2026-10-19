@@ -434,15 +434,56 @@ def site(tmp_path):
         server.server_close()
 
 
+def _drivable_browser() -> str:
+    """Can a browser on this machine actually be launched AND reached on a debugger port?
+
+    A path check is not the precondition these tests need. CI found a browser executable on the
+    Windows runner and then every live test failed with "did not answer its debugger port", which
+    reports as a defect in V.O.I.D's lifecycle code when it is a property of the machine. So the
+    precondition is the real thing, tried once per session.
+    """
+    if find_chrome() is None:
+        return "no Chromium-family browser on this machine"
+    import tempfile
+    probe = CleanBrowser(headless=True, profile_root=Path(tempfile.mkdtemp()),
+                         port=_free_port())
+    try:
+        probe.open("about:blank")
+    except TeardownBrowserError as exc:
+        return f"the browser on this machine could not be driven: {exc}"
+    finally:
+        probe.close()
+    return ""
+
+
+_BROWSER_PROBLEM: str | None = None
+
+
+def _browser_problem() -> str:
+    global _BROWSER_PROBLEM
+    if _BROWSER_PROBLEM is None:
+        _BROWSER_PROBLEM = _drivable_browser()
+    return _BROWSER_PROBLEM
+
+
 needs_browser = pytest.mark.skipif(find_chrome() is None,
                                    reason="no Chromium-family browser on this machine")
+
+
+@pytest.fixture
+def drivable_browser():
+    """Skips with the reason when this machine's browser cannot be launched and reached."""
+    problem = _browser_problem()
+    if problem:
+        pytest.skip(problem)
 needs_kit = pytest.mark.skipif(not Kit().ready,
                                reason="the REA kit is not installed here (void teardown diag)")
 
 
 @needs_browser
 @pytest.mark.real_socket
-def test_the_investigation_browser_is_fresh_every_time_and_always_torn_down(site, tmp_path):
+def test_the_investigation_browser_is_fresh_every_time_and_always_torn_down(
+        site, tmp_path, drivable_browser):
     root = tmp_path / "profiles"
     seen = []
     for _ in range(2):
@@ -460,7 +501,8 @@ def test_the_investigation_browser_is_fresh_every_time_and_always_torn_down(site
 
 @needs_browser
 @pytest.mark.real_socket
-def test_a_read_only_pass_reads_the_page_and_scrolls_it_with_wheel_events(site, tmp_path):
+def test_a_read_only_pass_reads_the_page_and_scrolls_it_with_wheel_events(
+        site, tmp_path, drivable_browser):
     browser = CleanBrowser(headless=True, profile_root=tmp_path / "profiles", port=_free_port())
     try:
         browser.open(site)
@@ -481,7 +523,8 @@ def test_a_read_only_pass_reads_the_page_and_scrolls_it_with_wheel_events(site, 
 @needs_browser
 @needs_kit
 @pytest.mark.real_socket
-def test_the_drill_takes_a_real_page_apart_and_leaves_no_trace(site, tmp_path):
+def test_the_drill_takes_a_real_page_apart_and_leaves_no_trace(site, tmp_path,
+                                                              drivable_browser):
     """The pack's Prompt 12: a real teardown, checked, with nothing left behind."""
     vault = vault_for(tmp_path)
     notes_before = vault.node_count
@@ -521,7 +564,7 @@ def test_the_drill_takes_a_real_page_apart_and_leaves_no_trace(site, tmp_path):
 @needs_browser
 @needs_kit
 @pytest.mark.real_socket
-def test_only_one_teardown_runs_at_a_time(site, tmp_path):
+def test_only_one_teardown_runs_at_a_time(site, tmp_path, drivable_browser):
     teardown = Teardown(Kit(), headless=True, profile_root=tmp_path / "profiles")
     teardown._running = True                           # noqa: SLF001 - the state a capture sets
     with pytest.raises(TeardownUnavailable, match="already running"):
