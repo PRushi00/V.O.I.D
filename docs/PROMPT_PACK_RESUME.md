@@ -55,7 +55,7 @@ python -m pytest -q 2>&1 | grep -E '^(FAILED|ERROR)' | sed 's/ - .*//' | sort
 ```
 
 New test files: `tests/test_vault.py` (79), `tests/test_judge.py` (60), `tests/test_model_catalog.py`
-(64), `tests/test_preflight.py` (28), `tests/test_focus.py` (91), `tests/test_teardown.py` (69).
+(70), `tests/test_preflight.py` (28), `tests/test_focus.py` (91), `tests/test_teardown.py` (67).
 
 `tests/guard_limits.json` `min_collected` was ratcheted to 4 700 (4 706 collected).
 
