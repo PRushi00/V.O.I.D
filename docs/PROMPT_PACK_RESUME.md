@@ -43,7 +43,7 @@ CI, the teardown kit, and a CI dependency fix.
 ## 3. Where the test numbers stand
 
 Baseline before this work, in this container: **4 255 pass, 38 fail, 30 skipped, 2 xfailed.**
-After it: **4 650 pass, 38 fail, 30 skipped, 2 xfailed** — the *same* 38, verified by diffing the
+After it: **4 655 pass, 38 fail, 30 skipped, 2 xfailed** — the *same* 38, verified by diffing the
 failure lists, not by counting.
 
 Those 38 are environment-bound and none is a code defect: no Windows (`pywin32`, `pythoncom`), no
@@ -54,10 +54,36 @@ OpenTelemetry patch-version pin. The exact list is reproducible with:
 python -m pytest -q 2>&1 | grep -E '^(FAILED|ERROR)' | sed 's/ - .*//' | sort
 ```
 
-New test files: `tests/test_vault.py` (79), `tests/test_judge.py` (60), `tests/test_model_catalog.py`
-(70), `tests/test_preflight.py` (28), `tests/test_focus.py` (91), `tests/test_teardown.py` (67).
+### What CI says, which is a different machine
 
-`tests/guard_limits.json` `min_collected` was ratcheted to 4 700 (4 706 collected).
+`tests.yml` runs on `windows-latest`, so its red is not this container's red. The two sets barely
+overlap: Linux fails for want of Windows, Windows fails for want of hardware and credentials.
+
+Before this branch the workflow could not collect the suite at all — it installed
+`requirements.lock` only, which has never carried the MCP SDK (defect 8 below). Once it could, the
+first real run gave **16 failed / 4 680 passed**. Four of those were mine and are fixed; the
+twelve that remain are pre-existing and environment-bound:
+
+| Count | Tests | Why |
+|---|---|---|
+| 3 | `test_entity_routing`, `test_voice_text_parity`, `test_voice_transcript_routing` folder/model routes | `ProviderUnavailable` — the runner holds no LLM credential |
+| 4 | `test_cross_domain` ×2, `test_observe` ×2 | the runner reports no audio device |
+| 2 | `test_vision` ×2 | the runner reports no camera |
+| 2 | `test_voice_text_parity`, `test_voice_transcript_routing` application routes | no browser or messaging application installed |
+| 1 | `test_whisper_gen3_wake::test_the_config_key_reaches_the_detector` | asserts `_cpu_threads` on a detector that has no such attribute |
+
+Every one of the twelve was in the recorded pre-work baseline and none touches a file this branch
+changes, checked against the list rather than assumed. The repository already carries a `hardware`
+marker for exactly this; applying it would touch twelve unrelated tests and would need
+`guard_limits.json`'s `max_skipped` raised from 4 to 6, which is a deliberate tripwire — so it was
+**proposed on the PR and not applied**. Until someone decides, CI stays red on those twelve,
+honestly, with no assertion weakened and no test skipped to hide them.
+
+New test files: `tests/test_vault.py` (80), `tests/test_judge.py` (60), `tests/test_model_catalog.py`
+(70), `tests/test_preflight.py` (28), `tests/test_focus.py` (95), `tests/test_teardown.py` (67).
+
+`tests/guard_limits.json` `min_collected` was ratcheted to 4 700 (4 725 collected, so 25 of
+margin; the ceiling is deliberately not set flush against the count).
 
 ## 4. Defects this work found and fixed
 
