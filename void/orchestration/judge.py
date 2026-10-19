@@ -32,6 +32,13 @@ effects is ever added without being put in it.
 could not send it") and a question are all left alone, because replacing an honest sentence with a
 correction is its own kind of lie, and a judge that cries wolf gets switched off.
 
+**What it deliberately does not screen.** Only a final answer a MODEL wrote. The engine's own
+completions do not pass through it, and must not: ``Agent._deterministic_completion`` returns a
+successful tool's own summary line verbatim (and only for a first-step, single-call,
+``terminal_on_success`` tool), so it is receipt-backed by construction; ``_finish_direct`` replies
+with engine constants or a fast-path line. Screening those would mean a gate inspecting sentences the
+engine already knows to be true, which buys nothing and adds a way to be wrong.
+
 The ruling never deletes evidence. The model's original sentence stays in the task's message history;
 only what the owner is *told* is replaced, and the replacement is engine-authored, so it can be
 spoken aloud under the same rule as any other engine sentence (see ``AgentResult.engine_authored``).

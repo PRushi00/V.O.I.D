@@ -370,6 +370,28 @@ def test_opening_a_browser_without_one_installed_says_so(tmp_path):
         browser.open("https://example.com")
 
 
+def test_the_debugger_port_is_not_predictable_by_default():
+    """A known port is something a page on loopback can try; nothing here needs it to be fixed."""
+    from void.teardown.browser import DEBUG_PORT, free_port
+    ports = {CleanBrowser(chrome="x").port for _ in range(5)}
+    assert len(ports) > 1, "every investigation browser would listen on the same port"
+    assert DEBUG_PORT not in ports or len(ports) > 1
+    assert CleanBrowser(chrome="x", port=DEBUG_PORT).port == DEBUG_PORT   # still overridable
+    assert 1024 < free_port() < 65536
+
+
+def test_the_investigation_browser_does_not_allow_any_origin_to_drive_it():
+    """--remote-allow-origins=* would let any page that found the port use the debugger.
+
+    Removable because the client sends no Origin header at all, which was checked against a real
+    browser rather than assumed.
+    """
+    source = Path(__import__("void.teardown.browser", fromlist=["x"]).__file__)
+    text = source.read_text(encoding="utf-8")
+    assert "--remote-allow-origins" not in text.replace("# NOT --remote-allow-origins=*", "")
+    assert "Origin" not in text.split("def send(")[0].split("handshake = (")[1].split(")")[0]
+
+
 def test_stray_profiles_reports_what_a_crash_left_behind(tmp_path):
     root = tmp_path / "profiles"
     assert stray_profiles(root) == []

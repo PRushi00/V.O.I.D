@@ -48,8 +48,11 @@ from urllib.parse import urlsplit
 
 _log = logging.getLogger(__name__)
 
-#: Loopback port the investigation browser listens on. Loopback only, and a port V.O.I.D's own
-#: device gateway does not use.
+#: Loopback port the investigation browser listens on when one is named. The DEFAULT is an ephemeral
+#: free port instead (:func:`free_port`), which is a deliberate departure from the pack's fixed 9333:
+#: anything that can reach loopback can try a known port, and nothing here needs the port to be
+#: predictable - REA is handed the endpoint as an argument. 9333 remains available for a caller who
+#: wants to watch the browser with their own devtools.
 DEBUG_PORT = 9333
 
 #: Window the browser opens at. A fixed size so two runs of the same site are comparable, and large
@@ -100,6 +103,13 @@ CHROME_ENV = "VOID_TEARDOWN_CHROME"
 
 class TeardownBrowserError(RuntimeError):
     """The investigation browser could not be started, reached, or read."""
+
+
+def free_port() -> int:
+    """An ephemeral loopback port the OS says is free. See :data:`DEBUG_PORT` for why."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
 
 
 def find_chrome() -> str | None:
@@ -368,10 +378,10 @@ class CleanBrowser:
     """
 
     def __init__(self, chrome: str | None = None, *, headless: bool = True,
-                 port: int = DEBUG_PORT, profile_root: Path | None = None):
+                 port: int | None = None, profile_root: Path | None = None):
         self.chrome = chrome or find_chrome()
         self.headless = bool(headless)
-        self.port = int(port)
+        self.port = int(port) if port else free_port()
         self.profile_root = Path(profile_root) if profile_root else PROFILE_ROOT
         self.launched: Launched | None = None
         self.cleanup_error = ""
@@ -395,14 +405,21 @@ class CleanBrowser:
         argv = [self.chrome,
                 f"--user-data-dir={profile}",
                 f"--remote-debugging-port={self.port}",
-                "--remote-allow-origins=*",
+                # NOT --remote-allow-origins=*: the client below sends no Origin header, so Chrome
+                # accepts it without the wildcard - and the wildcard would let any page that found
+                # the port drive this browser through its debugger. Verified by connecting without it.
                 "--no-first-run", "--no-default-browser-check", "--disable-extensions",
                 "--disable-background-networking", "--disable-sync", "--mute-audio",
                 "--no-service-autorun", "--password-store=basic", "--use-mock-keychain",
                 f"--window-size={WINDOW[0]},{WINDOW[1]}"]
         if self.headless:
             argv += ["--headless=new", "--disable-gpu"]
-        if os.name != "nt" and os.geteuid() == 0:      # a root container has no sandbox to use
+        if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
+            # Chrome refuses to start its sandbox as root, so a teardown inside a root container
+            # cannot run without this. It is a real weakening - the sandbox is what contains a
+            # hostile page - so it is logged, and it is conditional: on an ordinary machine, where
+            # the owner is not root, the sandbox stays on.
+            _log.warning("TEARDOWN_BROWSER_NO_SANDBOX reason=running_as_root")
             argv.append("--no-sandbox")
         argv.append(url)
         _log.info("TEARDOWN_BROWSER_LAUNCH headless=%s port=%d", self.headless, self.port)

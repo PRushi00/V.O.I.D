@@ -258,6 +258,25 @@ def test_an_ordinary_answer_is_not_touched_by_the_gate(tmp_path):
     assert out.result == "The retainer is 2400 a month." and out.engine_authored is False
 
 
+def test_the_engines_own_completion_is_receipt_backed_by_construction(tmp_path):
+    """Why the deterministic path does not need the judge: its answer IS a successful tool's line.
+
+    A ``terminal_on_success`` tool that succeeds completes the task with its own summary verbatim,
+    so there is no model sentence to screen and the receipt exists by definition.
+    """
+    registry = ToolRegistry()
+    registry.register(Tool(name="launch_app", description="l", parameters={"type": "object"},
+                           handler=lambda **kw: ToolResult.success("Opened Notepad."),
+                           risk=RiskLevel.LOW, terminal_on_success=True))
+    agent = make_agent(tmp_path, [LLMResponse(tool_calls=[tool_call("launch_app", app="notepad")])],
+                       tools=registry)
+    out = agent.run("open notepad")
+    assert out.status == Status.COMPLETED and out.result == "Opened Notepad."
+    assert out.local_action is True
+    assert [r.tool for r in agent._receipts] == ["launch_app"]      # noqa: SLF001
+    assert agent._receipts[0].ok is True                            # noqa: SLF001
+
+
 def test_receipts_do_not_survive_into_a_later_run(tmp_path):
     """A resumed or repeated run must not inherit a previous run's proof of success."""
     registry = ToolRegistry()
