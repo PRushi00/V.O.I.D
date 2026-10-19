@@ -1,8 +1,11 @@
 # V.O.I.D tests. Hermetic: no network, no real keyring, no microphone, no model download
 # (tests/conftest.py enforces this; see tests/test_isolation.py).
 #
-# UNVALIDATED: this workflow has not run on GitHub yet. The runner's availability of the
-# pinned CPython (3.14) is the main thing to check on the first run.
+# The first real run of this workflow (2026-10-19) failed at COLLECTION, for a reason that had
+# nothing to do with the suite: it installed `requirements.lock` only, and the lock does not carry
+# the MCP SDK - so `tests/test_mcp_server.py` could not import `mcp` and pytest aborted the whole
+# run. The optional manifests the suite's own tests import are therefore installed too, below. The
+# pinned CPython (3.14) resolved fine on windows-latest.
 name: tests
 
 on:
@@ -25,6 +28,14 @@ jobs:
           allow-prereleases: true
       - name: Install the pinned environment
         run: python -m pip install -r requirements.lock
+      # The optional capability layers. Each has tests that IMPORT it, and
+      # tests/test_v3_interop.py asserts the installed version equals the pinned one - so a run
+      # without these does not "skip those tests", it fails to collect at all.
+      - name: Install the optional capability layers
+        run: |
+          python -m pip install -r requirements-mcp.txt
+          python -m pip install -r requirements/v3-capabilities.txt
+          python -m pip install -r requirements/v3-interop.txt
       - name: Run the suite
         run: python -m pytest -q --junitxml=junit.xml
       - name: Guard against silent coverage loss
