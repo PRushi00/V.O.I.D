@@ -81,10 +81,29 @@ def test_an_excerpt_is_bounded_and_carries_no_markdown_scaffolding(tmp_path):
     note = v.notes()[0]
     assert len(note.excerpt) <= EXCERPT_CHARS
     assert "---" not in note.excerpt and "##" not in note.excerpt
-    # The WHOLE note's size, not the excerpt's - measured against the FILE rather than the string
-    # that was written, because on Windows write_text turns each \n into \r\n and the two differ.
-    on_disk = (root / "Long.md").read_text(encoding="utf-8")
+    # The WHOLE note's size, not the excerpt's - measured the way the vault itself measures it.
+    # Vault._read decodes the raw bytes, so on Windows, where write_text turns each \n into
+    # \r\n, the note is six characters longer than the string written. read_text would undo
+    # that translation and disagree; read_bytes is what `chars` actually describes.
+    on_disk = (root / "Long.md").read_bytes().decode("utf-8")
     assert note.chars == len(on_disk) >= len(body)
+
+
+def test_a_notes_size_counts_the_bytes_on_disk_whatever_the_line_endings(tmp_path):
+    """Pins the property on every platform, not only on the one that exposed it.
+
+    A vault written by Obsidian on Windows has CRLF line endings. `chars` is what the vault read,
+    so it must count them; a reader that translates newlines away disagrees by the line count, and
+    a size that quietly shrinks is a size nothing can be decided from.
+    """
+    root = tmp_path / "notes"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "Crlf.md").write_bytes(b"# Crlf\r\nfirst line\r\nsecond line\r\n")
+    v = Vault(root)
+    v.reload()
+    note = v.notes()[0]
+    assert note.chars == 33                       # 30 characters plus one \r per line
+    assert note.chars == len((root / "Crlf.md").read_bytes().decode("utf-8"))
 
 
 def test_notes_are_linked_by_wikilink_and_by_naming_each_others_titles(vault):
