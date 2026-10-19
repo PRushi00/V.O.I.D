@@ -170,6 +170,36 @@ def test_an_utterance_that_is_not_about_the_brain_is_left_alone(utterance):
     assert parse(utterance).intent == Intent.NONE
 
 
+@pytest.mark.parametrize("utterance", [
+    # These share a word with a model family but name a WEBSITE or nothing in particular, and this
+    # route runs ahead of the website matcher - so claiming them would steal them.
+    "switch to chat gpt", "use claude", "switch to haiku", "switch to gemini",
+    "switch to claude", "use gpt",
+])
+def test_a_bare_family_word_is_left_to_the_routes_behind_this_one(utterance):
+    assert parse(utterance).intent == Intent.NONE
+    assert parse(utterance, known=GEMINI).intent == Intent.NONE
+
+
+@pytest.mark.parametrize("utterance", [
+    "try on opus 5.5",                        # a version is named
+    "switch to gemini 3.8 flash",
+    "switch to the gemini model",             # or the sentence says "model"
+    "change your brain to haiku",
+])
+def test_an_utterance_that_clearly_names_a_model_is_claimed(utterance):
+    assert parse(utterance).intent == Intent.SWITCH
+
+
+def test_a_name_the_catalogue_really_knows_is_claimed_even_without_a_version():
+    """A configured alias has to work, or an owner's own spoken name for a model is unreachable."""
+    with_alias = ModelCatalog.from_config(Config({
+        "llm": {"gemini": {"model": "gemini-flash-latest"},
+                "model_aliases": {"the fast one": "gemini:gemini-flash-latest"}}}))
+    assert parse("switch to gemini flash latest", known=with_alias).intent == Intent.SWITCH
+    assert parse("switch to gemini flash latest").intent == Intent.NONE   # unknowable without it
+
+
 # ================================================================== the swap itself
 
 def registry() -> ProviderRegistry:

@@ -1064,7 +1064,10 @@ class Assistant:
         itself is the wrong authority for it. A name V.O.I.D does not know is REFUSED with the list
         of what it does know - never approximated. See void/providers/catalog.py.
         """
-        request = parse_brain(goal)
+        # The catalog is handed to the parser: this route runs ahead of the website and application
+        # matchers, so "switch to chat gpt" must stay a request to open ChatGPT. See
+        # void/providers/catalog.parse for the rule that keeps them apart.
+        request = parse_brain(goal, known=self.brains.catalog)
         if request.intent == BrainIntent.NONE:
             return None
         if request.intent == BrainIntent.WHICH:

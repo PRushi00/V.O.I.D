@@ -125,8 +125,28 @@ class Resolution:
         return bool(self.model)
 
 
-def parse(utterance: object) -> Request:
-    """Classify a brain utterance deterministically, before any model sees it."""
+#: Words that say the owner is talking about which model is thinking, whatever else is in the
+#: sentence. Their presence is enough to claim an utterance for this route.
+_SAYS_BRAIN = re.compile(r"\b(?:brain|model|llm)\b", re.IGNORECASE)
+
+#: A version number in the name. "opus 5.5" is unambiguously a model; a bare family word is not.
+_HAS_VERSION = re.compile(r"\d")
+
+
+def parse(utterance: object, *, known=None) -> Request:
+    """Classify a brain utterance deterministically, before any model sees it.
+
+    ``known`` is the catalog, when the caller has one. It matters for a specific collision rather
+    than for politeness: this route runs AHEAD of the website and application matchers, so claiming
+    every sentence that happens to contain a family word would steal them. "switch to chat gpt" is a
+    request to open ChatGPT the website, and the only honest way to tell it from "switch to GPT 5.6"
+    is that the second one names a version.
+
+    So an utterance is claimed only when the owner clearly meant a model: a version number is
+    present, or the sentence says "brain"/"model", or the name resolves to an id this installation
+    really knows. Anything else falls through to the routes behind this one - which is why a bare
+    "switch to haiku" is left alone rather than refused.
+    """
     text = " ".join(str(utterance or "").split()).strip(" .!,")
     if not text:
         return Request(Intent.NONE)
@@ -137,11 +157,18 @@ def parse(utterance: object) -> Request:
     match = _SWITCH.match(text)
     if match:
         name = match.group("name").strip(" .!,")
-        # "switch to the other window" is not a brain request. A name only counts when it begins
-        # with a family word, which is also what lets the refusal below be specific.
-        if _family_of(name) is not None:
+        # A name only counts when it begins with a family word, which is also what lets the refusal
+        # be specific about what IS available.
+        if _family_of(name) is not None and _means_a_model(text, name, known):
             return Request(Intent.SWITCH, spoken=name)
     return Request(Intent.NONE)
+
+
+def _means_a_model(text: str, name: str, known) -> bool:
+    """Did the owner clearly name a MODEL, as opposed to a website that shares a word with one?"""
+    if _SAYS_BRAIN.search(text) or _HAS_VERSION.search(_normalise(name)):
+        return True
+    return known is not None and known.resolve(name).ok
 
 
 def _normalise(name: str) -> str:

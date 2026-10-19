@@ -43,7 +43,7 @@ CI, the teardown kit, and a CI dependency fix.
 ## 3. Where the test numbers stand
 
 Baseline before this work, in this container: **4 255 pass, 38 fail, 30 skipped, 2 xfailed.**
-After it: **4 636 pass, 38 fail, 30 skipped, 2 xfailed** — the *same* 38, verified by diffing the
+After it: **4 650 pass, 38 fail, 30 skipped, 2 xfailed** — the *same* 38, verified by diffing the
 failure lists, not by counting.
 
 Those 38 are environment-bound and none is a code defect: no Windows (`pywin32`, `pythoncom`), no
@@ -55,7 +55,7 @@ python -m pytest -q 2>&1 | grep -E '^(FAILED|ERROR)' | sed 's/ - .*//' | sort
 ```
 
 New test files: `tests/test_vault.py` (79), `tests/test_judge.py` (60), `tests/test_model_catalog.py`
-(59), `tests/test_preflight.py` (28), `tests/test_focus.py` (91), `tests/test_teardown.py` (67).
+(64), `tests/test_preflight.py` (28), `tests/test_focus.py` (91), `tests/test_teardown.py` (69).
 
 `tests/guard_limits.json` `min_collected` was ratcheted to 4 700 (4 706 collected).
 
@@ -73,11 +73,15 @@ New test files: `tests/test_vault.py` (79), `tests/test_judge.py` (60), `tests/t
    reported the wrong one.
 5. **`Vault.capture` flattened every capture to one line**, which turned a structured note into one
    unreadable paragraph.
-6. **`--remote-allow-origins=*`** on the investigation browser would have let any page that found the
+6. **A spoken "switch to chat gpt" was stolen** by the brain route, which runs ahead of the
+   website matcher: any sentence containing a model family word was claimed. It now claims an
+   utterance only when the owner clearly named a *model* — a version number, the word
+   "brain"/"model", or a name the catalogue really knows — so a bare family word falls through.
+7. **`--remote-allow-origins=*`** on the investigation browser would have let any page that found the
    port drive it through the debugger. Removed after checking against a real browser that the client
    connects without it, because it sends no `Origin` header. The debugger port is now ephemeral by
    default rather than the pack's fixed 9333.
-7. **CI had never been able to collect the suite**: the workflow installed `requirements.lock` only,
+8. **CI had never been able to collect the suite**: the workflow installed `requirements.lock` only,
    which does not carry the MCP SDK, so `tests/test_mcp_server.py` failed to import and pytest
    aborted. Pre-existing on `main`; the workflow's own header said it had never run.
 
