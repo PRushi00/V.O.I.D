@@ -18,6 +18,8 @@ What lives here, and what deliberately does not:
               existing ``AppCatalog`` rather than a second discovery mechanism.
 ``verify``    did the intended state actually happen? Structured checks first, never a screenshot by
               default.
+``judge``     did the sentence the owner is about to hear claim an action that no receipt supports?
+              The last gate before an answer is reported, and the only one that reads the ANSWER.
 ``commands``  deterministic command semantics. "stop" while speaking means stop speaking, not cancel the
               task - decided here, before any model sees the words.
 ``replan``    applying an owner's mid-task change: keep completed work, invalidate what the change

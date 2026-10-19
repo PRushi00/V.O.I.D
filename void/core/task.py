@@ -14,6 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from void.security import ownership
 
 _log = logging.getLogger(__name__)
 
@@ -134,6 +135,10 @@ class TaskStore:
     def __init__(self, db_path: str | Path):
         self.db_path = str(db_path)
         self._init_db()
+        # Owner-only, because this file holds task goals, the owner's own sentences, model answers
+        # and tool output in PLAIN TEXT. It was being created 0644 until `void preflight` ran for
+        # real and said so. See void/security/ownership.py.
+        ownership.restrict(self.db_path, directory=False)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)

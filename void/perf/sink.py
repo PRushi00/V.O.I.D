@@ -18,6 +18,7 @@ from pathlib import Path
 
 from void.perf import schema
 from void.perf.rotate import CopyTruncateRotatingHandler
+from void.security import ownership
 
 FILENAME = "perf.jsonl"
 _logger = logging.getLogger("void.perf")
@@ -76,6 +77,9 @@ def configure(directory, *, max_bytes: int = 5 * 1024 * 1024, backup_count: int 
             directory.mkdir(parents=True, exist_ok=True)
             h = CopyTruncateRotatingHandler(directory / FILENAME, maxBytes=int(max_bytes),
                                             backupCount=int(backup_count), encoding="utf-8")
+            # Owner-only: the records are content-free by convention, but tool names, timings and
+            # when the owner was at their machine are still theirs. See void/security/ownership.py.
+            ownership.restrict(directory / FILENAME, directory=False)
             h.setFormatter(logging.Formatter("%(message)s"))
             _logger.addHandler(h)
             _handler = h

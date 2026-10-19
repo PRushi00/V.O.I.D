@@ -31,6 +31,7 @@ from pathlib import Path
 
 from void.memory import crypto
 from void.memory.crypto import DecryptionError, MemoryCipher, MemoryUnavailable
+from void.security import ownership
 
 KINDS = ("preference", "fact", "episode")
 ORIGINS = ("owner_stated", "voice_stated", "owner_confirmed", "agent_proposed")
@@ -115,7 +116,13 @@ class MemoryStore:
     @contextlib.contextmanager
     def _conn(self):
         try:
+            new_file = not self.path.exists()
             con = sqlite3.connect(str(self.path), timeout=self.busy_timeout_s, isolation_level=None)
+            if new_file:
+                # The rows are encrypted, so this is defence in depth rather than the only guard -
+                # but the metadata (how many memories, when they changed) is readable without the
+                # key, and that is nobody else's business either.
+                ownership.restrict(self.path, directory=False)
             try:
                 con.execute("PRAGMA secure_delete=ON")
                 con.execute("PRAGMA journal_mode=DELETE")
@@ -190,6 +197,7 @@ class MemoryStore:
 
     def _initialise(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        ownership.restrict(self.path.parent, directory=True)
         key = self._keys.get() or self._keys.create()
         cipher = MemoryCipher(key)
         with self._conn() as con:

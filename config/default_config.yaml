@@ -78,6 +78,22 @@ llm:
     num_ctx: 8192
     keep_alive: "10m"
 
+  # Model ids this installation knows exist, BEYOND the ones named above. The spoken-name resolver
+  # (void/providers/catalog.py) refuses any name that does not land on an id in this closed set -
+  # it never loads the nearest thing and reports it as what was asked for - so adding a model you
+  # have verified against your own credential is one line here:
+  #
+  #   known_models:
+  #     gemini: ["gemini-3.6-flash"]
+  #
+  # Only add an id you have actually reached; `python -m void preflight` checks the configured ones
+  # against the live Models API and fails with the id in the message when one is unreachable.
+  known_models: {}
+
+  # Spoken names for ids whose words cannot be derived from them ("the fast one" -> a specific id).
+  # Values are "provider:model-id", or a bare model id already present in the known set.
+  model_aliases: {}
+
 fast_path:
   # "Open <something not installed>" is answered here instead of being handed to the model. Measured 2026-09-24:
   # "Open Notepad++" (not installed) used to cost 12 model calls and end in "The task failed" - 1.4 min at the
@@ -500,6 +516,25 @@ memory:
   episode_ttl_days: 90          # episodic notes expire unless pinned
   max_proposals_per_task: 3
   recall_routing: true          # memory questions ("what project am I building?") are answered from memory with no tools
+
+# The notes vault: the owner's own markdown notes, searchable and citable.
+#
+# The switch is ``notes_root``, not ``enabled``. With no root set, every notes tool answers honestly
+# that no notes folder is configured and names this setting - the vault never guesses where someone's
+# notes live, because a wrong guess means indexing a whole home directory. Set it in the gitignored
+# config/local_config.yaml, to an absolute path:
+#
+#   vault:
+#     notes_root: "C:/Users/you/Documents/Notes"
+#
+# The root must sit inside security.allowed_roots and outside the protected roots; it is read through
+# the same confined file layer as every other file access, so a root outside them fails loudly rather
+# than reading anything. Note text is UNTRUSTED DATA - a note can contain a sentence written to look
+# like an instruction - and reaches a model framed as such, exactly like any other tool output.
+vault:
+  enabled: true
+  notes_root: null              # absolute path to the markdown notes folder; null = no vault
+  max_notes: 5000               # ceiling on one indexing pass, so a huge tree degrades instead of hanging
 
 # Owner preferences (V3). ROUTING SIGNALS, never permissions: a preference chooses between routes the
 # security layer has already allowed, and can neither grant a capability nor skip a confirmation.

@@ -840,6 +840,25 @@ def cmd_doctor(state_dir: str | None, no_probe: bool) -> int:
     return doctor.exit_code(checks)
 
 
+def cmd_preflight(offline: bool, read_only: bool, strict: bool, as_json: bool) -> int:
+    """Run every LIVE chain end to end and print a verdict. Exit 0 = no failures, 2 = failures.
+
+    Complements ``void doctor`` rather than replacing it: doctor reads the running process's health
+    and changes nothing; this one executes - it builds a real Assistant, indexes the real vault,
+    makes a real minimal provider call, writes and removes a real probe note. It never sends
+    anything, launches anything or touches the owner's memory store. See void/preflight/__init__.py.
+    """
+    from void.config import Config
+    from void import preflight
+
+    report = preflight.run_preflight(Config.load(), offline=offline, read_only=read_only)
+    if as_json:
+        print(json.dumps(report.as_dict(), indent=2))
+    else:
+        print(preflight.format_report(report))
+    return preflight.exit_code(report, strict=strict)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="void", description="V.O.I.D V1")
     sub = parser.add_subparsers(dest="command")
@@ -964,6 +983,17 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Also parse pre-V2.0 void.log markers (auto: only if no perf data)")
     p_report.add_argument("--json", action="store_true", dest="as_json")
 
+    p_preflight = sub.add_parser(
+        "preflight",
+        help="Run every live chain end to end and print a verdict (exit 2 on any failure)")
+    p_preflight.add_argument("--offline", action="store_true",
+                             help="Skip the probes that need the network or a credential")
+    p_preflight.add_argument("--read-only", action="store_true", dest="read_only",
+                             help="Write nothing at all: skip the vault capture probe")
+    p_preflight.add_argument("--strict", action="store_true",
+                             help="Also exit non-zero when a probe only WARNS (for CI)")
+    p_preflight.add_argument("--json", action="store_true", dest="as_json")
+
     p_doctor = sub.add_parser("doctor", help="Read-only health report (never repairs anything)")
     p_doctor.add_argument("--state-dir", default=None, help="Inspect a different state directory")
     p_doctor.add_argument("--no-probe", action="store_true",
@@ -979,7 +1009,7 @@ def main(argv: list[str] | None = None) -> int:
     known = {"run", "resume", "clarify", "approve", "deny", "set-key",
              "list-keys", "remove-key", "set-pin", "tasks", "stop",
              "clear-stop", "ui", "voice", "app", "singularity", "autostart",
-             "roots", "protect", "device", "perf", "doctor", "memory",
+             "roots", "protect", "device", "perf", "doctor", "preflight", "memory",
              "prefs", "maintenance", "-h", "--help"}
     if argv and argv[0] not in known:
         return cmd_run(" ".join(argv))
@@ -1046,6 +1076,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.command == "doctor":
         return cmd_doctor(args.state_dir, args.no_probe)
+    if args.command == "preflight":
+        return cmd_preflight(args.offline, args.read_only, args.strict, args.as_json)
     if args.command == "device":
         if args.device_action == "pair-start":
             return cmd_device_pair_start(args.name, args.minutes)

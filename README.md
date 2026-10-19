@@ -43,6 +43,20 @@ Other commands: `python -m void tasks` (list tasks),
 `python -m void resume <task-id>` (resume an interrupted task),
 `python -m void set-pin` (set an emergency-stop PIN).
 
+Check that the installation actually works, end to end:
+
+```powershell
+python -m void preflight          # runs every LIVE chain; exit 2 on any failure
+python -m void preflight --offline # skip the probes that need a credential or the network
+python -m void doctor              # read-only health of a RUNNING instance; repairs nothing
+```
+
+`preflight` executes: it builds a real Assistant, indexes the real notes vault, makes one real
+minimal provider call, asks the Models API for the configured model by id, writes and removes a real
+probe note, and engages and clears the kill switch in a scratch directory. It never sends anything,
+launches anything or touches your memory store. It ends with one line — `N pass, N fail, N warn` —
+and "done" means that line has no failures in it.
+
 ---
 
 ## How it's put together
@@ -72,7 +86,49 @@ void/
     kill_switch.py     "VOID, STOP EVERYTHING" — in-process + cross-process file
   ui/
     widget.py          minimal always-on-top circular widget (PySide6)
+  vault/               the owner's own markdown notes, retrievable and cited
+  preflight/           the live-chain harness behind `python -m void preflight`
 ```
+
+### The notes vault
+
+Point V.O.I.D at a folder of markdown notes and it can answer from them and say which note each
+answer came from. Set it in `config/local_config.yaml` (never the tracked default):
+
+```yaml
+vault:
+  notes_root: "C:/Users/you/Documents/Notes"
+```
+
+The root must sit inside `security.allowed_roots`; it is read through the same confined file layer as
+every other file access. With no root set, the notes tools answer honestly that none is configured
+rather than guessing where your notes are.
+
+The property that matters most: when the notes genuinely do not cover a question, the vault returns
+**no excerpts at all** and says so, instead of handing the model its best six near-misses to
+improvise from. See `void/vault/__init__.py`.
+
+### Receipts, or it didn't happen
+
+Before an answer written by a model reaches you, it is screened against this turn's tool receipts. If
+it claims V.O.I.D just sent, called, booked, paid, posted or deleted something and no tool in that
+turn produced that effect, the sentence is replaced with an honest one and the original is kept in
+the task's message history. Five of those six claims can never be backed, because V.O.I.D has no
+capability that sends, calls, books, pays or posts. See `void/orchestration/judge.py`.
+
+### Changing which model thinks
+
+```
+"which model are you using"        -> the exact id and provider
+"switch to gemini 3.5 flash"       -> swapped, for this process only
+"try on opus 5.5"                  -> refused, with the list of what IS available
+"go back to your normal brain"     -> back to the configured model
+```
+
+A name that does not land on an exact id V.O.I.D knows about is **refused**, never approximated — a
+loose matcher that keeps "opus" and throws away "5.5" costs you an hour of testing the wrong brain.
+The known set comes from your configuration, so adding a model you have verified is one line
+(`llm.known_models`). Swaps are runtime only: a restart always returns to the configured model.
 
 ### Security & autonomy (V1)
 
@@ -87,6 +143,11 @@ void/
   stop later).
 - **Secrets** live in the Windows Credential Manager via `keyring`, never in
   the repo or plaintext config.
+- **V.O.I.D's own state is owner-only.** The state directory is created 0700 and
+  every file in it 0600 (`void/security/ownership.py`), re-applied at every
+  start so an installation created before that was true is repaired. The task
+  database holds your goals and sentences in plain text; `void preflight` checks
+  the modes and fails loudly when they are wrong.
 
 ### Configuration
 

@@ -19,6 +19,7 @@ from void.memory import scope as memory_scope
 from void.memory.intent import RECALL_NO_ANSWER
 from void.memory.persist import Injection, MemorySafeStore, was_redacted
 from void.core.kill_switch import KillSwitch, StopRequested
+from void.orchestration import judge
 from void.core.task import CorruptedTaskState, Status, Task, TaskStore
 from void.providers.base import LLMProvider, ProviderUnavailable
 from void.providers import failures
@@ -198,6 +199,9 @@ class Agent:
         # answer, so this turn offers NO tools. It can only reduce capability - a tool call a model
         # hallucinates anyway is dropped, never executed.
         self.recall_only = recall_only
+        # See _begin_run: the per-run receipt ledger the judge reads. Initialised here as well so a
+        # caller that executes one tool without starting a run (the MCP adapter) still has one.
+        self._receipts: list[judge.Receipt] = []
         self._memory_msgs: list[dict] | None = None
         self._injection: Injection | None = None
         self._sticky_memory = False
@@ -212,6 +216,13 @@ class Agent:
         seen_tool_output = any(m.get("role") == "tool" and m.get("name") != memory_scope.PROPOSE_TOOL
                                for m in task.messages)
         self._completed_by_local_action = False
+        # Receipts for THIS run: which tools really ran and whether they really succeeded. Written
+        # only by _run_call (the single execution funnel), so nothing a model says can add one. The
+        # judge compares the final answer against this and nothing else - see
+        # void/orchestration/judge.py. Reset here, with the rest of the run's provenance: a resumed
+        # task has no receipts from the process that paused it, and inheriting a claim of success
+        # across a restart is exactly the failure the judge exists to catch.
+        self._receipts = []
         self._scope = memory_scope.RunScope(task_id=task.id, tainted=seen_tool_output)
         self._memory_msgs = None
         self._sticky_memory = was_redacted(task)          # once memory-influenced, a task stays protected
@@ -446,6 +457,9 @@ class Agent:
                   name, risk.name, bool(result.ok), time.monotonic() - t0)
         perf.emit("tool", name=name, risk=risk.name, duration_s=round(time.monotonic() - t0, 3),
                   ok=bool(result.ok))
+        # The receipt. Recorded here, and only here, for the same reason every other audit fact is:
+        # this is the one place a tool actually runs.
+        self._receipts.append(judge.Receipt(tool=name, ok=bool(result.ok)))
         first = result.summary.splitlines()[0] if result.summary else ""
         self.on_event(f"   {first}")
         kind = "ok" if result.ok else "tool_failure"
@@ -1173,9 +1187,21 @@ class Agent:
                         task.error = f"Completion refused: {reason}"
                     self.store.save(task)
                     return self._result(task)
-                task.result = final
+                # The last gate: a final answer that claims V.O.I.D sent, called, booked, paid,
+                # posted or deleted something must have a receipt from this run behind it. The
+                # model's own sentence stays in the message history above - only what the owner is
+                # TOLD is replaced, so the audit trail keeps both versions. See
+                # void/orchestration/judge.py for why the set of claims is deliberately small.
+                ruling = judge.screen(final, self._receipts)
+                task.result = ruling.answer
                 task.status = Status.COMPLETED
                 self.store.save(task)
+                if ruling.blocked:
+                    self.on_event(ruling.answer)
+                    # engine_authored: every word of the replacement comes from the judge's own
+                    # constants, so it may be spoken aloud like any other engine sentence.
+                    return AgentResult(task, task.status, task.result, task.steps,
+                                       engine_authored=True)
                 return self._result(task)
 
             # Safety cap reached.

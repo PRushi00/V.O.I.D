@@ -20,8 +20,11 @@ from void.actions.messaging import MessagingActions
 from void.actions.artifacts import ArtifactActions
 from void.actions.research import ResearchActions
 from void.actions.reference import ReferenceActions
+from void.actions.vault import VaultActions
 from void.actions.resources import ResourceActions
 from void.obs import TelemetryPolicy, configure as configure_telemetry
+from void.providers.catalog import BrainSwitch, Intent as BrainIntent, ModelCatalog
+from void.providers.catalog import parse as parse_brain
 from void.providers.policy import ProviderPolicy
 from void.a2a import A2aGateway, A2aPolicy
 from void.ui.a2ui import A2uiSession
@@ -33,6 +36,7 @@ from void.orchestration.reference import ReferenceResolver, parse_reference
 from void.orchestration.overrides import extract_overrides
 from void.maintenance import Maintenance
 from void.state import StateStore
+from void.vault import from_config as vault_from_config
 from void.orchestration.referents import (RecentThings, recent_candidates, tab_candidates,
                                           window_candidates)
 from void.actions.folders import DEFAULT_DEPTH, FolderCatalog, scan_roots
@@ -61,6 +65,7 @@ from void.memory.tool import make_tool as make_memory_tool
 from void.providers.base import LLMProvider, ProviderUnavailable
 from void.providers.registry import ProviderRegistry
 from void.security.protected import EngineProtected
+from void.security import ownership
 from void.security.risk import RiskGate
 
 _log = logging.getLogger(__name__)
@@ -194,6 +199,12 @@ class Assistant:
 
         # Persistence directory is needed early for the cross-process stop file.
         state_dir = self.config.state_dir()
+        # Owner-only, at boot and not only at creation. An installation that predates
+        # void/security/ownership.py already has a 0644 tasks.sqlite on disk, and that file holds
+        # task goals and messages in plain text; only re-applying the mode on every start fixes the
+        # machines that are already wrong. Cheap (a handful of chmods), best effort, and a no-op on
+        # Windows, where the inherited profile ACL governs instead.
+        ownership.restrict_tree(state_dir)
 
         # Security / control
         self.kill_switch = KillSwitch(
@@ -295,6 +306,13 @@ class Assistant:
                                                    policy=self.provider_policy)
         self.tools.register_all(ResearchActions(engine=lambda: self.research,
                                                 artifacts=self.artifacts).tools())
+        # The notes vault (prompt packs, Part One). A READ layer over markdown the owner already owns,
+        # inside roots the file layer already allows, so registering it grants no new reach - and the
+        # switch is the absence of ``vault.notes_root`` rather than a boolean, because the vault must
+        # never guess where someone's notes are. Built lazily: the tree is walked by the first
+        # question, not here. See void/vault/__init__.py for why absence is a first-class answer.
+        self.vault = vault_from_config(self.config, file_actions=file_actions)
+        self.tools.register_all(VaultActions(vault=lambda: self.vault).tools())
         # What V.O.I.D has recently produced or the owner recently referred to, so that "this chart" and
         # "the document I was looking at" have something to resolve against. References only: labels and
         # targets, never content and never permissions.
@@ -376,6 +394,12 @@ class Assistant:
             file_facts=lambda path: _file_facts(file_actions, path))
         # Providers
         self.providers = ProviderRegistry.from_config(self.config)
+        # Which model ids really exist, and the refusal that keeps "switch to X" honest. Built from
+        # configuration rather than from a shipped catalogue of other companies' model names, and it
+        # authorizes nothing: a swap changes which model thinks, never which capabilities exist or
+        # which data may leave - ProviderPolicy still decides that, per capability, at egress.
+        # See void/providers/catalog.py.
+        self.brains = BrainSwitch(ModelCatalog.from_config(self.config))
         # Deterministic fast path for plain "open <known app>" commands (no model call). Off switch: fast_path.enabled.
         self._fast = (FastPath(catalog,
                                answer_unknown=self.config.get("fast_path.answer_unknown_apps", True),
@@ -1013,6 +1037,31 @@ class Assistant:
         task = Task(goal="[memory command]", id="(memory)", status=Status.COMPLETED, result=reply)
         return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0)
 
+    def _brain_command(self, goal: str) -> AgentResult | None:
+        """"Switch to <model>", "go back to your normal brain", "which model are you using".
+
+        Deterministic and ahead of the model, for the same reason control commands are: which brain
+        is thinking is not a semantic judgement, and a model asked to interpret a request to replace
+        itself is the wrong authority for it. A name V.O.I.D does not know is REFUSED with the list
+        of what it does know - never approximated. See void/providers/catalog.py.
+        """
+        request = parse_brain(goal)
+        if request.intent == BrainIntent.NONE:
+            return None
+        if request.intent == BrainIntent.WHICH:
+            name, model = self.brains.active(self.providers)
+            reply = (f"{model} ({name})." if model else
+                     "No brain is available right now - no provider has a usable credential.")
+        elif request.intent == BrainIntent.REVERT:
+            _changed, reply = self.brains.revert(self.providers)
+        else:
+            _changed, reply = self.brains.switch(self.providers, request.spoken)
+        # engine_authored: the sentence is built from the catalog's own constants and from model ids
+        # that came out of configuration - never from a model, a tool or a page.
+        task = Task(goal=goal, id="(brain)", status=Status.COMPLETED, result=reply)
+        return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0,
+                           engine_authored=True)
+
     def _control_command(self, goal: str) -> AgentResult | None:
         """"stop" / "pause" / "resume" / "cancel" / "instead of that ...", decided deterministically.
 
@@ -1212,6 +1261,11 @@ class Assistant:
         handled = self._memory_command(goal)
         if handled is not None:
             return handled
+        # Which brain is thinking, before the model: a request to swap the model must not be
+        # interpreted BY the model, and an unknown name must refuse rather than load something near it.
+        brain = self._brain_command(goal)
+        if brain is not None:
+            return brain
         # A conversation that NAMES someone outranks the application matcher - see
         # _conversation_route on why it is consulted on both sides of the fast path.
         named = self._conversation_route(goal, named_only=True)
