@@ -517,6 +517,28 @@ memory:
   max_proposals_per_task: 3
   recall_routing: true          # memory questions ("what project am I building?") are answered from memory with no tools
 
+# Focus sessions: the accountability timer ("thirty minutes on this").
+#
+# It observes and accounts; it enforces nothing. There is no capability in this layer that can
+# launch, close, block or hide anything - the only output is a counter and a spoken sentence.
+#
+# PRIVACY. The name of the application or site you drift into exists for exactly one tick: it is
+# read, turned into a sentence, spoken, and dropped. Nothing in the session state or the ledger can
+# hold an identity, not even a hashed one, and tests/test_focus.py proves that with a canary label.
+# Set name_the_distraction to false and no label is derived at all; the callouts lose the name and
+# keep the point.
+#
+# The tab lane needs browser.enabled and a browser that will say which tab is in front. Without it
+# a session locks the application only and says so, rather than degrading quietly.
+#
+# The defaults below are demo speed. For real work, slower and quieter is the setting most people
+# end up at - and the honest way to choose is from the numbers in the ledger, not from memory.
+focus:
+  enabled: true
+  name_the_distraction: true     # false = never derive a label, even for one tick
+  ledger: true                   # write one aggregates-only row per finished session to focus.jsonl
+
+
 # The notes vault: the owner's own markdown notes, searchable and citable.
 #
 # The switch is ``notes_root``, not ``enabled``. With no root set, every notes tool answers honestly

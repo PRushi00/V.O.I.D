@@ -42,6 +42,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from void.focus import Phase
+
 OK, WARN, FAIL = "ok", "warn", "fail"
 
 #: Name of the note a probe writes into the owner's vault, and removes. Deliberately unmistakable:
@@ -50,6 +52,10 @@ PROBE_NOTE_TITLE = "void preflight probe"
 
 #: Question the vault probe asks after capturing, built so that only the probe note can answer it.
 PROBE_PHRASE = "preflight probe sentinel phrase zygal"
+
+#: Length of the focus session the probe starts. The shortest the engine allows, since it is ended
+#: a tick later and only exists to prove the chain is wired.
+MIN_FOCUS_MINUTES = 1
 
 
 @dataclass
@@ -393,6 +399,30 @@ def _check_vault(ctx) -> None:
                        "a question the notes do not cover returned absent, with no excerpts")
 
 
+def _check_notes_question_route(ctx) -> None:
+    """A question the owner aimed at their notes, that the notes cannot answer, is answered honestly
+    without a model being consulted at all."""
+    assistant = ctx.assistant()
+    if assistant.vault is None:
+        ctx.report.add("notes question route", WARN, "no notes folder is configured")
+        return
+    t0 = time.monotonic()
+    out = assistant._vault_route(                       # noqa: SLF001 - probing the route itself
+        "what do my notes say about " + PROBE_PHRASE)
+    if out is None:
+        ctx.report.add("notes question route", FAIL,
+                       "a notes question with no answer in the notes fell through to the model: "
+                       "'not in your notes' then depends on a model choosing to say it", _ms(t0))
+        return
+    if out.steps != 0 or not out.engine_authored:
+        ctx.report.add("notes question route", FAIL,
+                       f"answered in {out.steps} steps, engine_authored={out.engine_authored}: it "
+                       f"should be answered from V.O.I.D's own constants with no model call", _ms(t0))
+        return
+    ctx.report.add("notes question route", OK,
+                   f"answered without a model: {out.result!r}", _ms(t0))
+
+
 def _check_vault_capture(ctx) -> None:
     """A captured note is written AND retrievable immediately - then removed.
 
@@ -523,6 +553,49 @@ def _check_model_is_reachable(ctx) -> None:
                    f"{model} answered models.get ({getattr(info, 'name', model)})", _ms(t0))
 
 
+def _check_focus(ctx) -> None:
+    """A focus session really starts, really reads the foreground, and leaks no identity.
+
+    The identity check runs here and not only in the test suite because the thing it protects is a
+    property of the installation, not of the code: a session on this machine must not be able to put
+    the name of an application into its own state. ``void preflight`` is where the owner can see that
+    for themselves.
+    """
+    assistant = ctx.assistant()
+    engine = getattr(assistant, "focus", None)
+    if engine is None:
+        ctx.report.add("focus sessions", WARN, "focus.enabled is false")
+        return
+    t0 = time.monotonic()
+    line = engine.start(MIN_FOCUS_MINUTES)
+    engine.tick()
+    state = engine.state()
+    diag = engine.diag()
+    engine.end(completed=False)
+
+    leaked = [key for key, value in {**state.as_dict(), **diag}.items()
+              if isinstance(value, str) and value not in Phase.ALL]
+    if leaked:
+        ctx.report.add("focus sessions", FAIL,
+                       f"the session state carries free text in {', '.join(leaked)}: an "
+                       f"application or site name could be stored there", _ms(t0))
+        return
+    if state.phase not in Phase.ALL:
+        ctx.report.add("focus sessions", FAIL, f"unknown phase {state.phase!r}", _ms(t0))
+        return
+    if diag.get("reads", 0) < 1:
+        ctx.report.add("focus sessions", FAIL,
+                       "a tick read the foreground zero times: the sensor is not wired up", _ms(t0))
+        return
+    lane = ("the foreground could not be read here, so a session would run blind"
+            if state.blind else
+            f"locked app={state.app_locked} tab={state.tab_locked}")
+    status = WARN if state.blind else OK
+    ctx.report.add("focus sessions", status,
+                   f"started, ticked and ended with no identity in its state; {lane} "
+                   f"({line.split('.')[0]})", _ms(t0))
+
+
 def _check_optional_dependencies(ctx) -> None:
     """Which optional capability layers are installed here. Never a failure: each is opt-in."""
     wanted = {"playwright": "browser automation", "uiautomation": "desktop automation",
@@ -568,8 +641,10 @@ PROBES = (
     _check_judge,
     _check_model_refusal,
     _check_vault,
+    _check_notes_question_route,
     _check_vault_capture,
     _check_memory,
+    _check_focus,
     _check_optional_dependencies,
     _check_provider_credential,
     _check_model_is_reachable,

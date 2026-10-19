@@ -29,3 +29,8 @@ jobs:
         run: python -m pytest -q --junitxml=junit.xml
       - name: Guard against silent coverage loss
         run: python scripts/check_test_guard.py --junit junit.xml
+      # "Done means preflight passed." The hermetic suite proves the units; this proves the chains
+      # are wired together in a fresh checkout. --offline because a runner has no credential and
+      # --strict is deliberately NOT used: an absent optional layer is a warning, not a failure.
+      - name: Preflight the live chains
+        run: python -m void preflight --offline

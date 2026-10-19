@@ -87,6 +87,20 @@ CAPTURES_DIR = "captures"
 MAX_NAME_GRAM = 3
 MIN_PHONETIC_KEY = 4
 
+#: The wake word, and what a recogniser writes instead of it, removed from a question before note
+#: names are matched. The Jev pack reports this failure from its own field pass and it is the same
+#: one here: the recogniser writes a near-homophone of the assistant's name, the phonetic matcher
+#: finds a note whose title sounds like THAT, and the question is rewritten to ask about a note the
+#: owner never mentioned - a wrong answer with a confident lookup behind it. Stripping first costs
+#: nothing, because a wake word is never part of the question.
+#:
+#: Only the leading occurrence is removed: "void" in the middle of a sentence is a word.
+WAKE_WORDS = ("void", "hey void", "voit", "hey voit", "vouid", "boid", "void.", "v o i d")
+
+_WAKE = re.compile(r"\A(?:hey\s+)?(?:" + "|".join(
+    sorted((re.escape(w.removeprefix("hey ").rstrip(".")) for w in WAKE_WORDS), key=len,
+           reverse=True)) + r")[\s,.!?]+", re.IGNORECASE)
+
 _WIKILINK = re.compile(r"\[\[([^\[\]|#]+)")
 _FRONTMATTER = re.compile(r"\A---\r?\n.*?\r?\n---\r?\n", re.DOTALL)
 _HEADING = re.compile(r"^#{1,6}\s*", re.MULTILINE)
@@ -439,7 +453,9 @@ class Vault:
         called "Notes" must not turn every sentence into a lookup of it.
         """
         self._ensure()
-        words = _WORDS.findall(question or "")
+        # The wake word goes first: see WAKE_WORDS for the failure this prevents.
+        asked = _WAKE.sub("", " ".join(str(question or "").split()), count=1)
+        words = _WORDS.findall(asked)
         if not words:
             return question, ""
         keys: dict[str, str] = {}

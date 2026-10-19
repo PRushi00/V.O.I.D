@@ -36,7 +36,11 @@ from void.orchestration.reference import ReferenceResolver, parse_reference
 from void.orchestration.overrides import extract_overrides
 from void.maintenance import Maintenance
 from void.state import StateStore
+from void.vault import Verdict as VaultVerdict, VaultUnavailable
 from void.vault import from_config as vault_from_config
+from void.vault import ask as vault_ask
+from void.focus import commands as focus_commands
+from void.focus import from_assistant as focus_from_assistant
 from void.orchestration.referents import (RecentThings, recent_candidates, tab_candidates,
                                           window_candidates)
 from void.actions.folders import DEFAULT_DEPTH, FolderCatalog, scan_roots
@@ -344,6 +348,14 @@ class Assistant:
         # accepted request still goes through Assistant.run and the whole funnel, with the skill's tool
         # ceiling on top.
         self.a2a = A2aGateway(A2aPolicy.from_config(self.config))
+
+        # Focus sessions (prompt packs, Astra Part Two). Built LAZILY: the engine reads the
+        # foreground through the tools registered above, and an owner who never starts a session
+        # must not pay for a window read. `focus` is the property below; `_focus` is the instance
+        # once one exists. See void/focus/__init__.py for the privacy property that shapes it.
+        self._focus = None
+        #: True while a session has asked "what are we focusing on?" and is waiting for the answer.
+        self._awaiting_intent = False
 
         # Weekly maintenance (V3). Constructed, NOT scheduled: the runner claims its own week in the
         # state database, so whatever fires it cannot cause a second pass, and nothing here starts a
@@ -1062,6 +1074,120 @@ class Assistant:
         return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0,
                            engine_authored=True)
 
+    @property
+    def focus(self):
+        """The focus engine, built on first use. None when ``focus.enabled`` is false."""
+        if self._focus is None:
+            self._focus = focus_from_assistant(self, speak=self.on_event)
+        return self._focus
+
+    #: Said when a focus command arrives and no session is running. A CONSTANT, like every other
+    #: engine-authored line here.
+    NO_SESSION = "There is no focus session running."
+    FOCUS_OFF = "Focus sessions are switched off (focus.enabled)."
+
+    def _focus_command(self, goal: str) -> AgentResult | None:
+        """A focus-session command, decided deterministically before any model sees the words.
+
+        Whether "pause" means the session or something else, and whether "it's fine, I'm reading the
+        docs" is an excuse or a remark, are control decisions rather than semantic ones - the same
+        argument ``void/orchestration/commands.py`` makes about "stop". See void/focus/commands.py.
+        """
+        request = focus_commands.parse(goal, expecting_intent=self._awaiting_intent)
+        if request.intent == focus_commands.FocusIntent.NONE:
+            return None
+        engine = self.focus
+        if engine is None:
+            return self._engine_reply(goal, self.FOCUS_OFF, task_id="(focus)")
+
+        intents = focus_commands.FocusIntent
+        if request.intent == intents.START:
+            reply = engine.start(request.minutes)
+            engine.start_ticking()
+            self._awaiting_intent = "focusing on" in reply
+        elif request.intent == intents.INTENT:
+            reply = engine.set_intent(request.text)
+            self._awaiting_intent = False
+        elif request.intent == intents.STOP:
+            card = engine.end(completed=False)
+            engine.stop_ticking()
+            reply = card.spoken() if card.planned_minutes else self.NO_SESSION
+            self._awaiting_intent = False
+        elif request.intent == intents.STATUS:
+            state = engine.state()
+            reply = (f"{state.seconds_left / 60:.0f} minutes left, "
+                     f"{state.on_target_s / 60:.0f} on target, {state.drifts} detours."
+                     if engine.running else self.NO_SESSION)
+        elif request.intent == intents.PAUSE:
+            reply = engine.pause()
+        elif request.intent == intents.RESUME:
+            reply = engine.resume()
+        elif request.intent == intents.EXTEND:
+            reply = engine.extend(request.minutes)
+        elif request.intent == intents.SNOOZE:
+            reply = engine.snooze(request.seconds)
+        elif request.intent == intents.NAG:
+            reply = engine.nag_every(request.seconds)
+        elif request.intent == intents.EXCUSE:
+            if not engine.running:
+                return None                           # "it's fine" outside a session is a remark
+            reply = engine.excuse()
+        elif request.intent == intents.RELOCK:
+            reply = engine.relock()
+        else:                                         # unreachable: FocusIntent.ALL is closed
+            return None
+        # engine_authored: every one of those replies is built from the focus layer's own constants
+        # and numbers. None of them can carry an application name, a host or a window title - that
+        # is the privacy property in void/focus/__init__.py, asserted by its tests.
+        return self._engine_reply(goal, reply, task_id="(focus)")
+
+    #: What the owner hears when they scoped a question to their notes and the notes do not cover it.
+    #: A CONSTANT: nothing from the question, a note, a filename or a model is interpolated, which is
+    #: what lets it be spoken aloud as engine-authored text.
+    NOT_IN_NOTES = "That is not in your notes."
+
+    #: And what they hear when they asked their notes a question without having configured any.
+    NO_NOTES_CONFIGURED = ("No notes folder is configured, so I have nothing to search. Set "
+                           "vault.notes_root in config/local_config.yaml to your notes directory.")
+
+    def _vault_route(self, goal: str) -> AgentResult | None:
+        """A question the owner explicitly aimed at their own notes, which the notes cannot answer.
+
+        Only that case, and only when the owner said "my notes" - see void/vault/ask.py for why the
+        scoping has to be explicit. The point is the one the prompt packs are most insistent about:
+        "not in the vault" has to be reachable without depending on a model choosing to call a tool
+        and then choosing to be honest about the result.
+
+        Everything else about the notes is left to the ordinary agent and the ``search_notes`` tool,
+        whose result already carries the verified-or-absent header. A second answering path for the
+        cases a model handles correctly would only be a second thing to keep correct.
+        """
+        question = vault_ask.scoped_question(goal)
+        if question is None:
+            return None
+        if self.vault is None:
+            return self._engine_reply(goal, self.NO_NOTES_CONFIGURED, task_id="(notes)")
+        try:
+            recall = self.vault.search(question)
+        except VaultUnavailable as exc:
+            _log.warning("VAULT_UNAVAILABLE_ON_ROUTE reason=%s", type(exc).__name__)
+            return None                               # let the agent try; the tool reports the reason
+        if recall.verdict != VaultVerdict.ABSENT:
+            return None                               # the notes may hold it: the agent and the tool
+        _log.info("VAULT_ABSENT_ANSWERED notes=%d", self.vault.node_count)
+        return self._engine_reply(goal, self.NOT_IN_NOTES, task_id="(notes)")
+
+    def _engine_reply(self, goal: str, reply: str, *, task_id: str) -> AgentResult:
+        """A completed task whose answer is one of V.O.I.D's own constants.
+
+        ``engine_authored`` is safe to set here precisely because the caller passes a constant: no
+        note text, no filename, no model sentence and no tool summary is interpolated into any reply
+        that reaches this method.
+        """
+        task = Task(goal=goal, id=task_id, status=Status.COMPLETED, result=reply)
+        return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0,
+                           engine_authored=True)
+
     def _control_command(self, goal: str) -> AgentResult | None:
         """"stop" / "pause" / "resume" / "cancel" / "instead of that ...", decided deterministically.
 
@@ -1266,6 +1392,11 @@ class Assistant:
         brain = self._brain_command(goal)
         if brain is not None:
             return brain
+        # Focus-session control, before the matchers: "lock on this tab" said mid-session is about
+        # the session's target, not about a browser tab to open.
+        session = self._focus_command(goal)
+        if session is not None:
+            return session
         # A conversation that NAMES someone outranks the application matcher - see
         # _conversation_route on why it is consulted on both sides of the fast path.
         named = self._conversation_route(goal, named_only=True)
@@ -1289,6 +1420,12 @@ class Assistant:
         chat = self._conversation_route(goal)
         if chat is not None:
             return chat
+        # After every matcher that could claim the words ("open my notes folder" is a folder, and
+        # stays one), and before memory recall, because "my notes" is an explicit scope the owner
+        # asserted and recall routing is a heuristic about personal-sounding questions.
+        notes = self._vault_route(goal)
+        if notes is not None:
+            return notes
         route = self._recall_route(goal)
         if isinstance(route, AgentResult):
             return route

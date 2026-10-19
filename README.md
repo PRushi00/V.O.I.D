@@ -87,6 +87,7 @@ void/
   ui/
     widget.py          minimal always-on-top circular widget (PySide6)
   vault/               the owner's own markdown notes, retrievable and cited
+  focus/               the accountability timer, and the identities it never stores
   preflight/           the live-chain harness behind `python -m void preflight`
 ```
 
@@ -129,6 +130,32 @@ A name that does not land on an exact id V.O.I.D knows about is **refused**, nev
 loose matcher that keeps "opus" and throws away "5.5" costs you an hour of testing the wrong brain.
 The known set comes from your configuration, so adding a model you have verified is one line
 (`llm.known_models`). Swaps are runtime only: a restart always returns to the configured model.
+
+### Focus sessions
+
+```
+"thirty minutes on this"            -> starts a session
+"I'm working on the thumbnail sprint"  (the answer to "what are we focusing on?")
+"give me fifteen seconds"           -> quiet
+"it's okay, I'm doing research"     -> excuses the detour and refunds its seconds
+"lock on this tab"                  -> move the target to where you are now
+"how long is left"                  -> the countdown, on target minutes, detours
+"end the session"                   -> the report card
+```
+
+It observes and accounts; it enforces nothing — there is no capability in the layer that can close,
+block or hide a window. A session started while you are looking at V.O.I.D locks **nothing** until
+you settle somewhere else, because that is the one window you are guaranteed to leave.
+
+The privacy property is structural, not a promise: the name of the site or application you drift into
+is read, turned into a sentence, spoken, and dropped. Neither the session state nor the ledger has a
+field that can hold it — not even a hash — and the tests prove it with a canary label that appears
+nowhere else in the repository. `focus.name_the_distraction: false` derives no label at all. See
+`void/focus/__init__.py`.
+
+The tab lane needs `browser.enabled`; without it a session locks the application only and says so. If
+the foreground cannot be read at all, the session is `blind`: it counts nothing and accuses you of
+nothing.
 
 ### Security & autonomy (V1)
 

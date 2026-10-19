@@ -204,6 +204,27 @@ def test_a_generic_title_may_never_rewrite_a_question(vault):
         assert vault.correct_names(question)[1] == ""
 
 
+def test_the_wake_word_is_stripped_before_note_names_are_matched(tmp_path):
+    """A note whose title sounds like the assistant's name must not hijack every question."""
+    notes = {"Voit Pricing.md": "# Voit Pricing\nA title that sounds like the wake word.\n",
+             "Sideview Pricing.md": "# Sideview Pricing\nThe retainer is 2400.\n"}
+    v = Vault(write_notes(tmp_path / "notes", notes))
+    v.reload()
+    for spoken in ("Void, what is the side view pricing",
+                   "voit what is the side view pricing",
+                   "hey void what is the side view pricing"):
+        _corrected, matched = v.correct_names(spoken)
+        assert matched == "Sideview Pricing", spoken
+
+
+def test_the_wake_word_is_only_stripped_from_the_front(tmp_path):
+    """In the middle of a sentence it is an ordinary word."""
+    v = Vault(write_notes(tmp_path / "notes",
+                          {"Sideview Pricing.md": "# Sideview Pricing\nthe retainer\n"}))
+    v.reload()
+    assert v.correct_names("the void between stars")[0] == "the void between stars"
+
+
 def test_a_correction_is_reported_rather_than_applied_silently(vault):
     recall = vault.search("open my notes on side view pricing")
     assert recall.corrected_question and "Sideview Pricing" in recall.corrected_question
@@ -363,3 +384,101 @@ def test_a_vault_is_not_configured_by_default(tmp_path):
     a = Assistant(config=cfg)
     assert a.vault is None
     assert not a.tools.execute("search_notes", {"question": "anything"}).ok
+
+
+# ================================================================== a question aimed at the notes
+
+@pytest.mark.parametrize("utterance, question", [
+    ("what do my notes say about the retainer", "the retainer"),
+    ("do my notes mention the kickoff", "the kickoff"),
+    ("does my vault cover pricing", "pricing"),
+    ("check my notes for the invoice date", "the invoice date"),
+    ("search my notes for pricing", "pricing"),
+    ("look in my notes for the discount cap", "the discount cap"),
+    ("according to my notes, when is the kickoff", "when is the kickoff"),
+    ("in my notes, what is the retainer", "what is the retainer"),
+    ("from my notes, the discount cap", "the discount cap"),
+    ("ask my notes about pricing", "pricing"),
+    ("what do I have on pricing in my notes", "pricing"),
+    ("Void, what do my notes say about pricing?", "pricing"),
+    ("okay, check my notes for the retainer", "the retainer"),
+])
+def test_an_explicitly_notes_scoped_question_is_recognised(utterance, question):
+    from void.vault.ask import scoped_question
+    assert scoped_question(utterance) == question
+
+
+@pytest.mark.parametrize("utterance", [
+    # ordinary questions: the notes may or may not be the best source, and that is the agent's call
+    "what is the retainer", "when is the kickoff", "what is the weather in Paris",
+    # about notes, but not a question for them
+    "open my notes folder", "open my notes", "my notes are a mess", "take notes on this",
+    "remember that pricing is 2400", "write a note about pricing",
+    # scoped but asking nothing
+    "what do my notes say", "check my notes", "ask my notes",
+    # the notes of a meeting or a document, which are not the owner's vault
+    "what do the notes on that document say", "read the notes in the margin",
+    "", "   ",
+])
+def test_an_utterance_that_is_not_a_question_for_the_notes_is_left_alone(utterance):
+    from void.vault.ask import scoped_question
+    assert scoped_question(utterance) is None
+
+
+def assistant_with_notes(tmp_path, **over):
+    root = write_notes(tmp_path / "work" / "Notes")
+    data = {"app": {"state_dir": str(tmp_path / "state")},
+            "security": {"allowed_roots": [str(tmp_path / "work")]},
+            "memory": {"enabled": False},
+            "vault": {"notes_root": str(root)}}
+    data.update(over)
+    return Assistant(config=Config(data))
+
+
+def test_a_notes_question_the_notes_cannot_answer_is_answered_without_a_model(tmp_path):
+    """The sharp end of "not in the vault": it must not depend on a model choosing to be honest."""
+    a = assistant_with_notes(tmp_path)
+    out = a.run("what do my notes say about the weather in Paris")
+    assert out.steps == 0 and out.engine_authored is True
+    assert out.result == a.NOT_IN_NOTES
+
+
+def test_the_honest_answer_carries_no_untrusted_text(tmp_path):
+    """engine_authored means spoken aloud, so not one character may come from a note or a filename."""
+    a = assistant_with_notes(tmp_path)
+    out = a.run("check my notes for the quantum flux capacitor")
+    assert out.result == a.NOT_IN_NOTES
+    for note in a.vault.notes():
+        assert note.title not in out.result and note.path not in out.result
+
+
+def test_a_notes_question_the_notes_can_answer_goes_to_the_agent_and_its_tool(tmp_path):
+    """No second answering path: the tool result already carries the verified header."""
+    a = assistant_with_notes(tmp_path)
+    assert a._vault_route("what do my notes say about the sideview retainer") is None
+
+
+def test_asking_the_notes_with_no_notes_folder_configured_names_the_setting(tmp_path):
+    (tmp_path / "work").mkdir(parents=True, exist_ok=True)
+    a = Assistant(config=Config({"app": {"state_dir": str(tmp_path / "state")},
+                                 "security": {"allowed_roots": [str(tmp_path / "work")]},
+                                 "memory": {"enabled": False}}))
+    out = a.run("what do my notes say about the retainer")
+    assert out.steps == 0 and out.engine_authored is True
+    assert "vault.notes_root" in out.result
+
+
+def test_opening_the_notes_folder_is_still_a_folder_and_not_a_question(tmp_path):
+    """The route sits after every matcher that could claim these words, deliberately."""
+    a = assistant_with_notes(tmp_path)
+    assert a._vault_route("open my notes folder") is None
+    assert a._vault_route("open my notes") is None
+
+
+def test_a_vault_that_cannot_be_read_falls_through_rather_than_claiming_absence(tmp_path):
+    """"That is not in your notes" would be a lie when the truth is "I could not read them"."""
+    a = assistant_with_notes(tmp_path)
+    import shutil
+    shutil.rmtree(tmp_path / "work" / "Notes")
+    a.vault._loaded = False
+    assert a._vault_route("what do my notes say about the retainer") is None

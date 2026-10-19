@@ -68,7 +68,8 @@ def test_every_chain_that_matters_is_actually_probed(home):
     for chain in ("assembly", "source on disk", "state file permissions", "engine protection",
                   "path confinement", "task store", "kill switch", "risk gate", "receipt judge",
                   "model refusal", "vault index", "vault recall", "vault honesty",
-                  "vault capture", "memory round trip", "provider credential",
+                  "notes question route", "vault capture", "memory round trip",
+                  "focus sessions", "provider credential",
                   "model reachable"):
         assert chain in names, f"{chain} is no longer probed"
 
