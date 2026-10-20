@@ -150,6 +150,29 @@ class FocusCardView:
 
     @classmethod
     def create(cls, parent=None) -> "FocusCardView | None":
+        # Qt ABORTS THE PROCESS if a QWidget is constructed with no QApplication - "QWidget: Must
+        # construct a QApplication before a QWidget" is a fatal abort, not a Python exception, so
+        # the try below cannot catch it. On Linux without a display the import or the widget raises
+        # and is caught; on Windows PySide6 imports cleanly and the construction kills the
+        # interpreter. That is exactly how this crashed CI at 29% of the suite.
+        #
+        # Two guards, both following void/ui/tray_indicator.py, which solved this first:
+        #   * never make a real window from a test process - a desktop side effect per run;
+        #   * require an EXISTING QApplication. One is deliberately not created here: the runtime
+        #     owns the application object, and a panel that quietly started a second one would be
+        #     taking over the process's event loop to draw a courtesy.
+        try:
+            from void.runtime.diagnostics import _running_under_pytest
+            if _running_under_pytest():
+                return None
+        except Exception:                       # noqa: BLE001 - the guard must not be the failure
+            pass
+        try:
+            from PySide6.QtWidgets import QApplication
+            if QApplication.instance() is None:
+                return None
+        except Exception:                       # noqa: BLE001 - no Qt at all: same answer
+            return None
         try:
             from PySide6.QtCore import Qt
             from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget

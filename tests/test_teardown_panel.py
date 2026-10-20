@@ -421,9 +421,78 @@ def test_importing_the_module_does_not_import_qt():
     assert done.returncode == 0, f"importing void.teardown.panel pulled in Qt:\n{done.stderr}"
 
 
-def test_the_view_declines_rather_than_raising_when_there_is_no_display():
-    view = TeardownPanelView.create()
-    assert view is None or isinstance(view, TeardownPanelView)
+def test_the_view_never_constructs_a_widget_without_a_qapplication(monkeypatch):
+    """The guard that matters, exercised on the dangerous path rather than inferred.
+
+    Qt ABORTS the process - "QWidget: Must construct a QApplication before a QWidget" is a fatal
+    abort, not a Python exception, so no try/except can catch it. On Linux with no display the
+    import raises and is caught; on Windows PySide6 imports cleanly and the construction kills the
+    interpreter. That is how this crashed CI a third of the way through the suite, mid-run, with no
+    failure summary and no traceback at all.
+
+    A FAKE PySide6.QtWidgets is injected rather than patching the real one, so this runs identically
+    on a machine whose Qt cannot even be imported (this container has no libEGL). The pytest guard
+    is switched off deliberately, so the QApplication check is the thing under test, and a bomb
+    stands in for the widget: if the factory reaches it, this test fails loudly instead of the whole
+    run dying silently.
+    """
+    import sys
+    import types
+
+    from void.runtime import diagnostics
+
+    monkeypatch.setattr(diagnostics, "_running_under_pytest", lambda: False)
+
+    reached = []
+
+    class FakeApplication:
+        @staticmethod
+        def instance():
+            return None
+
+    def bomb(*_a, **_k):
+        reached.append(True)
+        raise AssertionError("a QWidget was constructed with no QApplication - Qt would abort here")
+
+    widgets = types.ModuleType("PySide6.QtWidgets")
+    widgets.QApplication = FakeApplication
+    widgets.QWidget = bomb
+    widgets.QLabel = bomb
+    widgets.QVBoxLayout = bomb
+    core = types.ModuleType("PySide6.QtCore")
+    core.Qt = types.SimpleNamespace(FramelessWindowHint=1, WindowStaysOnTopHint=2, Tool=4,
+                                    WA_ShowWithoutActivating=8, NoFocus=0)
+    package = types.ModuleType("PySide6")
+    package.QtWidgets = widgets
+    package.QtCore = core
+    monkeypatch.setitem(sys.modules, "PySide6", package)
+    monkeypatch.setitem(sys.modules, "PySide6.QtWidgets", widgets)
+    monkeypatch.setitem(sys.modules, "PySide6.QtCore", core)
+
+    assert TeardownPanelView.create() is None
+    assert not reached, "the factory reached the widget constructor"
+
+
+def test_the_view_makes_no_real_window_from_a_test_process():
+    """The second guard, and the reason it is first: a factory that built a real always-on-top
+    window would put one on the developer's desktop on every run of the suite. Same rule as
+    void/ui/tray_indicator.py, which found this class of problem first.
+    """
+    assert TeardownPanelView.create() is None
+
+
+def test_the_factory_never_starts_a_qapplication_of_its_own():
+    """A panel that quietly created one would be taking over the process's event loop to draw a
+    courtesy. The runtime owns the application object; this asks whether one exists."""
+    import ast
+    import inspect
+    import textwrap
+
+    src = inspect.getsource(TeardownPanelView.create)
+    for node in ast.walk(ast.parse(textwrap.dedent(src))):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            assert node.func.id != "QApplication", "the factory constructs a QApplication"
+    assert "QApplication.instance()" in src
 
 
 class FakeLabel:
