@@ -336,6 +336,53 @@ def _check_judge(ctx) -> None:
                    "unbacked claim blocked; an ordinary answer and a backed claim untouched")
 
 
+def _check_invoice_arithmetic(ctx) -> None:
+    """A model's wrong arithmetic really is overridden, and the ledger really does number in sequence.
+
+    Executed, not inspected: a payload with a deliberately wrong tax and total goes through the real
+    engine, and a real ledger in the scratch directory issues two numbers. No model is needed - the
+    whole point of the rule is that the model's figures are not an input.
+    """
+    from decimal import Decimal
+
+    from void.billing import Ledger, build, check_number
+
+    payload = {"client": "Preflight", "currency": "GBP", "tax_rate": "0.20",
+               "items": [{"description": "a day", "quantity": "2", "unit_price": "450.00"}],
+               "subtotal": "900.00", "tax": "999.99", "total": "4299.99"}
+    invoice = build(payload, number="VOID-2026-0001", issued="2026-01-01")
+    if invoice.tax != Decimal("180.00") or invoice.total != Decimal("1080.00"):
+        ctx.report.add("invoice arithmetic", FAIL,
+                       f"the model's figures were not overridden: tax {invoice.tax}, "
+                       f"total {invoice.total}")
+        return
+    if len(invoice.discrepancies) != 2:
+        ctx.report.add("invoice arithmetic", FAIL,
+                       "the override was not recorded, so a model that cannot add up leaves no trace")
+        return
+    ledger = Ledger(path=ctx.scratch / "invoices.jsonl", prefix="VOID")
+    first = ledger.next_number(year=2026)
+    ledger.record(build(payload, number=first, issued="2026-01-01"))
+    second = ledger.next_number(year=2026)
+    if not (check_number(first).endswith("0001") and check_number(second).endswith("0002")):
+        ctx.report.add("invoice arithmetic", FAIL,
+                       f"the ledger did not number in sequence: {first} then {second}")
+        return
+    try:
+        ledger.record(build(payload, number=first, issued="2026-01-01"))
+    except Exception:
+        pass
+    else:
+        ctx.report.add("invoice arithmetic", FAIL, "an invoice number was reused")
+        return
+    if invoice.delivered:
+        ctx.report.add("invoice arithmetic", FAIL, "an invoice reported itself as delivered")
+        return
+    ctx.report.add("invoice arithmetic", OK,
+                   "two wrong figures overridden and recorded; numbers issued in sequence, "
+                   "never reused, nothing claimed as sent")
+
+
 def _check_model_refusal(ctx) -> None:
     """A model name this installation does not know is refused, not approximated."""
     from void.providers.catalog import ModelCatalog
@@ -699,6 +746,7 @@ PROBES = (
     _check_risk_gate,
     _check_judge,
     _check_model_refusal,
+    _check_invoice_arithmetic,
     _check_vault,
     _check_notes_question_route,
     _check_vault_capture,

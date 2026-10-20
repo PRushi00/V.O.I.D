@@ -243,7 +243,7 @@ class Assistant:
         self.provider_policy = ProviderPolicy.from_config(self.config)
 
         # Tools (actions)
-        file_actions = FileActions(
+        self.files = file_actions = FileActions(
             allowed_roots=self.config.allowed_roots(),
             delete_to_recycle_bin=self.config.get(
                 "security.delete_to_recycle_bin", True),

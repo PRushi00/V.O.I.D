@@ -1040,6 +1040,89 @@ def cmd_teardown_last(as_json: bool) -> int:
     return 0
 
 
+def cmd_invoice(description: str, kind: str, out: str, as_json: bool) -> int:
+    """Turn a description of work into an invoice: strict JSON in, Python's arithmetic out.
+
+    The model describes WHAT was done. Every figure is recomputed here and overrides whatever the
+    model said, and any disagreement is printed and put on the document rather than quietly fixed -
+    a model that cannot add up is a fact about the run.
+
+    Nothing is sent. V.O.I.D has no invoice transport, so this writes a document and records a
+    numbered ledger row, and says so in those words.
+    """
+    from void.app import Assistant
+    from void.billing import INVOICE_SYSTEM_PROMPT, InvoiceError, Ledger, issue, parse_strict
+    from void.config import Config
+
+    config = Config.load()
+    assistant = Assistant(config=config)
+    try:
+        provider = assistant.providers.select()
+    except Exception as exc:
+        print(f"No brain is available to read the work description ({exc}). Nothing was written.")
+        return 2
+
+    reply = provider.generate([{"role": "system", "content": INVOICE_SYSTEM_PROMPT},
+                               {"role": "user", "content": description}])
+    ledger = Ledger.from_config(config)
+    try:
+        payload = parse_strict(reply.text)
+        result = issue(payload, ledger=ledger, kind=kind)
+    except InvoiceError as bad:
+        # Refused, not repaired. An ambiguous invoice is one to stop on.
+        print(f"No invoice was created: {bad}")
+        return 2
+
+    invoice = result.invoice
+    target = out or f"invoice-{invoice.number}.{kind}"
+    saved = _save_document(assistant, target, result.document)
+
+    if as_json:
+        print(json.dumps({**invoice.as_dict(), "document": saved,
+                          "units": result.units, "unit_name": result.unit_name,
+                          "delivered": False, "delivery": result.delivery}, indent=2))
+        return 0
+
+    print(f"{invoice.number}  {invoice.issued}  {invoice.client}")
+    for item in invoice.items:
+        print(f"  {item.description}: {item.quantity} x {invoice.currency} {item.unit_price} "
+              f"= {invoice.currency} {item.total}")
+    print(f"  subtotal {invoice.currency} {invoice.subtotal}")
+    if invoice.tax_rate:
+        print(f"  tax at {invoice.tax_rate * 100:g}%  {invoice.currency} {invoice.tax}")
+    print(f"  TOTAL    {invoice.currency} {invoice.total}")
+    if invoice.discrepancies:
+        print("\nRecomputed (the model's figures were overridden):")
+        for bad in invoice.discrepancies:
+            print(f"  - {bad.rendered()}")
+    print(f"\ndocument: {saved or '(not saved)'} ({result.units} {result.unit_name})")
+    print(f"ledger:   {ledger.path}")
+    print(result.delivery)
+    return 0 if saved else 1
+
+
+def _save_document(assistant, target: str, payload: bytes) -> str:
+    """Write the document through the confined file layer, never with a bare open().
+
+    Returns the path written, or "" when it could not be. Binary-safe: an XLSX or DOCX is a ZIP, and
+    a text-mode write corrupts it.
+    """
+    files = getattr(assistant, "files", None)
+    writer = getattr(files, "write_bytes", None)
+    if not callable(writer):
+        print("This build cannot save binary documents, so the invoice was not written.")
+        return ""
+    try:
+        out = writer(target, payload)
+    except Exception as exc:                    # noqa: BLE001
+        print(f"The document could not be saved: {exc}")
+        return ""
+    if not getattr(out, "ok", False):
+        print(f"The document could not be saved: {getattr(out, 'summary', 'refused')}")
+        return ""
+    return str(getattr(out, "data", target) or target)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="void", description="V.O.I.D V1")
     sub = parser.add_subparsers(dest="command")
@@ -1192,6 +1275,13 @@ def build_parser() -> argparse.ArgumentParser:
         "last", help="Show the most recent teardown note (reads the vault; needs no browser)")
     p_td_last.add_argument("--json", action="store_true", dest="as_json")
 
+    p_invoice = sub.add_parser(
+        "invoice", help="Turn a description of work into an invoice (Python does the arithmetic)")
+    p_invoice.add_argument("description", help="What the work was, in your own words")
+    p_invoice.add_argument("--kind", default="pdf", help="pdf (default), docx, xlsx")
+    p_invoice.add_argument("--out", default="", help="Where to write it (default invoice-<number>.<kind>)")
+    p_invoice.add_argument("--json", action="store_true", dest="as_json")
+
     p_doctor = sub.add_parser("doctor", help="Read-only health report (never repairs anything)")
     p_doctor.add_argument("--state-dir", default=None, help="Inspect a different state directory")
     p_doctor.add_argument("--no-probe", action="store_true",
@@ -1208,7 +1298,7 @@ def main(argv: list[str] | None = None) -> int:
              "list-keys", "remove-key", "set-pin", "tasks", "stop",
              "clear-stop", "ui", "voice", "app", "singularity", "autostart",
              "roots", "protect", "device", "perf", "doctor", "preflight", "teardown", "memory",
-             "prefs", "maintenance", "-h", "--help"}
+             "prefs", "maintenance", "invoice", "-h", "--help"}
     if argv and argv[0] not in known:
         return cmd_run(" ".join(argv))
 
@@ -1276,6 +1366,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_doctor(args.state_dir, args.no_probe)
     if args.command == "preflight":
         return cmd_preflight(args.offline, args.read_only, args.strict, args.as_json)
+    if args.command == "invoice":
+        return cmd_invoice(args.description, args.kind, args.out, args.as_json)
     if args.command == "teardown":
         if args.teardown_action == "diag":
             return cmd_teardown_diag(args.as_json)

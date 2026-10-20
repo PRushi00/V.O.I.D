@@ -87,6 +87,7 @@ void/
   ui/
     widget.py          minimal always-on-top circular widget (PySide6)
     focus_card.py      the countdown card: a pure presenter, and a view that only paints it
+  billing/             the invoice engine: the model describes, Python does the arithmetic
   vault/               the owner's own markdown notes, retrievable and cited
   focus/               the accountability timer, and the identities it never stores
   teardown/            website teardown: a clean browser, REA, and a cited note
@@ -195,6 +196,27 @@ python -m void teardown last                 # the most recent note: title, path
 
 That reads your vault, so it needs no browser, no Node and no REA — the note is the record. It exits
 2 when there is nothing to show, so a script can tell "none yet" from "here it is".
+
+### Invoices, where the model never does the sums
+
+```powershell
+python -m void invoice "two days of design for Sideview at 450 a day, 20% VAT"
+```
+
+The model reads your description and returns strict JSON: descriptions, quantities, unit prices. It
+is **not** asked to add anything up, and if it supplies a total anyway that figure is recomputed,
+overridden, and **printed on the invoice** as having been overridden — a model that cannot add up is
+a fact about the run, and quietly fixing it would hide the only evidence of it.
+
+Money is `Decimal` throughout, never `float`, rounded half-up the way a person does it on paper.
+Invoice numbers come out of the ledger itself in sequence, gap-free and never reused; the ledger is
+JSON lines at mode 0600, because it names your clients and what each was charged. The document goes
+through the same artifact layer as everything else, which re-opens what it wrote — and the ledger row
+is written only after that inspection passes, so a failed render never burns a number.
+
+**Nothing is sent.** There is no invoice transport configured, so the command says so in those
+words, the invoice records `delivered: false`, and there is no code path that can set it true. If
+anything ever told you otherwise, the receipt judge would block the sentence for want of a receipt.
 
 ### The focus card
 

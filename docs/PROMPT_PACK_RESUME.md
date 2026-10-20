@@ -37,6 +37,7 @@ V.O.I.D's own layout) are in SOURCES §4 with the reasoning.
 | Teardown panel and reader | `void/teardown/panel.py` | `python -m void teardown last`; `run` prints the eight steps live |
 | Focus countdown card | `void/ui/focus_card.py` | starts with a session; tints amber on drift |
 | Screen-watch organ | `void/perception/stillness.py` | `screen.enabled` **and** `screen.watch_enabled`, both false by default |
+| Invoice engine | `void/billing/` | `python -m void invoice "two days for Acme at 450 a day"` |
 | State files owner-only | `void/security/ownership.py` | `python -m void preflight` ("state file permissions") |
 
 Each commit on the branch carries a full message: the first tranche (preflight, vault, judge, model
@@ -47,7 +48,7 @@ previously-declined items above.
 ## 3. Where the test numbers stand
 
 Baseline before this work, in this container: **4 255 pass, 38 fail, 30 skipped, 2 xfailed.**
-After it: **4 822 pass, 28 fail, 34 skipped, 2 xfailed.** Those 28 are a *subset* of the baseline 38 -
+After it: **4 897 pass, 28 fail, 34 skipped, 2 xfailed; 4 961 collected.** Those 28 are a *subset* of the baseline 38 -
 ten were fixed along the way (see the CI table below) and **no new failure appeared**, established
 by diffing the before and after lists rather than by comparing their lengths.
 
@@ -89,9 +90,10 @@ two folder tests still fail in this container for one checked reason - `open_pat
 
 New test files: `tests/test_vault.py` (80), `tests/test_judge.py` (60), `tests/test_model_catalog.py`
 (70), `tests/test_preflight.py` (28), `tests/test_focus.py` (95), `tests/test_teardown.py` (67),
-`tests/test_focus_card.py` (48), `tests/test_teardown_panel.py` (57), `tests/test_stillness.py` (37).
+`tests/test_focus_card.py` (48), `tests/test_teardown_panel.py` (57), `tests/test_stillness.py` (37),
+`tests/test_invoice.py` (75).
 
-`tests/guard_limits.json`: `min_collected` ratcheted to 4 850 (4 886 collected, so 36 of margin -
+`tests/guard_limits.json`: `min_collected` ratcheted to 4 920 (4 961 collected, so 41 of margin -
 the floor is deliberately not flush against the count). `max_skipped` raised 6 -> 14, which is
 derived rather than guessed: the 10 that windows-latest already skipped, plus the 4 per-device
 precondition gates below. **Correction:** two earlier PR comments said this needed raising "from 4
@@ -187,9 +189,13 @@ means, keeps nothing, writes nothing, has no provider to call, needs two switche
 to false, and decides only WHEN the screen has been still — never what is on it. The original
 reasoning is kept in the ledger beside the new status rather than deleted.
 
-The invoice engine (P6.4) is the one row still DECLINED. Its delivery leg is genuinely blocked on
-Telegram; the engine itself is not, and the one rule in it that generalises — never trust a model's
-arithmetic — is written down.
+The invoice engine (P6.4) is built too, and **the ledger now has no DECLINED rows at all**: 49
+VERIFIED, 12 BLOCKED, 9 ALREADY_SATISFIED, 6 PARTIAL, 2 INAPPLICABLE, 1 CONFLICTING. Its **delivery
+leg is still blocked** on Telegram and is reported as such rather than stubbed — `delivered` is
+false, no code path can set it true, and a syntax-tree walk asserts the module imports no transport
+and calls nothing that sends. What is built is the part that generalises: the model describes the
+work, Python recomputes every figure and overrides the model's, and the override is recorded on the
+invoice rather than quietly applied.
 
 ## 7. If something here breaks
 
