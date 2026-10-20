@@ -10,6 +10,16 @@ status). Read those for *why*; read this for *where things stand*.
 
 ---
 
+The other durable artifacts the directive asks for:
+
+| Document | What it is for |
+| --- | --- |
+| `PROMPT_PACK_SOURCES.md` | the archive inventory, the prompt-sequence map, and every conflict resolved against the packs |
+| `PROMPT_PACK_REQUIREMENTS.md` | the requirement-to-evidence ledger: every requirement, its status, and the test or probe behind it |
+| `PROMPT_PACK_ARCHITECTURE.md` | where each new module attaches, what it may not do, and the three paths worth tracing |
+| `PROMPT_PACK_DECISIONS.md` | the consequential decisions, what was rejected, and what would change each one |
+| **this file** | where the work stands, the numbers, the defects found, and what is blocked on what |
+
 ## 1. What the task was
 
 A ZIP of seven "Build Your Own Jarvis" prompt packs (111 pages, all read) was supplied with an
