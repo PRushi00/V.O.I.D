@@ -563,6 +563,7 @@ class FastPath:
             calls.append(DirectCall("launch_app", {"name": key}, f"Opening {shown}."))
 
         match = NameMatch()
+        catalog_down = False
         if self.catalog is not None:
             # Spoken names differ from installed ones in ways that are settled deterministically - punctuation
             # ("Opera-GX"), spacing ("Whats App"), letters spelled out by speech-to-text ("Opera G X"), an omitted
@@ -572,12 +573,21 @@ class FastPath:
             try:
                 match = self.catalog.resolve_name(phrase)
             except ComputerBackendError:
-                if not calls:
-                    return Decision(None, "discovery", matched=True)
+                catalog_down = True
             except Exception:                        # noqa: BLE001 - discovery must never break a command
                 _log.exception("FAST_PATH_CATALOG_FAILED")
-                if not calls:
-                    return Decision(None, "discovery", matched=True)
+                catalog_down = True
+        if catalog_down and not calls:
+            # What failed is the APPLICATION catalog, and a folder request does not need it: the
+            # folder index is a separate catalog with its own guard, two lines down. Returning
+            # "discovery" here instead skipped it, so on any machine whose application backend is
+            # unavailable "open my <name> folder" fell through to the model - the exact 41-second
+            # round trip this route exists to remove, and invisible on a desktop where the backend
+            # answers. Try the folder index before giving up.
+            folder = self._folder(phrase)
+            if folder is not None:
+                return folder
+            return Decision(None, "discovery", matched=True)
         entry = match.entry
         if (entry is not None and strict and match.tier not in _SPLIT_TIERS
                 and len(phrase.split(" ")) < _SPLIT_PREFIX_MIN_WORDS):

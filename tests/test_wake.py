@@ -229,6 +229,49 @@ def test_optional_dependency_absence_fails_cleanly(tmp_path):
         pytest.skip("openwakeword installed; missing-dependency path not hit")
 
 
+def test_the_always_on_preprocessor_is_pinned_to_one_core(tmp_path, monkeypatch):
+    """The bound must reach the library, not just sit on the wrapper.
+
+    openWakeWord pins its CLASSIFIER sessions to one thread itself, but the melspectrogram and
+    embedding sessions - the ones that run on every single frame, forever - are sized by the
+    ``ncpu`` its Model forwards to AudioFeatures (openwakeword 0.6.0: model.py:213, utils.py:42-84).
+    One is also the library's default, so this test is not guarding today's behaviour but the
+    hand-off: if the kwarg stopped being passed, a future release that relaxed its default would
+    put an always-on ONNX spin-wait on every core and nothing would notice. That is the 20.6-cores
+    of idle load in docs/VOICE_LATENCY_2026-09-23.md.
+
+    A fake ``openwakeword.model`` module is injected so this runs identically with or without the
+    real package, which has no Linux wheel for current CPython.
+    """
+    import sys
+    import types
+
+    seen = {}
+
+    class _FakeModel:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+    module = types.ModuleType("openwakeword.model")
+    module.Model = _FakeModel
+    package = types.ModuleType("openwakeword")
+    package.model = module
+    monkeypatch.setitem(sys.modules, "openwakeword", package)
+    monkeypatch.setitem(sys.modules, "openwakeword.model", module)
+
+    model_file = tmp_path / "hey_void.onnx"
+    model_file.write_bytes(b"not-a-real-model")
+    OpenWakeWordDetector(model_path=str(model_file)).start()
+    assert seen["ncpu"] == 1, f"the thread bound did not reach the library: {seen}"
+
+    OpenWakeWordDetector(model_path=str(model_file), cpu_threads=3).start()
+    assert seen["ncpu"] == 3
+    # Never 0 or negative: in ONNX Runtime both mean "use every core".
+    for bad in (0, -4, None, "nonsense"):
+        OpenWakeWordDetector(model_path=str(model_file), cpu_threads=bad).start()
+        assert seen["ncpu"] == 1, f"cpu_threads={bad!r} escaped the clamp"
+
+
 def test_core_and_wake_import_without_optional_stack():
     # Importing core + the wake module must work even though openwakeword is not
     # installed (the heavy import is lazy inside OpenWakeWordDetector._load).

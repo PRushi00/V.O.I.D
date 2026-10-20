@@ -181,8 +181,21 @@ class ObserveActions:
                 label = labels[key]
                 counts.append(f"{len(rows)} {label}" + ("" if len(rows) == 1 else "s"))
         if not counts:
-            return ToolResult.failure(
-                "I could not find any device of that kind on this machine." + _unavailable_note(reading))
+            # An empty inventory is an ANSWER, not a failure. ``Reading`` exists precisely to
+            # separate "nothing is attached" from "nothing could be read" - its own docstring says
+            # so - and this was the caller that threw the distinction away. The cost was not
+            # cosmetic: ToolResult.failure makes the agent's completion guard report an unresolved
+            # execution failure, so on a machine with no audio or camera "what is attached?" could
+            # not be answered at all, which is the one kind of machine where the answer matters.
+            # Failure is now reserved for the case where every source asked for was unreadable.
+            data = _payload(reading, "devices")
+            data["values"] = kept
+            if all(key in reading.unavailable for key in keys):
+                return ToolResult.failure(
+                    "I could not read the device inventory on this machine." + _unavailable_note(reading))
+            return ToolResult.success(
+                "Nothing of that kind is attached to this machine." + _unavailable_note(reading),
+                data=data)
         data = _payload(reading, "devices")
         data["values"] = kept
         return ToolResult.success("Attached: " + ", ".join(counts) + "." + _unavailable_note(reading),
