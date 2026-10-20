@@ -40,6 +40,7 @@ from void.vault import Verdict as VaultVerdict, VaultUnavailable
 from void.vault import from_config as vault_from_config
 from void.vault import ask as vault_ask
 from void.teardown import address as teardown_address
+from void.teardown import panel as teardown_panel
 from void.teardown import from_config as teardown_from_config
 from void.focus import commands as focus_commands
 from void.focus import from_assistant as focus_from_assistant
@@ -1097,6 +1098,11 @@ class Assistant:
         long-running job with a model call in the middle of it, which belongs to a caller that can
         wait for it (``python -m void teardown run``), not to a synchronous answer.
         """
+        # "show me the last teardown" is a request to READ, not to run one, and it is answered
+        # from the vault rather than from the kit - so it is checked first and does not care whether
+        # a browser, REA or Node is installed on this machine. The note is the record.
+        if teardown_panel.asked_for_the_last(goal):
+            return self._engine_reply(goal, self._last_teardown_line(), task_id="(teardown)")
         address = teardown_address.parse(goal)
         if address is None:
             return None
@@ -1116,6 +1122,21 @@ class Assistant:
         return self._engine_reply(
             goal, f"Ready to take that apart. Run: python -m void teardown run {address}",
             task_id="(teardown)")
+
+    def _last_teardown_line(self) -> str:
+        """What to say when asked for the most recent teardown.
+
+        Absence is reported as absence, with no excerpt and no guess, exactly as the notes vault
+        answers a question its notes do not cover: there is nothing to improvise from and saying so
+        is the whole answer.
+        """
+        found = teardown_panel.last_teardown(self.vault)
+        if not found.found:
+            return found.reason
+        line = f"The last one was {found.title}."
+        if found.excerpt:
+            line += f" {found.excerpt}"
+        return (line[:600] + f" The note is at {found.path}")[:900]
 
     @property
     def focus(self):

@@ -23,13 +23,28 @@ lifetime here, and clearing/rearming it is never automatic.
 """
 from __future__ import annotations
 
+import logging
 from typing import Callable
 
 from void.app import Assistant
 
+_log = logging.getLogger(__name__)
+
 # Killswitch-watch cadence: a cheap boolean property read, same order of
 # magnitude as VoiceController's own monitor loop (100ms default).
 _DEFAULT_KILLSWITCH_POLL_MS = 200
+
+# Focus-card cadence. The countdown is read in minutes and seconds, so twice a second is already
+# finer than the thing it displays; anything faster would just be redraws nobody can perceive. The
+# card never DRIVES the engine - FocusEngine ticks itself on its own daemon thread so a session
+# outlives whoever started it - this only reads state() and paints.
+_DEFAULT_FOCUS_CARD_POLL_MS = 500
+
+# Screen-watch cadence. Five seconds: the shortest stillness the watch reacts to is ten minutes, so
+# this is already two orders of magnitude finer than the decision it feeds, and each tick is one
+# downscale to 576 numbers. Off entirely unless BOTH screen.enabled and screen.watch_enabled are
+# true, so on a default installation this timer is never armed.
+_DEFAULT_SCREEN_WATCH_POLL_MS = 5000
 
 
 class VoidRuntime:
@@ -44,7 +59,11 @@ class VoidRuntime:
     def __init__(self, assistant, voice_controller, bridge, widget=None, *,
                  quit_fn: Callable[[], None] | None = None,
                  timer_factory: Callable[[], object] | None = None,
-                 killswitch_poll_ms: int = _DEFAULT_KILLSWITCH_POLL_MS):
+                 killswitch_poll_ms: int = _DEFAULT_KILLSWITCH_POLL_MS,
+                 focus_card=None,
+                 focus_card_poll_ms: int = _DEFAULT_FOCUS_CARD_POLL_MS,
+                 screen_watch=None,
+                 screen_watch_poll_ms: int = _DEFAULT_SCREEN_WATCH_POLL_MS):
         self.assistant = assistant
         self.voice_controller = voice_controller
         self.bridge = bridge
@@ -52,7 +71,13 @@ class VoidRuntime:
         self._quit_fn = quit_fn or (lambda: None)
         self._timer_factory = timer_factory
         self.killswitch_poll_ms = killswitch_poll_ms
+        self.focus_card = focus_card
+        self.focus_card_poll_ms = focus_card_poll_ms
+        self.screen_watch = screen_watch
+        self.screen_watch_poll_ms = screen_watch_poll_ms
         self._timer = None
+        self._focus_timer = None
+        self._watch_timer = None
         self._shutting_down = False
 
     # --- lifecycle -------------------------------------------------------
@@ -65,6 +90,8 @@ class VoidRuntime:
         if self.widget is not None:
             self.widget.show()
         self._start_killswitch_watch()
+        self._start_focus_card()
+        self._start_screen_watch()
 
     def _start_killswitch_watch(self) -> None:
         """A polling timer, NOT a new KillSwitch API. KillSwitch itself is
@@ -84,6 +111,94 @@ class VoidRuntime:
         self._timer.setInterval(self.killswitch_poll_ms)
         self._timer.timeout.connect(self.poll_killswitch)
         self._timer.start()
+
+    def _start_focus_card(self) -> None:
+        """Poll the focus engine and paint the card. Built on demand, and optional.
+
+        Deliberately a read-only observer of ``FocusEngine.state()``, like the killswitch watch
+        above: it never starts, ends, pauses or ticks a session. A card that could change the
+        session it displays would be a second control path over the owner's attention, and there is
+        no reason for one to exist.
+        """
+        if self.focus_card is None:
+            try:
+                from void.ui.focus_card import FocusCardView
+                self.focus_card = FocusCardView.create()
+            except Exception:                   # noqa: BLE001 - no Qt, no display: not an error
+                self.focus_card = None
+        if self.focus_card is None:
+            return
+        factory = self._timer_factory
+        if factory is None:
+            try:
+                from PySide6.QtCore import QTimer
+            except ImportError:
+                return
+            factory = QTimer
+        self._focus_timer = factory()
+        self._focus_timer.setInterval(self.focus_card_poll_ms)
+        self._focus_timer.timeout.connect(self.poll_focus_card)
+        self._focus_timer.start()
+
+    def poll_focus_card(self) -> None:
+        """One card tick: read the session's published state, paint it, and nothing else.
+
+        Returns early when focus is switched off or no engine exists, so a machine with
+        ``focus.enabled: false`` never builds one just to draw a card. Swallows its own failures for
+        the same reason the card itself does: the session is the feature and the card is a courtesy,
+        so a panel that cannot paint must not be able to take the assistant down with it.
+        """
+        card = self.focus_card
+        if card is None:
+            return
+        try:
+            engine = getattr(self.assistant, "focus", None)
+            if engine is None:
+                card.hide()
+                return
+            card.render(engine.state())
+        except Exception:                       # noqa: BLE001
+            _log.debug("FOCUS_CARD_TICK_FAILED", exc_info=True)
+
+    def _start_screen_watch(self) -> None:
+        """Arm the stillness watch, if and only if the owner switched it on.
+
+        ``from_config`` returns None unless BOTH screen.enabled and screen.watch_enabled are true,
+        so on a default installation there is nothing to drive and no timer is created - a watch of
+        the owner's screen is not something to arrange by accident.
+        """
+        if self.screen_watch is None:
+            try:
+                from void.perception.stillness import from_config as watch_from_config
+                self.screen_watch = watch_from_config(
+                    self.assistant.config,
+                    on_nudge=getattr(self.assistant, "on_event", None))
+            except Exception:                   # noqa: BLE001 - absent numpy, no display, no Qt
+                self.screen_watch = None
+        if self.screen_watch is None:
+            return
+        factory = self._timer_factory
+        if factory is None:
+            try:
+                from PySide6.QtCore import QTimer
+            except ImportError:
+                return
+            factory = QTimer
+        self._watch_timer = factory()
+        self._watch_timer.setInterval(self.screen_watch_poll_ms)
+        self._watch_timer.timeout.connect(self.poll_screen_watch)
+        self._watch_timer.start()
+
+    def poll_screen_watch(self) -> None:
+        """One watch tick. ``StillnessWatch.tick`` already swallows its own failures; this is the
+        second belt, for the case where the watch object itself is wrong."""
+        watch = self.screen_watch
+        if watch is None:
+            return
+        try:
+            watch.tick()
+        except Exception:                       # noqa: BLE001
+            _log.debug("SCREEN_WATCH_TICK_FAILED", exc_info=True)
 
     def poll_killswitch(self) -> None:
         """One watch tick. Deliberately does nothing beyond an optional,
@@ -112,12 +227,22 @@ class VoidRuntime:
         if self._shutting_down:
             return
         self._shutting_down = True
-        if self._timer is not None:
+        for attr in ("_timer", "_focus_timer", "_watch_timer"):
+            timer = getattr(self, attr, None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        # The card is hidden rather than left painted over whatever the owner does next: a
+        # countdown still sitting top-right after the assistant has gone would be a window with
+        # nothing behind it, and no obvious way to dismiss.
+        if self.focus_card is not None:
             try:
-                self._timer.stop()
+                self.focus_card.hide()
             except Exception:
                 pass
-            self._timer = None
         self.voice_controller.shutdown(reason)
         self._quit_fn()
 

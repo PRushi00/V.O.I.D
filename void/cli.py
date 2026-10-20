@@ -953,8 +953,27 @@ def cmd_teardown_run(address: str, question: str, show: bool, as_json: bool) -> 
               "Set vault.notes_root in config/local_config.yaml.")
         return 2
     assistant.teardown.headless = not show
+    # The live panel the pack asks for, and its text equivalent. The text runs everywhere, because
+    # a capture is tens of seconds of silence otherwise and a run that looks hung is a run people
+    # interrupt; the on-screen panel is additional and simply absent where there is no display.
+    from void.teardown.browser import _host_of
+    from void.teardown.panel import LABELS, Progress, TeardownPanelView, panel_for
+    progress = Progress(host=_host_of(address))
+    screen = None if as_json else TeardownPanelView.create()
+
+    def on_step(name: str, status: str, detail: str) -> None:
+        progress.mark(name, status, detail)
+        if not as_json and status != "running":
+            panel = panel_for(progress)
+            mark = {"done": "ok", "failed": "FAILED", "skipped": "skipped"}.get(status, status)
+            tail = f" - {detail}" if detail else ""
+            print(f"  [{panel.done + panel.failed + panel.skipped}/{panel.total}] "
+                  f"{LABELS.get(name, name)}: {mark}{tail}", flush=True)
+        if screen is not None:
+            screen.render(progress)
+
     try:
-        evidence = assistant.teardown.capture(address, question=question)
+        evidence = assistant.teardown.capture(address, question=question, on_step=on_step)
     except TeardownUnavailable as exc:
         print(f"Cannot run a teardown: {exc}")
         return 2
@@ -988,6 +1007,36 @@ def cmd_teardown_run(address: str, question: str, show: bool, as_json: bool) -> 
     print(f"\n{written.label}")
     print(f"note:   {written.note_path} (indexed as note {written.note_id})")
     print(f"spoken: {written.spoken or '(the reply carried no spoken line)'}")
+    if screen is not None:
+        screen.hide()
+    return 0
+
+
+def cmd_teardown_last(as_json: bool) -> int:
+    """Show the most recent teardown - the reader half of the pack's panel prompt.
+
+    Answered from the vault, so it needs no browser, no Node and no REA: the note is the record.
+    Reports absence as absence rather than guessing, and exits 2 when there is nothing to show so a
+    script can tell "none yet" from "here it is".
+    """
+    from void.app import Assistant
+    from void.config import Config
+    from void.teardown.panel import last_teardown
+
+    assistant = Assistant(config=Config.load())
+    found = last_teardown(assistant.vault)
+    if as_json:
+        print(json.dumps({"found": found.found, "title": found.title, "path": found.path,
+                          "note_id": found.note_id, "excerpt": found.excerpt,
+                          "reason": found.reason}, indent=2))
+        return 0 if found.found else 2
+    if not found.found:
+        print(found.reason)
+        return 2
+    print(found.title)
+    print(f"note:   {found.path} (indexed as note {found.note_id})")
+    if found.excerpt:
+        print(f"\n{found.excerpt}")
     return 0
 
 
@@ -1139,6 +1188,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_td_run.add_argument("--show", action="store_true",
                           help="Show the investigation browser instead of running it headless")
     p_td_run.add_argument("--json", action="store_true", dest="as_json")
+    p_td_last = teardown_sub.add_parser(
+        "last", help="Show the most recent teardown note (reads the vault; needs no browser)")
+    p_td_last.add_argument("--json", action="store_true", dest="as_json")
 
     p_doctor = sub.add_parser("doctor", help="Read-only health report (never repairs anything)")
     p_doctor.add_argument("--state-dir", default=None, help="Inspect a different state directory")
@@ -1231,7 +1283,9 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_teardown_install()
         if args.teardown_action == "run":
             return cmd_teardown_run(args.address, args.question, args.show, args.as_json)
-        print("Usage: python -m void teardown {diag,install,run}")
+        if args.teardown_action == "last":
+            return cmd_teardown_last(args.as_json)
+        print("Usage: python -m void teardown {diag,install,run,last}")
         return 1
     if args.command == "device":
         if args.device_action == "pair-start":

@@ -381,14 +381,27 @@ class Teardown:
     def running(self) -> bool:
         return self._running
 
-    def capture(self, address: str, question: str = "") -> Evidence:
+    def capture(self, address: str, question: str = "", *, on_step=None) -> Evidence:
         """Open the site in a clean browser, gather every kind of evidence, and close it.
 
         The order matters and is the pack's: start REA's observation, then scroll **while it is
         watching**, so that scroll-driven effects and lazily-loaded files happen inside the window
         REA can see. Scroll back to the top before the snapshot, so the picture is of the site rather
         than of wherever the scroll stopped.
+
+        ``on_step(step, status, detail)`` is an optional progress callback - the live panel in
+        ``void.teardown.panel`` is the intended caller. Purely additive: it is told what is
+        happening and can change nothing, its own exceptions are swallowed, and a capture with no
+        callback behaves exactly as before. A progress display must never be able to lose a run that
+        has already spent a browser, seconds of observation and a model call.
         """
+        # Imported here, not at module scope: void.teardown.panel reads NOTE_DIR from this module,
+        # so a top-level import either way round would be a cycle. By the time a capture runs, both
+        # modules are loaded and this is a dictionary lookup.
+        from void.teardown import panel as _panel
+
+        step = _panel.emitter(on_step)
+
         url = self._safe_url(address)                 # one gate for every address V.O.I.D opens
         host = (urlsplit(url).hostname or "").lower()
         if not self.kit.ready:
@@ -402,9 +415,12 @@ class Teardown:
         browser = CleanBrowser(self.kit.chrome(), headless=self.headless,
                                profile_root=self.profile_root)
         try:
+            step(_panel.Step.OPEN, _panel.RUNNING)
             browser.open(url)
             page = browser.page(url)
             load_s = page.wait_for_load()
+            step(_panel.Step.OPEN, _panel.DONE, f"{load_s:.1f}s to load")
+            step(_panel.Step.READ_PAGE, _panel.RUNNING)
             # The page's own description of itself, read BEFORE anything scrolls it. A page is
             # entitled to change its own title as the owner moves through it - the synthetic drill
             # page does exactly that - so "what is this page" has to be asked of the page as loaded.
@@ -412,10 +428,15 @@ class Teardown:
             evidence.page = {"title": facts.title, "elements": facts.elements,
                              "height_screens": facts.height_screens, "load_s": round(load_s, 2)}
             endpoint = f"http://127.0.0.1:{browser.port}"
+            step(_panel.Step.READ_PAGE, _panel.DONE,
+                 f"{facts.elements} elements, {facts.height_screens:g} screens")
 
+            step(_panel.Step.ATTACH, _panel.RUNNING)
             targets = self.kit.run("list-browser-targets", endpoint)
             target_id = self._target_id(targets, host)
             evidence.lines.append(Line(f"REA attached to the page target at {endpoint}", REA))
+            step(_panel.Step.ATTACH, _panel.DONE)
+            step(_panel.Step.OBSERVE, _panel.RUNNING, f"{OBSERVE_MS / 1000:.0f}s")
 
             # 1 + 2. Watch while scrolling: REA observes on a thread, V.O.I.D scrolls into it.
             observation: dict = {}
@@ -438,21 +459,30 @@ class Teardown:
             inspect = observation.get("payload") or {}
             evidence.lines.append(
                 Line(f"watched the page for {OBSERVE_MS / 1000:.0f}s while it was scrolled", REA))
+            step(_panel.Step.OBSERVE, _panel.DONE)
 
             # 3. Read the code.
+            step(_panel.Step.BUNDLE, _panel.RUNNING)
             bundle = self.kit.run("analyze-web-bundle", endpoint, target_id)
             evidence.bundle = _normalised(bundle)
             evidence.lines.append(Line("read the page's script bundle statically", REA))
+            step(_panel.Step.BUNDLE, _panel.DONE)
 
             # 4. Snapshot, from the top.
+            step(_panel.Step.SNAPSHOT, _panel.RUNNING)
             page.scroll(20, up=True)
             shot = self.kit.run("capture-web-screenshot", endpoint, target_id)
             evidence.screenshot = self._png(shot)
             evidence.lines.append(Line("captured one viewport snapshot", REA))
+            step(_panel.Step.SNAPSHOT,
+                 _panel.DONE if evidence.screenshot else _panel.SKIPPED,
+                 f"{len(evidence.screenshot)} bytes" if evidence.screenshot else "no image returned")
 
             # 5. V.O.I.D's own read of the complete asset log - at the END, because a scroll is
             # what makes a lazily-loaded file load at all.
+            step(_panel.Step.ASSETS, _panel.RUNNING)
             evidence.assets = page.resources()
+            step(_panel.Step.ASSETS, _panel.DONE, f"{len(evidence.assets)} files")
             evidence.lines.append(
                 Line(f"read {len(evidence.assets)} loaded files from the browser's own resource "
                      f"timing log, which includes requests made before REA attached", OWN))
@@ -461,6 +491,7 @@ class Teardown:
                      f"elements", OWN))
 
             # Fingerprints, over the source REA captured.
+            step(_panel.Step.FINGERPRINT, _panel.RUNNING)
             evidence.scripts, source = _script_sources(inspect)
             if not source:
                 evidence.limitations.append(
@@ -468,6 +499,9 @@ class Teardown:
                     "page strings only.")
             evidence.signals = fingerprints.fingerprint(source)
             evidence.other_banners = fingerprints.other_banners(source, evidence.signals)
+            step(_panel.Step.FINGERPRINT,
+                 _panel.DONE if source else _panel.SKIPPED,
+                 f"{len(evidence.signals)} signals" if source else "no script source text")
             for signal in evidence.signals:
                 evidence.lines.append(Line(f"{signal.category}: {signal.described()}", BOTH))
 

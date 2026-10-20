@@ -95,6 +95,208 @@ def _runtime(**kw):
     return rt, assistant, vc, bridge, widget
 
 
+class FakeFocusCard:
+    """Records what it was asked to paint. Stands in for FocusCardView, which needs a display."""
+
+    def __init__(self):
+        self.rendered = []
+        self.hidden = 0
+
+    def render(self, state):
+        self.rendered.append(state)
+        return state
+
+    def hide(self):
+        self.hidden += 1
+
+
+class FakeFocusEngine:
+    """A focus engine that records every call, so a test can prove the card only READS."""
+
+    def __init__(self, state="a-session-state"):
+        self._state = state
+        self.calls = []
+
+    def state(self):
+        self.calls.append("state")
+        return self._state
+
+    def __getattr__(self, name):
+        def recorder(*a, **k):
+            self.calls.append(name)
+        return recorder
+
+
+# --- the focus card: a read-only observer ----------------------------------
+
+def test_start_arms_the_focus_card_poller():
+    card = FakeFocusCard()
+    rt, *_ = _runtime(focus_card=card)
+    rt.start()
+    assert rt._focus_timer.started == 1
+    assert rt._focus_timer.interval == rt.focus_card_poll_ms
+
+
+def test_each_tick_paints_the_published_session_state():
+    card = FakeFocusCard()
+    engine = FakeFocusEngine()
+    asst = FakeAssistant()
+    asst.focus = engine
+    rt, *_ = _runtime(assistant=asst, focus_card=card)
+    rt.start()
+    rt.poll_focus_card()
+    rt.poll_focus_card()
+    assert card.rendered == ["a-session-state", "a-session-state"]
+
+
+def test_the_card_never_drives_the_session_it_displays():
+    """The property that matters: a panel that could start, end, pause or tick a session would be a
+    second control path over the owner's attention. Only state() may be called."""
+    engine = FakeFocusEngine()
+    asst = FakeAssistant()
+    asst.focus = engine
+    rt, *_ = _runtime(assistant=asst, focus_card=FakeFocusCard())
+    rt.start()
+    for _ in range(5):
+        rt.poll_focus_card()
+    assert set(engine.calls) == {"state"}, engine.calls
+    for forbidden in ("start", "end", "abort", "pause", "resume", "tick", "snooze", "excuse"):
+        assert forbidden not in engine.calls
+
+
+def test_the_card_is_hidden_when_focus_is_switched_off():
+    """focus.enabled false makes Assistant.focus None. The card must retreat, not paint a stale
+    countdown forever."""
+    card = FakeFocusCard()
+    asst = FakeAssistant()
+    asst.focus = None
+    rt, *_ = _runtime(assistant=asst, focus_card=card)
+    rt.start()
+    rt.poll_focus_card()
+    assert card.hidden == 1 and card.rendered == []
+
+
+def test_a_card_that_cannot_paint_never_takes_the_assistant_down():
+    """The session is the feature; the card is a courtesy. A raising card must be swallowed."""
+    class Exploding:
+        def render(self, state):
+            raise RuntimeError("no display")
+
+        def hide(self):
+            raise RuntimeError("no display")
+
+    asst = FakeAssistant()
+    asst.focus = FakeFocusEngine()
+    rt, *_ = _runtime(assistant=asst, focus_card=Exploding())
+    rt.start()
+    rt.poll_focus_card()          # must not raise
+    rt.shutdown()                 # nor must the hide on the way out
+
+
+def test_an_engine_that_raises_on_state_is_survived_too():
+    class Angry:
+        def state(self):
+            raise RuntimeError("engine fell over")
+
+    asst = FakeAssistant()
+    asst.focus = Angry()
+    rt, *_ = _runtime(assistant=asst, focus_card=FakeFocusCard())
+    rt.start()
+    rt.poll_focus_card()          # must not raise
+
+
+def test_shutdown_stops_the_focus_card_timer_and_hides_the_card():
+    """A countdown still painted top-right after the assistant has gone is a window with nothing
+    behind it and no obvious way to dismiss."""
+    card = FakeFocusCard()
+    rt, *_ = _runtime(focus_card=card)
+    rt.start()
+    timer = rt._focus_timer
+    rt.shutdown()
+    assert timer.stopped == 1 and rt._focus_timer is None and card.hidden == 1
+
+
+def test_no_focus_card_leaves_no_timer_and_breaks_nothing(monkeypatch):
+    """FocusCardView.create() returns None where there is no display - a server, a headless CI
+    runner. start() must then simply not arm the poller.
+
+    The factory is patched rather than relying on this machine having no display: whether Qt can
+    build an offscreen widget varies by platform, and a test whose meaning depends on that is
+    testing the runner.
+    """
+    from void.ui import focus_card as focus_card_module
+
+    monkeypatch.setattr(focus_card_module.FocusCardView, "create", classmethod(lambda cls: None))
+    rt, *_ = _runtime(focus_card=None)
+    rt.start()
+    assert rt.focus_card is None and rt._focus_timer is None
+    rt.poll_focus_card()          # must not raise
+
+
+def test_a_card_is_built_on_demand_when_one_was_not_supplied(monkeypatch):
+    """The runtime does not require its caller to know about panels: given no card, it asks the
+    view for one. Patched for the same portability reason as above."""
+    from void.ui import focus_card as focus_card_module
+
+    built = FakeFocusCard()
+    monkeypatch.setattr(focus_card_module.FocusCardView, "create", classmethod(lambda cls: built))
+    rt, *_ = _runtime(focus_card=None)
+    rt.start()
+    assert rt.focus_card is built and rt._focus_timer.started == 1
+
+
+# --- the screen watch: off unless asked for --------------------------------
+
+def test_a_default_installation_arms_no_screen_watch():
+    """The property that matters most here: watching the owner's screen is not something to arrange
+    by accident. from_config returns None unless BOTH switches are on, so there is nothing to drive
+    and no timer is created."""
+    rt, *_ = _runtime()
+    rt.start()
+    assert rt.screen_watch is None and rt._watch_timer is None
+    rt.poll_screen_watch()        # must not raise
+
+
+def test_a_supplied_watch_is_armed_and_ticked():
+    class FakeWatch:
+        def __init__(self):
+            self.ticks = 0
+
+        def tick(self):
+            self.ticks += 1
+
+    w = FakeWatch()
+    rt, *_ = _runtime(screen_watch=w)
+    rt.start()
+    assert rt._watch_timer.started == 1
+    assert rt._watch_timer.interval == rt.screen_watch_poll_ms
+    rt.poll_screen_watch()
+    rt.poll_screen_watch()
+    assert w.ticks == 2
+
+
+def test_a_watch_that_raises_never_takes_the_assistant_down():
+    class Angry:
+        def tick(self):
+            raise RuntimeError("no display")
+
+    rt, *_ = _runtime(screen_watch=Angry())
+    rt.start()
+    rt.poll_screen_watch()        # must not raise
+
+
+def test_shutdown_stops_the_screen_watch_timer():
+    class FakeWatch:
+        def tick(self):
+            pass
+
+    rt, *_ = _runtime(screen_watch=FakeWatch())
+    rt.start()
+    timer = rt._watch_timer
+    rt.shutdown()
+    assert timer.stopped == 1 and rt._watch_timer is None
+
+
 # --- start(): composition / arming -----------------------------------------
 
 def test_start_starts_voice_shows_widget_and_arms_killswitch_watch():

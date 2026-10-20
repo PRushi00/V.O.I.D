@@ -156,6 +156,18 @@ screen:
                                  # the better answer to "what is on my screen?" and the smaller footprint
                                  # (a second monitor showing something private is not captured at all).
   max_width: 1280                # captures are downscaled to this before anything reads them
+  # Continuous screen watch (Astra's stillness organ). A SECOND switch on top of screen.enabled,
+  # because "look at my screen when I ask" and "watch my screen on a loop" are different decisions
+  # and one must never imply the other. Both must be true before a single capture is taken.
+  #
+  # What the watch can see: a 32x18 grid of block means, 576 numbers. No glyph, face or line of text
+  # survives that, nothing is written to disk, and the only thing held between ticks is the previous
+  # grid. It decides WHEN the screen has been still, never WHAT is on it - acting on that still goes
+  # through allow_cloud_analysis, the risk gate and the ordinary vision path, exactly as before.
+  watch_enabled: false           # false = no loop, no captures, nothing to drive
+  watch_still_for_s: 600         # unchanged for this long before a nudge is even considered
+  watch_nudge_every_s: 1800      # and never more often than this, however long the stillness lasts
+  watch_threshold: 2.0           # mean difference per cell (0-255) below which the screen is "the same"
 
 # Browser automation (V3). Playwright drives the owner's INSTALLED browser; nothing is downloaded.
 browser:

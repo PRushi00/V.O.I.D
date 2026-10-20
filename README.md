@@ -86,9 +86,13 @@ void/
     kill_switch.py     "VOID, STOP EVERYTHING" — in-process + cross-process file
   ui/
     widget.py          minimal always-on-top circular widget (PySide6)
+    focus_card.py      the countdown card: a pure presenter, and a view that only paints it
   vault/               the owner's own markdown notes, retrievable and cited
   focus/               the accountability timer, and the identities it never stores
   teardown/            website teardown: a clean browser, REA, and a cited note
+    panel.py           the live eight-step panel, and "show me the last teardown"
+  perception/
+    stillness.py       the screen watch: 576 block means, and no opinion about what is on screen
   preflight/           the live-chain harness behind `python -m void preflight`
 ```
 
@@ -180,6 +184,43 @@ script of a third-party package runs on your machine. The observation is read-on
 the DevTools client has no click, no typing and no navigation.
 
 Point it at public sites, open-source code and your own projects.
+
+While a capture runs it prints each of the eight steps as it happens, and shows the same thing as an
+on-screen panel where there is a display — a capture is tens of seconds of silence otherwise, and a
+run that looks hung is a run people interrupt. Afterwards:
+
+```powershell
+python -m void teardown last                 # the most recent note: title, path, excerpt
+```
+
+That reads your vault, so it needs no browser, no Node and no REA — the note is the record. It exits
+2 when there is nothing to show, so a script can tell "none yet" from "here it is".
+
+### The focus card
+
+A session paints a small always-on-top card in the top-right corner: the countdown, whether the lock
+is on, minutes on target, drifts. It **tints amber when you drift**, which is the only warm colour in
+the set, so one glance means one specific thing. It is a read-only observer of the session — it
+cannot start, end, pause or tick one — and it cannot display what you were looking at, because it is
+built from `FocusEngine.state()`, which has no field able to hold a name. It needs no configuration
+and simply does not appear where there is no display.
+
+### Watching for a still screen
+
+**Off by default, behind two switches.** `screen.enabled` is "may you read the screen when I ask";
+`screen.watch_enabled` is "may you do it on a loop". Both must be true, so one mis-set key cannot
+start a continuous watch, and with either false there is no watch object to drive at all.
+
+When on, it reduces each capture to a **32×18 grid of block means** — 576 numbers, in which no glyph,
+face or line of text survives — compares it with the previous grid, and says one content-free
+sentence when nothing has changed for ten minutes. A blank screen never nudges: asleep, locked and
+blanked are all still, and nudging you about your own screensaver is noise.
+
+It decides *when* the screen has been still, never *what* is on it. It holds nothing but the previous
+grid, writes nothing to disk, and has no provider to call and no encoder to hand a picture to — which
+is asserted by walking its syntax tree, not by trusting this paragraph. Acting on a nudge (taking a
+real capture, sending it anywhere) stays exactly where it already was: behind
+`screen.allow_cloud_analysis`, the risk gate and the kill switch.
 
 ### Security & autonomy (V1)
 

@@ -34,21 +34,26 @@ V.O.I.D's own layout) are in SOURCES §4 with the reasoning.
 | Model-id refusal | `void/providers/catalog.py` | "try on opus 5.5" → refused with the list |
 | Focus sessions | `void/focus/` | "thirty minutes on this" |
 | Website teardown | `void/teardown/` | `python -m void teardown diag`, then `run` |
+| Teardown panel and reader | `void/teardown/panel.py` | `python -m void teardown last`; `run` prints the eight steps live |
+| Focus countdown card | `void/ui/focus_card.py` | starts with a session; tints amber on drift |
+| Screen-watch organ | `void/perception/stillness.py` | `screen.enabled` **and** `screen.watch_enabled`, both false by default |
 | State files owner-only | `void/security/ownership.py` | `python -m void preflight` ("state file permissions") |
 
-Four commits on the branch, each with a full message: the first tranche (preflight, vault, judge,
-model refusal, the permissions fix), focus sessions plus the notes-scoped question plus preflight in
-CI, the teardown kit, and a CI dependency fix.
+Each commit on the branch carries a full message: the first tranche (preflight, vault, judge, model
+refusal, the permissions fix), focus sessions plus the notes-scoped question plus preflight in CI,
+the teardown kit, a CI dependency fix, the three real defects behind CI's twelve, and the three
+previously-declined items above.
 
 ## 3. Where the test numbers stand
 
 Baseline before this work, in this container: **4 255 pass, 38 fail, 30 skipped, 2 xfailed.**
-After it: **4 655 pass, 38 fail, 30 skipped, 2 xfailed** — the *same* 38, verified by diffing the
-failure lists, not by counting.
+After it: **4 822 pass, 28 fail, 34 skipped, 2 xfailed.** Those 28 are a *subset* of the baseline 38 -
+ten were fixed along the way (see the CI table below) and **no new failure appeared**, established
+by diffing the before and after lists rather than by comparing their lengths.
 
-Those 38 are environment-bound and none is a code defect: no Windows (`pywin32`, `pythoncom`), no
-`xdg-open`, no audio or camera hardware, `faster-whisper`/`ctranslate2` not installed, and one
-OpenTelemetry patch-version pin. The exact list is reproducible with:
+The remaining 28 are environment-bound and none is a code defect: no Windows (`pywin32`,
+`pythoncom`), no `xdg-open`, no audio or camera hardware, `faster-whisper`/`ctranslate2` not
+installed, and one OpenTelemetry patch-version pin. The exact list is reproducible with:
 
 ```
 python -m pytest -q 2>&1 | grep -E '^(FAILED|ERROR)' | sed 's/ - .*//' | sort
@@ -59,31 +64,40 @@ python -m pytest -q 2>&1 | grep -E '^(FAILED|ERROR)' | sed 's/ - .*//' | sort
 `tests.yml` runs on `windows-latest`, so its red is not this container's red. The two sets barely
 overlap: Linux fails for want of Windows, Windows fails for want of hardware and credentials.
 
-Before this branch the workflow could not collect the suite at all — it installed
-`requirements.lock` only, which has never carried the MCP SDK (defect 8 below). Once it could, the
-first real run gave **16 failed / 4 680 passed**. Four of those were mine and are fixed; the
-twelve that remain are pre-existing and environment-bound:
+Before this branch the workflow could not collect the suite at all - it installed
+`requirements.lock` only, which has never carried the MCP SDK (defect 8 below). The first run that
+executed gave **16 failed / 4 680 passed**. Four were mine and were fixed. I then reported the
+remaining twelve as environment-bound, which **was wrong**: investigating them one at a time instead
+of as a group found three real defects behind them.
 
-| Count | Tests | Why |
+| Was | Now | Why |
 |---|---|---|
-| 3 | `test_entity_routing`, `test_voice_text_parity`, `test_voice_transcript_routing` folder/model routes | `ProviderUnavailable` — the runner holds no LLM credential |
-| 4 | `test_cross_domain` ×2, `test_observe` ×2 | the runner reports no audio device |
-| 2 | `test_vision` ×2 | the runner reports no camera |
-| 2 | `test_voice_text_parity`, `test_voice_transcript_routing` application routes | no browser or messaging application installed |
-| 1 | `test_whisper_gen3_wake::test_the_config_key_reaches_the_detector` | asserts `_cpu_threads` on a detector that has no such attribute |
+| 3 × `ProviderUnavailable` | **fixed** | An application-catalog failure was cancelling the FOLDER lookup two lines before it happened (defect 9), and two tests created their probe folder outside `security.allowed_roots`, so the catalog rightly refused and they had never passed anywhere |
+| 4 × no audio device | **3 fixed, 1 gated** | `list_devices` reported an empty inventory as a FAILURE, which made the agent's completion guard refuse (defect 10). Absence is now an answer |
+| 2 × no camera | **gated** | Genuinely needs a camera; split so the part CI *can* check - that the probe answers rather than raising - runs everywhere |
+| 2 × no installed application | **1 fixed, 1 gated** | One asserted a reply wording the engine does not use on a machine with no messaging application, so it failed exactly where the answer was right |
+| 1 × wake `_cpu_threads` | **fixed** | `voice.wake_cpu_threads` reached the Gen 3 detector and not the one that ships (defect 11) |
 
-Every one of the twelve was in the recorded pre-work baseline and none touches a file this branch
-changes, checked against the list rather than assumed. The repository already carries a `hardware`
-marker for exactly this; applying it would touch twelve unrelated tests and would need
-`guard_limits.json`'s `max_skipped` raised from 4 to 6, which is a deliberate tripwire — so it was
-**proposed on the PR and not applied**. Until someone decides, CI stays red on those twelve,
-honestly, with no assertion weakened and no test skipped to hide them.
+So four genuine preconditions remain, each skipping only where its own device is absent and still
+running where it is present. The `hardware` marker is registered and documented as "skip in CI" but
+**nothing ever implemented it**; blanket-skipping all nine marked tests would have turned five that
+pass on windows-latest into skips, losing coverage CI really provides, so it was not used that way.
+
+Expected on windows-latest: **0 failed, 14 skipped.** Ten of the twelve fixes are verified here; the
+two folder tests still fail in this container for one checked reason - `open_path` reports
+`[Errno 2] 'xdg-open'`, absent here and not needed on Windows.
 
 New test files: `tests/test_vault.py` (80), `tests/test_judge.py` (60), `tests/test_model_catalog.py`
-(70), `tests/test_preflight.py` (28), `tests/test_focus.py` (95), `tests/test_teardown.py` (67).
+(70), `tests/test_preflight.py` (28), `tests/test_focus.py` (95), `tests/test_teardown.py` (67),
+`tests/test_focus_card.py` (48), `tests/test_teardown_panel.py` (57), `tests/test_stillness.py` (37).
 
-`tests/guard_limits.json` `min_collected` was ratcheted to 4 700 (4 725 collected, so 25 of
-margin; the ceiling is deliberately not set flush against the count).
+`tests/guard_limits.json`: `min_collected` ratcheted to 4 850 (4 886 collected, so 36 of margin -
+the floor is deliberately not flush against the count). `max_skipped` raised 6 -> 14, which is
+derived rather than guessed: the 10 that windows-latest already skipped, plus the 4 per-device
+precondition gates below. **Correction:** two earlier PR comments said this needed raising "from 4
+to 6". It was already 6 on `main`, and 6 was already below the 10 windows-latest skips - the ceiling
+had simply never been evaluated, because pytest failed first on every run and the guard step never
+executed.
 
 ## 4. Defects this work found and fixed
 
@@ -111,6 +125,34 @@ margin; the ceiling is deliberately not set flush against the count).
    which does not carry the MCP SDK, so `tests/test_mcp_server.py` failed to import and pytest
    aborted. Pre-existing on `main`; the workflow's own header said it had never run.
 
+9. **An application-catalog failure cancelled the FOLDER lookup.** `_decide_phrase` returned
+   "discovery" the moment `catalog.resolve_name` raised, two lines before it would have tried the
+   folder index - which is a separate catalog with its own guard and needs nothing from the
+   application backend. So on any machine whose app backend is unavailable, "open my `<name>`
+   folder" fell through to the model: the exact 41-second round trip that route exists to remove,
+   and invisible on a desktop where the backend answers. Fixed in `void/core/fast_path.py`.
+
+10. **An empty device inventory was reported as a FAILURE.** `Reading` exists to separate "nothing
+    is attached" from "nothing could be read" - its own docstring says so - and `list_devices` threw
+    that away. The cost was not cosmetic: a failed tool makes the agent's completion guard report an
+    unresolved execution failure, so on a machine with no sound card or camera "what is attached?"
+    could not be answered at all, which is the one kind of machine where the answer is interesting.
+    Failure is now reserved for the case where every source asked for was genuinely unreadable.
+    Same rule as the notes vault: absence is an answer.
+
+11. **The always-on wake preprocessor's thread bound was not pinned.** `voice.wake_cpu_threads`
+    reached the Gen 3 detector and not the one that actually ships: `OpenWakeWordDetector`
+    constructed `Model()` with no `ncpu` at all. One is openwakeword 0.6.0's own default, so this
+    changed no behaviour - it PINS it, so a release that relaxed that default could not quietly put
+    an ONNX spin-wait on every core, which `docs/VOICE_LATENCY_2026-09-23.md` measured at 20.6 cores
+    of idle load. Verified against the real 0.6.0 source, because the package has no Linux wheel for
+    current CPython.
+
+12. **A card's placement could stop it appearing at all.** Found by writing `FocusCardView`'s tests
+    against injected fakes rather than a display: `_place()` sat inside the same `try` as `show()`,
+    so an unresolvable screen - an unplugged monitor, a compositor mid-restart - produced no card
+    instead of a card in the wrong corner.
+
 ## 5. A correction, on the record
 
 An earlier revision of the ledger declined the REA teardown on the grounds that `rea-agents@6.7.0`
@@ -135,12 +177,19 @@ capability, which is the failure the receipts rule exists to prevent.
 | The live Gemini call and the Models API lookup | A Gemini credential. Both preflight probes WARN honestly without one |
 | Anything Windows-native | A Windows machine. The focus *sensor* in particular: the engine is verified to the second against a scripted desk, the reader needs a real foreground |
 
-Two things are **declined with a reason**, not blocked: the teardown's on-screen panel and the focus
-countdown card (display work that cannot be validated from here — the state both need is published),
-and the Astra screen-watch organ (its payoff is a model call on a screenshot of whatever the owner
-has open, which is the most privacy-expensive thing in the corpus for the least certain benefit).
-The invoice engine is recorded in the ledger as a business feature rather than a capability, with the
-one rule in it that generalises — never trust a model's arithmetic — written down.
+**The three items this document previously listed as declined have been built**, on the owner's
+explicit instruction: the teardown panel and reader (P4.18), the focus countdown card (P5.11) and
+the screen-watch organ (P5.7). Two of those three declines turned out to be wrong rather than
+cautious — once the logic was separated from the painting, almost all of the new tests needed no
+display at all, and writing a view against injected fakes found a real defect (12 above). The third,
+the screen watch, is answered in its design rather than waved away: it sees a 32×18 grid of block
+means, keeps nothing, writes nothing, has no provider to call, needs two switches that both default
+to false, and decides only WHEN the screen has been still — never what is on it. The original
+reasoning is kept in the ledger beside the new status rather than deleted.
+
+The invoice engine (P6.4) is the one row still DECLINED. Its delivery leg is genuinely blocked on
+Telegram; the engine itself is not, and the one rule in it that generalises — never trust a model's
+arithmetic — is written down.
 
 ## 7. If something here breaks
 
