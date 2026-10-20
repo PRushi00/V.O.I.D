@@ -295,6 +295,34 @@ def test_a_corrupt_line_is_skipped_rather_than_guessed_at(tmp_path):
     assert led.next_number(year=2026) == f"{NUMBER_PREFIX}-2026-0003"
 
 
+def test_the_ledger_is_hardened_through_the_one_ownership_helper(tmp_path):
+    """Runs on every platform, including Windows, where the mode assertion below cannot.
+
+    Split out so a Windows run is not blind to the hardening: POSIX mode bits do not describe NTFS
+    access, so the 0600 assertion has to skip there - but *that the writer asks for the restriction
+    at all* is platform-independent, and that is the part a regression would remove. void.security.
+    ownership itself reports not_applicable on Windows rather than pretending.
+    """
+    from void.security import ownership
+
+    asked: list[str] = []
+    real = ownership.restrict
+
+    def spy(path, *, directory=None):
+        asked.append(str(path))
+        return real(path, directory=directory)
+
+    led = ledger(tmp_path)
+    original, ownership.restrict = ownership.restrict, spy
+    try:
+        led.record(build(GOOD, number=f"{NUMBER_PREFIX}-2026-0001", issued="2026-01-01"))
+    finally:
+        ownership.restrict = original
+
+    assert str(led.path) in asked, "the ledger file was never handed to ownership.restrict"
+    assert str(led.path.parent) in asked, "the ledger's directory was never restricted"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX modes do not describe NTFS access")
 def test_the_ledger_is_owner_only(tmp_path):
     """It names the owner's clients and what each was charged - the same reason the task store is

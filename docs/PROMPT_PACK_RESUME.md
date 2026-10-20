@@ -84,9 +84,10 @@ running where it is present. The `hardware` marker is registered and documented 
 **nothing ever implemented it**; blanket-skipping all nine marked tests would have turned five that
 pass on windows-latest into skips, losing coverage CI really provides, so it was not used that way.
 
-Expected on windows-latest: **0 failed, 14 skipped.** Ten of the twelve fixes are verified here; the
-two folder tests still fail in this container for one checked reason - `open_path` reports
-`[Errno 2] 'xdg-open'`, absent here and not needed on Windows.
+**Confirmed on windows-latest: 4 948 passed, 0 failed, 15 skipped, 2 xfailed.** All twelve of the
+original failures are fixed, including the two folder tests, which did turn out to need nothing but
+a desktop opener Windows already has. The suite also now runs to 100%: an earlier head crashed a
+third of the way through, which is defect 13 below.
 
 New test files: `tests/test_vault.py` (80), `tests/test_judge.py` (60), `tests/test_model_catalog.py`
 (70), `tests/test_preflight.py` (28), `tests/test_focus.py` (95), `tests/test_teardown.py` (67),
@@ -94,9 +95,11 @@ New test files: `tests/test_vault.py` (80), `tests/test_judge.py` (60), `tests/t
 `tests/test_invoice.py` (75).
 
 `tests/guard_limits.json`: `min_collected` ratcheted to 4 920 (4 961 collected, so 41 of margin -
-the floor is deliberately not flush against the count). `max_skipped` raised 6 -> 14, which is
-derived rather than guessed: the 10 that windows-latest already skipped, plus the 4 per-device
-precondition gates below. **Correction:** two earlier PR comments said this needed raising "from 4
+the floor is deliberately not flush against the count). `max_skipped` raised 6 -> 15, derived rather
+than guessed: the 10 that windows-latest already skipped, plus the 4 per-device precondition gates
+below, plus the one POSIX file-mode test that cannot run on NTFS. I set it to 14 first and CI
+rejected it — the fifteenth skip was one I had added myself, in a later commit, and not recounted.
+The ceiling is deliberately exact rather than padded, which is why it caught that. **Correction:** two earlier PR comments said this needed raising "from 4
 to 6". It was already 6 on `main`, and 6 was already below the 10 windows-latest skips - the ceiling
 had simply never been evaluated, because pytest failed first on every run and the guard step never
 executed.
@@ -154,6 +157,16 @@ executed.
     against injected fakes rather than a display: `_place()` sat inside the same `try` as `show()`,
     so an unresolvable screen - an unplugged monitor, a compositor mid-restart - produced no card
     instead of a card in the wrong corner.
+
+13. **A panel constructed a QWidget with no QApplication, which ABORTS the process.** Not a test
+    failure - a crash. CI stopped a third of the way through the suite with exit 1, no failure
+    summary and no traceback, because Qt's "Must construct a QApplication before a QWidget" is a
+    fatal abort rather than a Python exception, so the try/except around the construction could not
+    catch it. Invisible on Linux, where the PySide6 import raises first and IS caught. Found by
+    mapping the progress percentage back to the collection order. Both view factories now return
+    None under pytest and require an *existing* QApplication, following
+    `void/ui/tray_indicator.py`. It mattered beyond the tests: `VoidRuntime._start_focus_card` ran
+    with nothing guaranteeing an application existed.
 
 ## 5. A correction, on the record
 
