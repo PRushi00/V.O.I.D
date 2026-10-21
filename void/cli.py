@@ -20,6 +20,8 @@ import getpass
 import json
 import logging
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -840,6 +842,287 @@ def cmd_doctor(state_dir: str | None, no_probe: bool) -> int:
     return doctor.exit_code(checks)
 
 
+def cmd_preflight(offline: bool, read_only: bool, strict: bool, as_json: bool) -> int:
+    """Run every LIVE chain end to end and print a verdict. Exit 0 = no failures, 2 = failures.
+
+    Complements ``void doctor`` rather than replacing it: doctor reads the running process's health
+    and changes nothing; this one executes - it builds a real Assistant, indexes the real vault,
+    makes a real minimal provider call, writes and removes a real probe note. It never sends
+    anything, launches anything or touches the owner's memory store. See void/preflight/__init__.py.
+    """
+    from void.config import Config
+    from void import preflight
+
+    report = preflight.run_preflight(Config.load(), offline=offline, read_only=read_only)
+    if as_json:
+        print(json.dumps(report.as_dict(), indent=2))
+    else:
+        print(preflight.format_report(report))
+    return preflight.exit_code(report, strict=strict)
+
+
+def cmd_teardown_diag(as_json: bool) -> int:
+    """Is a teardown possible on this machine, and if not, what is missing."""
+    from void.config import Config
+    from void.teardown import Kit
+
+    config = Config.load()
+    root = config.get("teardown.kit_root", None)
+    diag = Kit(Path(str(root)) if root else None).diag()
+    diag["capability_enabled"] = bool(config.get("teardown.enabled", False))
+    if as_json:
+        print(json.dumps(diag, indent=2))
+        return 0 if diag["ready"] else 1
+    print(f"REA kit:   {'ready' if diag['ready'] else 'NOT ready'}")
+    print(f"  capability   teardown.enabled = {diag['capability_enabled']}")
+    print(f"  rea          installed {diag['rea_installed'] or '(none)'}, "
+          f"pinned {diag['rea_pinned']}")
+    print(f"  node         {diag['node'] or '(not found)'} "
+          f"(minimum {diag['node_minimum']})")
+    print(f"  browser      {'found' if diag['chrome_found'] else 'NOT found'}")
+    if diag["stray_profiles"]:
+        print(f"  WARNING      {diag['stray_profiles']} investigation profile(s) left on disk")
+    for problem in diag["problems"]:
+        print(f"  - {problem}")
+    if not diag["ready"]:
+        print("\nInstall it with:  python -m void teardown install")
+    return 0 if diag["ready"] else 1
+
+
+def cmd_teardown_install() -> int:
+    """Install the REA kit, deliberately, after verifying where the package comes from.
+
+    V.O.I.D never does this on its own: running it is the owner's decision, the repository URL is
+    checked against the one the package is supposed to live at before anything is fetched, and
+    ``--ignore-scripts`` means no lifecycle script of a third-party package runs here.
+    """
+    from void.config import Config
+    from void.teardown import PINNED_REA, REA_REPOSITORY, Kit
+
+    config = Config.load()
+    root = config.get("teardown.kit_root", None)
+    kit = Kit(Path(str(root)) if root else None)
+    npm = shutil.which("npm")
+    if npm is None:
+        print("npm was not found on the PATH. Install Node.js "
+              f"{kit.diag()['node_minimum']} or newer first.")
+        return 2
+    print(f"Checking where rea-agents comes from (it must be {REA_REPOSITORY})...")
+    probe = subprocess.run([npm, "view", "rea-agents", "repository.url"],
+                           capture_output=True, text=True, timeout=120)
+    where = (probe.stdout or "").strip()
+    if probe.returncode != 0 or REA_REPOSITORY not in where:
+        print(f"REFUSED: rea-agents resolves to {where or '(nothing)'}, not {REA_REPOSITORY}. "
+              f"Copycat packages exist; nothing was installed.")
+        return 2
+    print(f"  {where}  ok")
+    kit.root.mkdir(parents=True, exist_ok=True)
+    argv = [npm, "install", f"rea-agents@{PINNED_REA}", "--save-exact", "--ignore-scripts",
+            "--no-audit", "--no-fund"]
+    print(f"Installing into {kit.root}:\n  {' '.join(argv)}")
+    out = subprocess.run(argv, cwd=str(kit.root), text=True, timeout=900)
+    if out.returncode != 0:
+        print("The install failed; nothing was changed in V.O.I.D.")
+        return 2
+    print(f"Installed rea-agents {kit.installed_version()}.")
+    return cmd_teardown_diag(as_json=False)
+
+
+def cmd_teardown_run(address: str, question: str, show: bool, as_json: bool) -> int:
+    """Take one website apart and write the note into the vault.
+
+    Long-running on purpose: a real browser opens, REA watches the page for seconds while V.O.I.D
+    scrolls it, and the brain writes the note. The spoken line is printed last, which is the one
+    sentence worth saying out loud.
+    """
+    from void.app import Assistant
+    from void.config import Config
+    from void.teardown import NOTE_SYSTEM_PROMPT, TeardownUnavailable, digest, write_note
+
+    config = Config.load()
+    if not config.get("teardown.enabled", False):
+        print("Website teardown is switched off. Set teardown.enabled: true in "
+              "config/local_config.yaml.")
+        return 2
+    assistant = Assistant(config=config)
+    if assistant.teardown is None:
+        print("Website teardown is switched off.")
+        return 2
+    if assistant.vault is None:
+        print("No notes folder is configured, so there is nowhere to write the teardown. "
+              "Set vault.notes_root in config/local_config.yaml.")
+        return 2
+    assistant.teardown.headless = not show
+    # The live panel the pack asks for, and its text equivalent. The text runs everywhere, because
+    # a capture is tens of seconds of silence otherwise and a run that looks hung is a run people
+    # interrupt; the on-screen panel is additional and simply absent where there is no display.
+    from void.teardown.browser import _host_of
+    from void.teardown.panel import LABELS, Progress, TeardownPanelView, panel_for
+    progress = Progress(host=_host_of(address))
+    screen = None if as_json else TeardownPanelView.create()
+
+    def on_step(name: str, status: str, detail: str) -> None:
+        progress.mark(name, status, detail)
+        if not as_json and status != "running":
+            panel = panel_for(progress)
+            mark = {"done": "ok", "failed": "FAILED", "skipped": "skipped"}.get(status, status)
+            tail = f" - {detail}" if detail else ""
+            print(f"  [{panel.done + panel.failed + panel.skipped}/{panel.total}] "
+                  f"{LABELS.get(name, name)}: {mark}{tail}", flush=True)
+        if screen is not None:
+            screen.render(progress)
+
+    try:
+        evidence = assistant.teardown.capture(address, question=question, on_step=on_step)
+    except TeardownUnavailable as exc:
+        print(f"Cannot run a teardown: {exc}")
+        return 2
+    except Exception as exc:
+        print(f"The capture failed: {type(exc).__name__}: {exc}")
+        return 2
+
+    text = digest(evidence)
+    if as_json:
+        print(json.dumps({"url": evidence.url, "seconds": evidence.seconds,
+                          "page": evidence.page, "totals": evidence.totals(),
+                          "signals": [s.as_dict() for s in evidence.signals],
+                          "evidence_ids": evidence.evidence_ids,
+                          "limitations": evidence.limitations}, indent=2))
+    else:
+        print(text)
+
+    try:
+        provider = assistant.providers.select()
+    except Exception as exc:
+        print(f"\nThe evidence above is complete, but no brain is available to write the note "
+              f"({exc}). Nothing was written.")
+        return 1
+    reply = provider.generate([{"role": "system", "content": NOTE_SYSTEM_PROMPT},
+                               {"role": "user", "content": text}])
+    try:
+        written = write_note(evidence, reply.text, vault=assistant.vault)
+    except Exception as exc:
+        print(f"\nThe note was NOT written: {exc}")
+        return 1
+    print(f"\n{written.label}")
+    print(f"note:   {written.note_path} (indexed as note {written.note_id})")
+    print(f"spoken: {written.spoken or '(the reply carried no spoken line)'}")
+    if screen is not None:
+        screen.hide()
+    return 0
+
+
+def cmd_teardown_last(as_json: bool) -> int:
+    """Show the most recent teardown - the reader half of the pack's panel prompt.
+
+    Answered from the vault, so it needs no browser, no Node and no REA: the note is the record.
+    Reports absence as absence rather than guessing, and exits 2 when there is nothing to show so a
+    script can tell "none yet" from "here it is".
+    """
+    from void.app import Assistant
+    from void.config import Config
+    from void.teardown.panel import last_teardown
+
+    assistant = Assistant(config=Config.load())
+    found = last_teardown(assistant.vault)
+    if as_json:
+        print(json.dumps({"found": found.found, "title": found.title, "path": found.path,
+                          "note_id": found.note_id, "excerpt": found.excerpt,
+                          "reason": found.reason}, indent=2))
+        return 0 if found.found else 2
+    if not found.found:
+        print(found.reason)
+        return 2
+    print(found.title)
+    print(f"note:   {found.path} (indexed as note {found.note_id})")
+    if found.excerpt:
+        print(f"\n{found.excerpt}")
+    return 0
+
+
+def cmd_invoice(description: str, kind: str, out: str, as_json: bool) -> int:
+    """Turn a description of work into an invoice: strict JSON in, Python's arithmetic out.
+
+    The model describes WHAT was done. Every figure is recomputed here and overrides whatever the
+    model said, and any disagreement is printed and put on the document rather than quietly fixed -
+    a model that cannot add up is a fact about the run.
+
+    Nothing is sent. V.O.I.D has no invoice transport, so this writes a document and records a
+    numbered ledger row, and says so in those words.
+    """
+    from void.app import Assistant
+    from void.billing import INVOICE_SYSTEM_PROMPT, InvoiceError, Ledger, issue, parse_strict
+    from void.config import Config
+
+    config = Config.load()
+    assistant = Assistant(config=config)
+    try:
+        provider = assistant.providers.select()
+    except Exception as exc:
+        print(f"No brain is available to read the work description ({exc}). Nothing was written.")
+        return 2
+
+    reply = provider.generate([{"role": "system", "content": INVOICE_SYSTEM_PROMPT},
+                               {"role": "user", "content": description}])
+    ledger = Ledger.from_config(config)
+    try:
+        payload = parse_strict(reply.text)
+        result = issue(payload, ledger=ledger, kind=kind)
+    except InvoiceError as bad:
+        # Refused, not repaired. An ambiguous invoice is one to stop on.
+        print(f"No invoice was created: {bad}")
+        return 2
+
+    invoice = result.invoice
+    target = out or f"invoice-{invoice.number}.{kind}"
+    saved = _save_document(assistant, target, result.document)
+
+    if as_json:
+        print(json.dumps({**invoice.as_dict(), "document": saved,
+                          "units": result.units, "unit_name": result.unit_name,
+                          "delivered": False, "delivery": result.delivery}, indent=2))
+        return 0
+
+    print(f"{invoice.number}  {invoice.issued}  {invoice.client}")
+    for item in invoice.items:
+        print(f"  {item.description}: {item.quantity} x {invoice.currency} {item.unit_price} "
+              f"= {invoice.currency} {item.total}")
+    print(f"  subtotal {invoice.currency} {invoice.subtotal}")
+    if invoice.tax_rate:
+        print(f"  tax at {invoice.tax_rate * 100:g}%  {invoice.currency} {invoice.tax}")
+    print(f"  TOTAL    {invoice.currency} {invoice.total}")
+    if invoice.discrepancies:
+        print("\nRecomputed (the model's figures were overridden):")
+        for bad in invoice.discrepancies:
+            print(f"  - {bad.rendered()}")
+    print(f"\ndocument: {saved or '(not saved)'} ({result.units} {result.unit_name})")
+    print(f"ledger:   {ledger.path}")
+    print(result.delivery)
+    return 0 if saved else 1
+
+
+def _save_document(assistant, target: str, payload: bytes) -> str:
+    """Write the document through the confined file layer, never with a bare open().
+
+    Returns the path written, or "" when it could not be. Binary-safe: an XLSX or DOCX is a ZIP, and
+    a text-mode write corrupts it.
+    """
+    files = getattr(assistant, "files", None)
+    writer = getattr(files, "write_bytes", None)
+    if not callable(writer):
+        print("This build cannot save binary documents, so the invoice was not written.")
+        return ""
+    try:
+        out = writer(target, payload)
+    except Exception as exc:                    # noqa: BLE001
+        print(f"The document could not be saved: {exc}")
+        return ""
+    if not getattr(out, "ok", False):
+        print(f"The document could not be saved: {getattr(out, 'summary', 'refused')}")
+        return ""
+    return str(getattr(out, "data", target) or target)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="void", description="V.O.I.D V1")
     sub = parser.add_subparsers(dest="command")
@@ -964,6 +1247,41 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Also parse pre-V2.0 void.log markers (auto: only if no perf data)")
     p_report.add_argument("--json", action="store_true", dest="as_json")
 
+    p_preflight = sub.add_parser(
+        "preflight",
+        help="Run every live chain end to end and print a verdict (exit 2 on any failure)")
+    p_preflight.add_argument("--offline", action="store_true",
+                             help="Skip the probes that need the network or a credential")
+    p_preflight.add_argument("--read-only", action="store_true", dest="read_only",
+                             help="Write nothing at all: skip the vault capture probe")
+    p_preflight.add_argument("--strict", action="store_true",
+                             help="Also exit non-zero when a probe only WARNS (for CI)")
+    p_preflight.add_argument("--json", action="store_true", dest="as_json")
+
+    p_teardown = sub.add_parser(
+        "teardown", help="Take a website apart with the REA kit (off by default)")
+    teardown_sub = p_teardown.add_subparsers(dest="teardown_action")
+    p_td_diag = teardown_sub.add_parser("diag", help="Is a teardown possible here, and what is missing")
+    p_td_diag.add_argument("--json", action="store_true", dest="as_json")
+    teardown_sub.add_parser(
+        "install", help="Install the pinned REA kit (verifies its repository, runs no scripts)")
+    p_td_run = teardown_sub.add_parser("run", help="Take one website apart and write the note")
+    p_td_run.add_argument("address", help="The site, e.g. example.com or https://example.com/path")
+    p_td_run.add_argument("--question", default="", help="What you actually want to know about it")
+    p_td_run.add_argument("--show", action="store_true",
+                          help="Show the investigation browser instead of running it headless")
+    p_td_run.add_argument("--json", action="store_true", dest="as_json")
+    p_td_last = teardown_sub.add_parser(
+        "last", help="Show the most recent teardown note (reads the vault; needs no browser)")
+    p_td_last.add_argument("--json", action="store_true", dest="as_json")
+
+    p_invoice = sub.add_parser(
+        "invoice", help="Turn a description of work into an invoice (Python does the arithmetic)")
+    p_invoice.add_argument("description", help="What the work was, in your own words")
+    p_invoice.add_argument("--kind", default="pdf", help="pdf (default), docx, xlsx")
+    p_invoice.add_argument("--out", default="", help="Where to write it (default invoice-<number>.<kind>)")
+    p_invoice.add_argument("--json", action="store_true", dest="as_json")
+
     p_doctor = sub.add_parser("doctor", help="Read-only health report (never repairs anything)")
     p_doctor.add_argument("--state-dir", default=None, help="Inspect a different state directory")
     p_doctor.add_argument("--no-probe", action="store_true",
@@ -979,8 +1297,8 @@ def main(argv: list[str] | None = None) -> int:
     known = {"run", "resume", "clarify", "approve", "deny", "set-key",
              "list-keys", "remove-key", "set-pin", "tasks", "stop",
              "clear-stop", "ui", "voice", "app", "singularity", "autostart",
-             "roots", "protect", "device", "perf", "doctor", "memory",
-             "prefs", "maintenance", "-h", "--help"}
+             "roots", "protect", "device", "perf", "doctor", "preflight", "teardown", "memory",
+             "prefs", "maintenance", "invoice", "-h", "--help"}
     if argv and argv[0] not in known:
         return cmd_run(" ".join(argv))
 
@@ -1046,6 +1364,21 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.command == "doctor":
         return cmd_doctor(args.state_dir, args.no_probe)
+    if args.command == "preflight":
+        return cmd_preflight(args.offline, args.read_only, args.strict, args.as_json)
+    if args.command == "invoice":
+        return cmd_invoice(args.description, args.kind, args.out, args.as_json)
+    if args.command == "teardown":
+        if args.teardown_action == "diag":
+            return cmd_teardown_diag(args.as_json)
+        if args.teardown_action == "install":
+            return cmd_teardown_install()
+        if args.teardown_action == "run":
+            return cmd_teardown_run(args.address, args.question, args.show, args.as_json)
+        if args.teardown_action == "last":
+            return cmd_teardown_last(args.as_json)
+        print("Usage: python -m void teardown {diag,install,run,last}")
+        return 1
     if args.command == "device":
         if args.device_action == "pair-start":
             return cmd_device_pair_start(args.name, args.minutes)

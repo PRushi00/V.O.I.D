@@ -140,7 +140,12 @@ def test_a_named_conversation_outranks_the_application_matcher(assistant):
     application matcher claiming a request that names a person, and being confidently wrong."""
     reply = (assistant.run("Open Rushi's chat.").result or "").lower()
     assert "can't find" not in reply and "cannot find" not in reply
-    assert "which app" in reply or "not installed" in reply or "desktop automation" in reply
+    # The honest answers, in the engine's own words. "no messaging application I can reach is
+    # installed" (void/orchestration/messaging.py) is this list's third case on a machine with no
+    # messaging application at all; an earlier revision listed only "not installed", which that
+    # sentence does not contain, so the test failed on exactly the machine whose answer was right.
+    assert ("which app" in reply or "not installed" in reply or "desktop automation" in reply
+            or "no messaging application i can reach is installed" in reply)
 
 
 def test_an_ordinary_launch_is_untouched_by_the_conversation_route(assistant):
@@ -151,9 +156,23 @@ def test_an_ordinary_launch_is_untouched_by_the_conversation_route(assistant):
 
 
 def test_a_non_conversation_goal_is_not_claimed(assistant):
+    """None of these is a conversation, so none may be answered with the conversation wording.
+
+    A goal with no deterministic route at all ("what is the weather") reaches the model, and on a
+    machine with no credential that raises ``ProviderUnavailable`` from ``run()``. That outcome is
+    not a hole in this test - it is the strongest possible evidence of the property under test,
+    because a goal the conversation route had claimed would have been answered deterministically
+    and never reached a provider at all. So it counts as a pass, and the wording assertion still
+    runs on every goal that does return.
+    """
+    from void.providers.base import ProviderUnavailable
+
     for goal in ("Open Pinterest.", "what is the weather", "open this chart."):
         # Either answered elsewhere or passed through - but never with the conversation wording.
-        reply = (assistant.run(goal).result or "").lower()
+        try:
+            reply = (assistant.run(goal).result or "").lower()
+        except ProviderUnavailable:
+            continue                      # reached the model, so the conversation route let it by
         assert "whose conversation" not in reply
 
 

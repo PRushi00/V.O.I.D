@@ -44,6 +44,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from void.security import ownership
 
 _log = logging.getLogger(__name__)
 
@@ -290,8 +291,13 @@ class StateStore:
 
     # -- connection / schema -------------------------------------------
     def _conn(self) -> sqlite3.Connection:
+        new_file = not self.path.exists()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.path, timeout=10.0)
+        if new_file:
+            # Owner-only from the moment it exists: this holds the computer's own details, the
+            # owner's preferences and detected changes. See void/security/ownership.py.
+            ownership.restrict(self.path, directory=False)
         conn.row_factory = sqlite3.Row
         # secure_delete so an overwritten row is not left readable in the file; foreign_keys so a
         # deleted snapshot takes its observations with it rather than orphaning them.

@@ -91,10 +91,20 @@ class Config:
     # --- derived paths -------------------------------------------------
 
     def state_dir(self) -> Path:
-        """Absolute path to the runtime state directory (created on demand)."""
+        """Absolute path to the runtime state directory (created on demand).
+
+        Created owner-only. Listing this directory tells a reader which tasks exist and when they
+        ran, which is exactly what the file modes inside it are there to withhold - so the
+        permission belongs on the directory as well as on its files. Best effort, and a no-op on
+        Windows, where the inherited profile ACL governs instead: see void/security/ownership.py.
+        """
         rel = self.get("app.state_dir", ".void")
         path = Path(os.path.expanduser("~")) / rel
+        fresh = not path.exists()
         path.mkdir(parents=True, exist_ok=True)
+        if fresh:
+            from void.security import ownership
+            ownership.restrict(path, directory=True)
         return path
 
     def peek_state_dir(self) -> Path:

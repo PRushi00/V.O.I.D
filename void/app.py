@@ -20,8 +20,11 @@ from void.actions.messaging import MessagingActions
 from void.actions.artifacts import ArtifactActions
 from void.actions.research import ResearchActions
 from void.actions.reference import ReferenceActions
+from void.actions.vault import VaultActions
 from void.actions.resources import ResourceActions
 from void.obs import TelemetryPolicy, configure as configure_telemetry
+from void.providers.catalog import BrainSwitch, Intent as BrainIntent, ModelCatalog
+from void.providers.catalog import parse as parse_brain
 from void.providers.policy import ProviderPolicy
 from void.a2a import A2aGateway, A2aPolicy
 from void.ui.a2ui import A2uiSession
@@ -33,6 +36,14 @@ from void.orchestration.reference import ReferenceResolver, parse_reference
 from void.orchestration.overrides import extract_overrides
 from void.maintenance import Maintenance
 from void.state import StateStore
+from void.vault import Verdict as VaultVerdict, VaultUnavailable
+from void.vault import from_config as vault_from_config
+from void.vault import ask as vault_ask
+from void.teardown import address as teardown_address
+from void.teardown import panel as teardown_panel
+from void.teardown import from_config as teardown_from_config
+from void.focus import commands as focus_commands
+from void.focus import from_assistant as focus_from_assistant
 from void.orchestration.referents import (RecentThings, recent_candidates, tab_candidates,
                                           window_candidates)
 from void.actions.folders import DEFAULT_DEPTH, FolderCatalog, scan_roots
@@ -61,6 +72,7 @@ from void.memory.tool import make_tool as make_memory_tool
 from void.providers.base import LLMProvider, ProviderUnavailable
 from void.providers.registry import ProviderRegistry
 from void.security.protected import EngineProtected
+from void.security import ownership
 from void.security.risk import RiskGate
 
 _log = logging.getLogger(__name__)
@@ -194,6 +206,12 @@ class Assistant:
 
         # Persistence directory is needed early for the cross-process stop file.
         state_dir = self.config.state_dir()
+        # Owner-only, at boot and not only at creation. An installation that predates
+        # void/security/ownership.py already has a 0644 tasks.sqlite on disk, and that file holds
+        # task goals and messages in plain text; only re-applying the mode on every start fixes the
+        # machines that are already wrong. Cheap (a handful of chmods), best effort, and a no-op on
+        # Windows, where the inherited profile ACL governs instead.
+        ownership.restrict_tree(state_dir)
 
         # Security / control
         self.kill_switch = KillSwitch(
@@ -225,7 +243,7 @@ class Assistant:
         self.provider_policy = ProviderPolicy.from_config(self.config)
 
         # Tools (actions)
-        file_actions = FileActions(
+        self.files = file_actions = FileActions(
             allowed_roots=self.config.allowed_roots(),
             delete_to_recycle_bin=self.config.get(
                 "security.delete_to_recycle_bin", True),
@@ -295,6 +313,13 @@ class Assistant:
                                                    policy=self.provider_policy)
         self.tools.register_all(ResearchActions(engine=lambda: self.research,
                                                 artifacts=self.artifacts).tools())
+        # The notes vault (prompt packs, Part One). A READ layer over markdown the owner already owns,
+        # inside roots the file layer already allows, so registering it grants no new reach - and the
+        # switch is the absence of ``vault.notes_root`` rather than a boolean, because the vault must
+        # never guess where someone's notes are. Built lazily: the tree is walked by the first
+        # question, not here. See void/vault/__init__.py for why absence is a first-class answer.
+        self.vault = vault_from_config(self.config, file_actions=file_actions)
+        self.tools.register_all(VaultActions(vault=lambda: self.vault).tools())
         # What V.O.I.D has recently produced or the owner recently referred to, so that "this chart" and
         # "the document I was looking at" have something to resolve against. References only: labels and
         # targets, never content and never permissions.
@@ -326,6 +351,19 @@ class Assistant:
         # accepted request still goes through Assistant.run and the whole funnel, with the skill's tool
         # ceiling on top.
         self.a2a = A2aGateway(A2aPolicy.from_config(self.config))
+
+        # Website teardown (prompt packs, REA Part Two). Deny-by-default behind teardown.enabled,
+        # and even then it needs a kit V.O.I.D will not install for the owner. Lazy for the same
+        # reason the focus engine is: discovering Node and a browser costs nothing until asked.
+        self.teardown = teardown_from_config(self.config)
+
+        # Focus sessions (prompt packs, Astra Part Two). Built LAZILY: the engine reads the
+        # foreground through the tools registered above, and an owner who never starts a session
+        # must not pay for a window read. `focus` is the property below; `_focus` is the instance
+        # once one exists. See void/focus/__init__.py for the privacy property that shapes it.
+        self._focus = None
+        #: True while a session has asked "what are we focusing on?" and is waiting for the answer.
+        self._awaiting_intent = False
 
         # Weekly maintenance (V3). Constructed, NOT scheduled: the runner claims its own week in the
         # state database, so whatever fires it cannot cause a second pass, and nothing here starts a
@@ -376,6 +414,12 @@ class Assistant:
             file_facts=lambda path: _file_facts(file_actions, path))
         # Providers
         self.providers = ProviderRegistry.from_config(self.config)
+        # Which model ids really exist, and the refusal that keeps "switch to X" honest. Built from
+        # configuration rather than from a shipped catalogue of other companies' model names, and it
+        # authorizes nothing: a swap changes which model thinks, never which capabilities exist or
+        # which data may leave - ProviderPolicy still decides that, per capability, at egress.
+        # See void/providers/catalog.py.
+        self.brains = BrainSwitch(ModelCatalog.from_config(self.config))
         # Deterministic fast path for plain "open <known app>" commands (no model call). Off switch: fast_path.enabled.
         self._fast = (FastPath(catalog,
                                answer_unknown=self.config.get("fast_path.answer_unknown_apps", True),
@@ -1013,6 +1057,201 @@ class Assistant:
         task = Task(goal="[memory command]", id="(memory)", status=Status.COMPLETED, result=reply)
         return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0)
 
+    def _brain_command(self, goal: str) -> AgentResult | None:
+        """"Switch to <model>", "go back to your normal brain", "which model are you using".
+
+        Deterministic and ahead of the model, for the same reason control commands are: which brain
+        is thinking is not a semantic judgement, and a model asked to interpret a request to replace
+        itself is the wrong authority for it. A name V.O.I.D does not know is REFUSED with the list
+        of what it does know - never approximated. See void/providers/catalog.py.
+        """
+        # The catalog is handed to the parser: this route runs ahead of the website and application
+        # matchers, so "switch to chat gpt" must stay a request to open ChatGPT. See
+        # void/providers/catalog.parse for the rule that keeps them apart.
+        request = parse_brain(goal, known=self.brains.catalog)
+        if request.intent == BrainIntent.NONE:
+            return None
+        if request.intent == BrainIntent.WHICH:
+            name, model = self.brains.active(self.providers)
+            reply = (f"{model} ({name})." if model else
+                     "No brain is available right now - no provider has a usable credential.")
+        elif request.intent == BrainIntent.REVERT:
+            _changed, reply = self.brains.revert(self.providers)
+        else:
+            _changed, reply = self.brains.switch(self.providers, request.spoken)
+        # engine_authored: the sentence is built from the catalog's own constants and from model ids
+        # that came out of configuration - never from a model, a tool or a page.
+        task = Task(goal=goal, id="(brain)", status=Status.COMPLETED, result=reply)
+        return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0,
+                           engine_authored=True)
+
+    #: Said when a teardown is asked for and the capability is off, or the kit is missing.
+    TEARDOWN_OFF = ("Website teardown is switched off. Turn on teardown.enabled in "
+                    "config/local_config.yaml.")
+
+    def _teardown_route(self, goal: str) -> AgentResult | None:
+        """A spoken request to take a website apart.
+
+        Catches ONLY sentences that name a site - see void/teardown/address.py for why "tear down
+        the old shed" must trigger nothing. What it does here is deliberately narrow: it reports
+        whether a teardown CAN run, and refuses clearly when it cannot. The capture itself is a
+        long-running job with a model call in the middle of it, which belongs to a caller that can
+        wait for it (``python -m void teardown run``), not to a synchronous answer.
+        """
+        # "show me the last teardown" is a request to READ, not to run one, and it is answered
+        # from the vault rather than from the kit - so it is checked first and does not care whether
+        # a browser, REA or Node is installed on this machine. The note is the record.
+        if teardown_panel.asked_for_the_last(goal):
+            return self._engine_reply(goal, self._last_teardown_line(), task_id="(teardown)")
+        address = teardown_address.parse(goal)
+        if address is None:
+            return None
+        if self.teardown is None:
+            return self._engine_reply(goal, self.TEARDOWN_OFF, task_id="(teardown)")
+        problems = self.teardown.kit.problems()
+        if problems:
+            # One line, in order, naming what to install. The problems are the kit's own sentences
+            # about this machine - not a model's, and not a tool's.
+            return self._engine_reply(goal, " ".join(problems)[:600], task_id="(teardown)")
+        if self.teardown.running:
+            return self._engine_reply(goal, "I am already taking one apart.",
+                                      task_id="(teardown)")
+        if address == "this":
+            return self._engine_reply(
+                goal, "Name the site and I will take it apart.", task_id="(teardown)")
+        return self._engine_reply(
+            goal, f"Ready to take that apart. Run: python -m void teardown run {address}",
+            task_id="(teardown)")
+
+    def _last_teardown_line(self) -> str:
+        """What to say when asked for the most recent teardown.
+
+        Absence is reported as absence, with no excerpt and no guess, exactly as the notes vault
+        answers a question its notes do not cover: there is nothing to improvise from and saying so
+        is the whole answer.
+        """
+        found = teardown_panel.last_teardown(self.vault)
+        if not found.found:
+            return found.reason
+        line = f"The last one was {found.title}."
+        if found.excerpt:
+            line += f" {found.excerpt}"
+        return (line[:600] + f" The note is at {found.path}")[:900]
+
+    @property
+    def focus(self):
+        """The focus engine, built on first use. None when ``focus.enabled`` is false."""
+        if self._focus is None:
+            self._focus = focus_from_assistant(self, speak=self.on_event)
+        return self._focus
+
+    #: Said when a focus command arrives and no session is running. A CONSTANT, like every other
+    #: engine-authored line here.
+    NO_SESSION = "There is no focus session running."
+    FOCUS_OFF = "Focus sessions are switched off (focus.enabled)."
+
+    def _focus_command(self, goal: str) -> AgentResult | None:
+        """A focus-session command, decided deterministically before any model sees the words.
+
+        Whether "pause" means the session or something else, and whether "it's fine, I'm reading the
+        docs" is an excuse or a remark, are control decisions rather than semantic ones - the same
+        argument ``void/orchestration/commands.py`` makes about "stop". See void/focus/commands.py.
+        """
+        request = focus_commands.parse(goal, expecting_intent=self._awaiting_intent)
+        if request.intent == focus_commands.FocusIntent.NONE:
+            return None
+        engine = self.focus
+        if engine is None:
+            return self._engine_reply(goal, self.FOCUS_OFF, task_id="(focus)")
+
+        intents = focus_commands.FocusIntent
+        if request.intent == intents.START:
+            reply = engine.start(request.minutes)
+            engine.start_ticking()
+            self._awaiting_intent = "focusing on" in reply
+        elif request.intent == intents.INTENT:
+            reply = engine.set_intent(request.text)
+            self._awaiting_intent = False
+        elif request.intent == intents.STOP:
+            card = engine.end(completed=False)
+            engine.stop_ticking()
+            reply = card.spoken() if card.planned_minutes else self.NO_SESSION
+            self._awaiting_intent = False
+        elif request.intent == intents.STATUS:
+            state = engine.state()
+            reply = (f"{state.seconds_left / 60:.0f} minutes left, "
+                     f"{state.on_target_s / 60:.0f} on target, {state.drifts} detours."
+                     if engine.running else self.NO_SESSION)
+        elif request.intent == intents.PAUSE:
+            reply = engine.pause()
+        elif request.intent == intents.RESUME:
+            reply = engine.resume()
+        elif request.intent == intents.EXTEND:
+            reply = engine.extend(request.minutes)
+        elif request.intent == intents.SNOOZE:
+            reply = engine.snooze(request.seconds)
+        elif request.intent == intents.NAG:
+            reply = engine.nag_every(request.seconds)
+        elif request.intent == intents.EXCUSE:
+            if not engine.running:
+                return None                           # "it's fine" outside a session is a remark
+            reply = engine.excuse()
+        elif request.intent == intents.RELOCK:
+            reply = engine.relock()
+        else:                                         # unreachable: FocusIntent.ALL is closed
+            return None
+        # engine_authored: every one of those replies is built from the focus layer's own constants
+        # and numbers. None of them can carry an application name, a host or a window title - that
+        # is the privacy property in void/focus/__init__.py, asserted by its tests.
+        return self._engine_reply(goal, reply, task_id="(focus)")
+
+    #: What the owner hears when they scoped a question to their notes and the notes do not cover it.
+    #: A CONSTANT: nothing from the question, a note, a filename or a model is interpolated, which is
+    #: what lets it be spoken aloud as engine-authored text.
+    NOT_IN_NOTES = "That is not in your notes."
+
+    #: And what they hear when they asked their notes a question without having configured any.
+    NO_NOTES_CONFIGURED = ("No notes folder is configured, so I have nothing to search. Set "
+                           "vault.notes_root in config/local_config.yaml to your notes directory.")
+
+    def _vault_route(self, goal: str) -> AgentResult | None:
+        """A question the owner explicitly aimed at their own notes, which the notes cannot answer.
+
+        Only that case, and only when the owner said "my notes" - see void/vault/ask.py for why the
+        scoping has to be explicit. The point is the one the prompt packs are most insistent about:
+        "not in the vault" has to be reachable without depending on a model choosing to call a tool
+        and then choosing to be honest about the result.
+
+        Everything else about the notes is left to the ordinary agent and the ``search_notes`` tool,
+        whose result already carries the verified-or-absent header. A second answering path for the
+        cases a model handles correctly would only be a second thing to keep correct.
+        """
+        question = vault_ask.scoped_question(goal)
+        if question is None:
+            return None
+        if self.vault is None:
+            return self._engine_reply(goal, self.NO_NOTES_CONFIGURED, task_id="(notes)")
+        try:
+            recall = self.vault.search(question)
+        except VaultUnavailable as exc:
+            _log.warning("VAULT_UNAVAILABLE_ON_ROUTE reason=%s", type(exc).__name__)
+            return None                               # let the agent try; the tool reports the reason
+        if recall.verdict != VaultVerdict.ABSENT:
+            return None                               # the notes may hold it: the agent and the tool
+        _log.info("VAULT_ABSENT_ANSWERED notes=%d", self.vault.node_count)
+        return self._engine_reply(goal, self.NOT_IN_NOTES, task_id="(notes)")
+
+    def _engine_reply(self, goal: str, reply: str, *, task_id: str) -> AgentResult:
+        """A completed task whose answer is one of V.O.I.D's own constants.
+
+        ``engine_authored`` is safe to set here precisely because the caller passes a constant: no
+        note text, no filename, no model sentence and no tool summary is interpolated into any reply
+        that reaches this method.
+        """
+        task = Task(goal=goal, id=task_id, status=Status.COMPLETED, result=reply)
+        return AgentResult(task=task, status=Status.COMPLETED, result=reply, steps=0,
+                           engine_authored=True)
+
     def _control_command(self, goal: str) -> AgentResult | None:
         """"stop" / "pause" / "resume" / "cancel" / "instead of that ...", decided deterministically.
 
@@ -1212,6 +1451,21 @@ class Assistant:
         handled = self._memory_command(goal)
         if handled is not None:
             return handled
+        # Which brain is thinking, before the model: a request to swap the model must not be
+        # interpreted BY the model, and an unknown name must refuse rather than load something near it.
+        brain = self._brain_command(goal)
+        if brain is not None:
+            return brain
+        # Focus-session control, before the matchers: "lock on this tab" said mid-session is about
+        # the session's target, not about a browser tab to open.
+        session = self._focus_command(goal)
+        if session is not None:
+            return session
+        # A request to take a website apart, before the website route claims the address as
+        # something to open.
+        apart = self._teardown_route(goal)
+        if apart is not None:
+            return apart
         # A conversation that NAMES someone outranks the application matcher - see
         # _conversation_route on why it is consulted on both sides of the fast path.
         named = self._conversation_route(goal, named_only=True)
@@ -1235,6 +1489,12 @@ class Assistant:
         chat = self._conversation_route(goal)
         if chat is not None:
             return chat
+        # After every matcher that could claim the words ("open my notes folder" is a folder, and
+        # stays one), and before memory recall, because "my notes" is an explicit scope the owner
+        # asserted and recall routing is a heuristic about personal-sounding questions.
+        notes = self._vault_route(goal)
+        if notes is not None:
+            return notes
         route = self._recall_route(goal)
         if isinstance(route, AgentResult):
             return route

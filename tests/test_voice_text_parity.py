@@ -154,7 +154,19 @@ def assistant():
 
 
 def test_the_same_website_route_is_chosen_either_way(assistant):
-    """Route parity, without touching the network: the resolver's own choice for both phrasings."""
+    """Route parity, without touching the network: the resolver's own choice for both phrasings.
+
+    Needs browser automation to be AVAILABLE, not merely configured. ``world_state`` deliberately
+    withholds the "browser" capability on a machine where the adapter cannot run, and
+    ``RouteResolver`` then drops every route requiring it - correctly, since a route that would fail
+    is worse than no route. So on a runner without Playwright there is no navigation candidate to
+    compare, and this test is asserting the runner rather than the parity it is named for. The
+    refusal path on the same machine is covered by
+    ``test_both_paths_refuse_identically_when_the_browser_is_unavailable`` below, so nothing is
+    left untested here.
+    """
+    if assistant.browser is None or not assistant.browser.available():
+        pytest.skip("browser automation is unavailable here, so no navigation route is offered")
     for goal in (TYPED, SPOKEN):
         state = assistant.world_state(goal)
         routes = [r for r in assistant.routes.candidates(goal, state) if r.executable]
@@ -314,13 +326,15 @@ def test_folder_routing_still_resolves_without_a_model():
     Builds its own Assistant AFTER creating the folder: the suite gives each test a fresh temporary
     home, so an Assistant made earlier has the previous home in its scan roots and cannot see this
     folder at all.
+
+    The probe goes inside a configured allowed root, not bare ``Path.home()`` - the catalog confines
+    every candidate through the file layer and is right to refuse a folder outside the boundary.
     """
-    from pathlib import Path
-
     from void.app import Assistant
+    from void.config import Config
 
-    folder = Path.home() / "ZqParityProbe"
-    folder.mkdir(exist_ok=True)
+    folder = Config.load().allowed_roots()[0] / "ZqParityProbe"
+    folder.mkdir(parents=True, exist_ok=True)
     try:
         fresh = Assistant()
         fresh.clear_stop()

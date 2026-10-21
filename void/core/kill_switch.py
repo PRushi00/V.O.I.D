@@ -23,6 +23,7 @@ import threading
 from pathlib import Path
 
 from void.security import secrets
+from void.security import ownership
 
 
 class StopRequested(Exception):
@@ -94,6 +95,7 @@ class KillSwitch:
             try:
                 self.stop_file.parent.mkdir(parents=True, exist_ok=True)
                 self.stop_file.write_text(reason, encoding="utf-8")
+                ownership.restrict(self.stop_file, directory=False)
             except OSError:
                 pass  # in-process flag still holds
         return True

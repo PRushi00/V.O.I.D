@@ -55,6 +55,17 @@ class BM25Index:
             df.update(tf.keys())
         self._idf = {t: math.log(1.0 + (self.n - d + 0.5) / (d + 0.5)) for t, d in df.items()}
 
+    def tokens(self, doc_id: str) -> list[str]:
+        """The token multiset held for one document, or an empty list if it is not indexed.
+
+        Exists so that a caller which must rebuild the index with one document ADDED (the vault, when
+        a note is captured mid-session) does not have to keep a second copy of every document's
+        tokens. BM25 depends on each term's count and the document length, never on token order, so
+        this is exact for rebuilding - it is not a way to recover the original text.
+        """
+        tf = self._tf.get(doc_id)
+        return list(tf.elements()) if tf else []
+
     def score(self, query_tokens: Iterable[str]) -> dict[str, float]:
         """BM25 score per document with at least one matching term (non-matches omitted)."""
         terms = sorted(set(query_tokens))

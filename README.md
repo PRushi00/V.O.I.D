@@ -43,6 +43,20 @@ Other commands: `python -m void tasks` (list tasks),
 `python -m void resume <task-id>` (resume an interrupted task),
 `python -m void set-pin` (set an emergency-stop PIN).
 
+Check that the installation actually works, end to end:
+
+```powershell
+python -m void preflight          # runs every LIVE chain; exit 2 on any failure
+python -m void preflight --offline # skip the probes that need a credential or the network
+python -m void doctor              # read-only health of a RUNNING instance; repairs nothing
+```
+
+`preflight` executes: it builds a real Assistant, indexes the real notes vault, makes one real
+minimal provider call, asks the Models API for the configured model by id, writes and removes a real
+probe note, and engages and clears the kill switch in a scratch directory. It never sends anything,
+launches anything or touches your memory store. It ends with one line — `N pass, N fail, N warn` —
+and "done" means that line has no failures in it.
+
 ---
 
 ## How it's put together
@@ -72,7 +86,163 @@ void/
     kill_switch.py     "VOID, STOP EVERYTHING" — in-process + cross-process file
   ui/
     widget.py          minimal always-on-top circular widget (PySide6)
+    focus_card.py      the countdown card: a pure presenter, and a view that only paints it
+  billing/             the invoice engine: the model describes, Python does the arithmetic
+  vault/               the owner's own markdown notes, retrievable and cited
+  focus/               the accountability timer, and the identities it never stores
+  teardown/            website teardown: a clean browser, REA, and a cited note
+    panel.py           the live eight-step panel, and "show me the last teardown"
+  perception/
+    stillness.py       the screen watch: 576 block means, and no opinion about what is on screen
+  preflight/           the live-chain harness behind `python -m void preflight`
 ```
+
+### The notes vault
+
+Point V.O.I.D at a folder of markdown notes and it can answer from them and say which note each
+answer came from. Set it in `config/local_config.yaml` (never the tracked default):
+
+```yaml
+vault:
+  notes_root: "C:/Users/you/Documents/Notes"
+```
+
+The root must sit inside `security.allowed_roots`; it is read through the same confined file layer as
+every other file access. With no root set, the notes tools answer honestly that none is configured
+rather than guessing where your notes are.
+
+The property that matters most: when the notes genuinely do not cover a question, the vault returns
+**no excerpts at all** and says so, instead of handing the model its best six near-misses to
+improvise from. See `void/vault/__init__.py`.
+
+### Receipts, or it didn't happen
+
+Before an answer written by a model reaches you, it is screened against this turn's tool receipts. If
+it claims V.O.I.D just sent, called, booked, paid, posted or deleted something and no tool in that
+turn produced that effect, the sentence is replaced with an honest one and the original is kept in
+the task's message history. Five of those six claims can never be backed, because V.O.I.D has no
+capability that sends, calls, books, pays or posts. See `void/orchestration/judge.py`.
+
+### Changing which model thinks
+
+```
+"which model are you using"        -> the exact id and provider
+"switch to gemini 3.5 flash"       -> swapped, for this process only
+"try on opus 5.5"                  -> refused, with the list of what IS available
+"go back to your normal brain"     -> back to the configured model
+```
+
+A name that does not land on an exact id V.O.I.D knows about is **refused**, never approximated — a
+loose matcher that keeps "opus" and throws away "5.5" costs you an hour of testing the wrong brain.
+The known set comes from your configuration, so adding a model you have verified is one line
+(`llm.known_models`). Swaps are runtime only: a restart always returns to the configured model.
+
+### Focus sessions
+
+```
+"thirty minutes on this"            -> starts a session
+"I'm working on the thumbnail sprint"  (the answer to "what are we focusing on?")
+"give me fifteen seconds"           -> quiet
+"it's okay, I'm doing research"     -> excuses the detour and refunds its seconds
+"lock on this tab"                  -> move the target to where you are now
+"how long is left"                  -> the countdown, on target minutes, detours
+"end the session"                   -> the report card
+```
+
+It observes and accounts; it enforces nothing — there is no capability in the layer that can close,
+block or hide a window. A session started while you are looking at V.O.I.D locks **nothing** until
+you settle somewhere else, because that is the one window you are guaranteed to leave.
+
+The privacy property is structural, not a promise: the name of the site or application you drift into
+is read, turned into a sentence, spoken, and dropped. Neither the session state nor the ledger has a
+field that can hold it — not even a hash — and the tests prove it with a canary label that appears
+nowhere else in the repository. `focus.name_the_distraction: false` derives no label at all. See
+`void/focus/__init__.py`.
+
+The tab lane needs `browser.enabled`; without it a session locks the application only and says so. If
+the foreground cannot be read at all, the session is `blind`: it counts nothing and accuses you of
+nothing.
+
+### Taking a website apart
+
+Off by default. Turn on `teardown.enabled`, then:
+
+```powershell
+python -m void teardown diag                 # can it run here, and what is missing
+python -m void teardown install              # installs the pinned kit, on purpose, verifying it first
+python -m void teardown run igloo.inc --question "how does the scroll work?"
+```
+
+It opens a **brand-new browser profile** with none of your logins in it, lets REA watch the page for
+seconds while V.O.I.D scrolls it, reads the code and the browser's own asset log, names the stack from
+licence banners (which survive minification, so the versions are exact rather than guessed), writes a
+note into your vault, and deletes the profile. Every line of evidence says who saw it — REA, V.O.I.D's
+own browser read, or both — and the note ends with what the evidence *cannot* show.
+
+V.O.I.D never installs the kit by itself: `teardown install` is your deliberate act, it checks the
+package's repository URL before fetching anything, and it passes `--ignore-scripts` so no lifecycle
+script of a third-party package runs on your machine. The observation is read-only by construction —
+the DevTools client has no click, no typing and no navigation.
+
+Point it at public sites, open-source code and your own projects.
+
+While a capture runs it prints each of the eight steps as it happens, and shows the same thing as an
+on-screen panel where there is a display — a capture is tens of seconds of silence otherwise, and a
+run that looks hung is a run people interrupt. Afterwards:
+
+```powershell
+python -m void teardown last                 # the most recent note: title, path, excerpt
+```
+
+That reads your vault, so it needs no browser, no Node and no REA — the note is the record. It exits
+2 when there is nothing to show, so a script can tell "none yet" from "here it is".
+
+### Invoices, where the model never does the sums
+
+```powershell
+python -m void invoice "two days of design for Sideview at 450 a day, 20% VAT"
+```
+
+The model reads your description and returns strict JSON: descriptions, quantities, unit prices. It
+is **not** asked to add anything up, and if it supplies a total anyway that figure is recomputed,
+overridden, and **printed on the invoice** as having been overridden — a model that cannot add up is
+a fact about the run, and quietly fixing it would hide the only evidence of it.
+
+Money is `Decimal` throughout, never `float`, rounded half-up the way a person does it on paper.
+Invoice numbers come out of the ledger itself in sequence, gap-free and never reused; the ledger is
+JSON lines at mode 0600, because it names your clients and what each was charged. The document goes
+through the same artifact layer as everything else, which re-opens what it wrote — and the ledger row
+is written only after that inspection passes, so a failed render never burns a number.
+
+**Nothing is sent.** There is no invoice transport configured, so the command says so in those
+words, the invoice records `delivered: false`, and there is no code path that can set it true. If
+anything ever told you otherwise, the receipt judge would block the sentence for want of a receipt.
+
+### The focus card
+
+A session paints a small always-on-top card in the top-right corner: the countdown, whether the lock
+is on, minutes on target, drifts. It **tints amber when you drift**, which is the only warm colour in
+the set, so one glance means one specific thing. It is a read-only observer of the session — it
+cannot start, end, pause or tick one — and it cannot display what you were looking at, because it is
+built from `FocusEngine.state()`, which has no field able to hold a name. It needs no configuration
+and simply does not appear where there is no display.
+
+### Watching for a still screen
+
+**Off by default, behind two switches.** `screen.enabled` is "may you read the screen when I ask";
+`screen.watch_enabled` is "may you do it on a loop". Both must be true, so one mis-set key cannot
+start a continuous watch, and with either false there is no watch object to drive at all.
+
+When on, it reduces each capture to a **32×18 grid of block means** — 576 numbers, in which no glyph,
+face or line of text survives — compares it with the previous grid, and says one content-free
+sentence when nothing has changed for ten minutes. A blank screen never nudges: asleep, locked and
+blanked are all still, and nudging you about your own screensaver is noise.
+
+It decides *when* the screen has been still, never *what* is on it. It holds nothing but the previous
+grid, writes nothing to disk, and has no provider to call and no encoder to hand a picture to — which
+is asserted by walking its syntax tree, not by trusting this paragraph. Acting on a nudge (taking a
+real capture, sending it anywhere) stays exactly where it already was: behind
+`screen.allow_cloud_analysis`, the risk gate and the kill switch.
 
 ### Security & autonomy (V1)
 
@@ -87,6 +257,11 @@ void/
   stop later).
 - **Secrets** live in the Windows Credential Manager via `keyring`, never in
   the repo or plaintext config.
+- **V.O.I.D's own state is owner-only.** The state directory is created 0700 and
+  every file in it 0600 (`void/security/ownership.py`), re-applied at every
+  start so an installation created before that was true is repaired. The task
+  database holds your goals and sentences in plain text; `void preflight` checks
+  the modes and fails loudly when they are wrong.
 
 ### Configuration
 

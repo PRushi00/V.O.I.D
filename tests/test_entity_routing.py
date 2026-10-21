@@ -408,14 +408,21 @@ def test_a_folder_request_resolves_from_the_catalog_and_consults_no_model():
     matters is the mechanism - that "open my <name> folder" reaches the deterministic catalog rather
     than the model - and that holds for any folder the catalog can see.
 
+    The probe is created inside a CONFIGURED ALLOWED ROOT. An earlier revision put it in bare
+    ``Path.home()``, which the folder catalog is right to refuse: it confines every candidate
+    through the file layer, and home is not an allowed root under the shipped configuration. So the
+    test asked the engine to breach its own boundary and then failed when it did not - it never
+    passed on any machine. Reading the root from the configuration rather than hard-coding it keeps
+    the test honest if that default ever moves.
+
     Measured on the owner's machine before the fix: 41 s, of which ~31 s was provider retries and
     8 s a filesystem walk the catalog answers in 0.01 ms. After: 0.79 s.
     """
     from void.app import Assistant
+    from void.config import Config
 
-    home = Path.home()
-    folder = home / "ZqFolderProbe"
-    folder.mkdir(exist_ok=True)
+    folder = Config.load().allowed_roots()[0] / "ZqFolderProbe"
+    folder.mkdir(parents=True, exist_ok=True)
     try:
         assistant = Assistant()
         assistant.clear_stop()

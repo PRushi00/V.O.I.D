@@ -36,6 +36,11 @@ WAKE_PHRASE = "Hey V.O.I.D."
 # Conservative default: a false negative is preferable to a false positive,
 # because an accidental wake is a privacy event. Real tuning happens in 9C-5.
 _DEFAULT_THRESHOLD = 0.6
+#: Cores the always-on wake preprocessor may use. One, because this model runs continuously
+#: and ONNX Runtime spin-waits between inferences when given the whole machine; measured at
+#: 20.6 cores of idle load unbounded vs 0.30 bounded, at identical per-inference time
+#: (docs/VOICE_LATENCY_2026-09-23.md). Configurable as voice.wake_cpu_threads.
+_DEFAULT_CPU_THREADS = 1
 
 
 class WakeWordError(RuntimeError):
@@ -129,12 +134,17 @@ class OpenWakeWordDetector(WakeWordDetector):
 
     def __init__(self, *, model_path: str | None, threshold: float = _DEFAULT_THRESHOLD,
                  model_name: str | None = None,
+                 cpu_threads: int = _DEFAULT_CPU_THREADS,
                  on_wake: Callable[[str], None] | None = None,
                  _model_factory: Callable[[], object] | None = None):
         super().__init__(on_wake)
         self._model_path = model_path
         self._threshold = float(threshold)
         self._model_name = model_name
+        try:
+            self._cpu_threads = max(1, int(cpu_threads))
+        except (TypeError, ValueError):
+            self._cpu_threads = _DEFAULT_CPU_THREADS
         self._model_factory = _model_factory
         self._model = None
         self._running = False
@@ -170,7 +180,15 @@ class OpenWakeWordDetector(WakeWordDetector):
                 "wake word needs the 'openwakeword' package "
                 "(pip install -r requirements-voice.txt)") from exc
         try:
-            self._model = Model(wakeword_models=[self._model_path])
+            # ``ncpu`` is forwarded by Model.__init__ to its AudioFeatures preprocessor, whose
+            # melspectrogram and embedding ORT sessions are the ALWAYS-ON ones (checked against the
+            # openwakeword 0.6.0 source, model.py:213 and utils.py:42-84). The classifier sessions
+            # the library already pins to one thread itself. One is also the library's own default,
+            # so this does not change today's behaviour - it PINS it, so a future release that
+            # relaxes the default cannot quietly put an always-on spin-wait on every core. That is
+            # the defect docs/VOICE_LATENCY_2026-09-23.md measured at 20.6 cores of idle load on
+            # the Gen 3 path, and the reason voice.wake_cpu_threads exists.
+            self._model = Model(wakeword_models=[self._model_path], ncpu=self._cpu_threads)
         except Exception as exc:
             raise WakeWordBackendError(
                 f"could not initialize openWakeWord model: {exc}") from exc
@@ -289,6 +307,7 @@ def create_wake_detector(config=None, *, provider: str | None = None,
         return factory(
             model_path=_cfg("voice.wake_model_path", "") or None,
             threshold=_cfg("voice.wake_threshold", _DEFAULT_THRESHOLD),
+            cpu_threads=_cfg("voice.wake_cpu_threads", _DEFAULT_CPU_THREADS),
             on_wake=on_wake,
         )
     if name == "whisper_gen3":
