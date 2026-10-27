@@ -248,13 +248,27 @@ def cmd_set_key(name: str, alias: str | None = None) -> int:
 
 
 def cmd_list_keys() -> int:
+    """Which Gemini credentials are configured, and whether each one is actually there.
+
+    The manifest holds NAMES. A name is what V.O.I.D looks for, not evidence that a value exists,
+    and printing the two as though they were the same thing makes an empty installation look
+    configured. So each line says where the value would come from, and `absent` means absent.
+    """
     # Names only - the pool reads just the manifest, never a secret value.
     pool = credentials.CredentialPool()
     names = pool.names()
-    print("Gemini credentials (names only; key values are never displayed):")
+    print("Gemini credentials (names and source only; key values are never displayed):")
     for n in names:
         tag = " (primary)" if n == secrets.GEMINI_API_KEY else ""
-        print(f"  - {n}{tag}")
+        try:
+            source = secrets.secret_source(n)
+        except Exception:                      # noqa: BLE001 - a report never fails on a backend
+            source = "unknown"
+        print(f"  - {n}{tag}: {source}")
+    if all(secrets.secret_source(n) == secrets.ABSENT for n in names):
+        primary = secrets.ENV_FALLBACKS.get(secrets.GEMINI_API_KEY, ("VOID_GEMINI_API_KEY",))[0]
+        print(f"\nNo key is stored. Use 'python -m void set-key gemini', or on a machine with no "
+              f"keyring set {primary} in the environment.")
     return 0
 
 
@@ -1058,11 +1072,13 @@ def cmd_egress(as_json: bool, run_drill: bool) -> int:
         assistant = Assistant(config=Config.load())
         if assistant.vault is not None:
             subject = "vault retrieval"
+
             def run():
                 return assistant.vault.search("pricing retainer invoice")
         else:
             from void.orchestration.judge import screen
             subject = "the receipt judge"
+
             def run():
                 return screen("Three notes mention pricing.", [])
         try:
