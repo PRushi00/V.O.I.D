@@ -387,15 +387,66 @@ def test_a_real_name_is_still_a_person():
 
 # =========================================================================== latency
 
-def test_an_application_request_consults_no_model():
-    """The latency property: a request V.O.I.D can resolve itself never reaches a model."""
+def test_an_application_request_consults_no_model(monkeypatch):
+    """The latency property: a request V.O.I.D can resolve itself never reaches a model.
+
+    Both of the facts this property stands on are FORCED here rather than inherited from whatever
+    machine the suite runs on, because inheriting either made a green result a statement about the
+    developer's environment rather than about the route.
+
+    **No brain at all.** The earlier form asserted only ``steps <= 1``, and a model that answers in
+    one step satisfies that - so with a Gemini credential in the environment this test passed while
+    the sentence DID reach a model. Instrumented: ``GeminiProvider.generate`` was called, failed on
+    the network, the local provider failed after it, and the run ended ``failed`` with ``steps=0``,
+    which the assertion accepted. Take the credential away and the same test went red instead, with
+    ``ProviderUnavailable`` raised out of ``Assistant._agent()``. Either way its colour described
+    the machine and not the routing. Emptying the registry is what makes the property testable at
+    all: if the route ever hands this sentence on, there is now no model to hand it to and the run
+    raises rather than passing quietly.
+
+    **A program that is actually installed.** ``notepad`` is a fixed alias resolved through
+    ``shutil.which``, so off Windows ``launch_app`` fails for want of the executable - and a launch
+    that was attempted and failed is the ordinary agent's to explain, deliberately
+    (``Agent.run_direct_targets`` returns ``None`` for exactly that case). That fall-through is
+    correct and is not what this test is about: a sentence is only answerable without a model while
+    the application is there to open. So the executable is supplied the same way the folder test
+    below supplies a real folder, and the spawn itself is swallowed - which also stops a suite run
+    opening a real Notepad window on the owner's desktop.
+    """
+    import void.actions.apps as apps_module
+
     from void.app import Assistant
+    from void.providers.base import ProviderUnavailable
+    from void.providers.registry import ProviderRegistry
+
+    def no_brain(_self):
+        raise ProviderUnavailable("forced absent: this route must need no model")
+
+    # Both entry points, because _agent() asks available_order() first and only falls back to
+    # select(). Leaving either real would let a configured credential answer for the route again.
+    monkeypatch.setattr(ProviderRegistry, "available_order", lambda _self: [])
+    monkeypatch.setattr(ProviderRegistry, "select", no_brain)
+
+    # Installed, and inert. Both patches are narrowed to this one program: everything else on PATH
+    # answers truthfully, and every other spawn in the process still runs - including the ones
+    # building an Assistant makes.
+    real_which, real_popen = apps_module.shutil.which, apps_module.subprocess.Popen
+    monkeypatch.setattr(apps_module.shutil, "which",
+                        lambda cmd, *a, **kw: ("/installed/notepad" if cmd == "notepad"
+                                               else real_which(cmd, *a, **kw)))
+    monkeypatch.setattr(apps_module.subprocess, "Popen",
+                        lambda args, *a, **kw: (None if "notepad" in str(args).lower()
+                                                else real_popen(args, *a, **kw)))
 
     assistant = Assistant()
     assistant.clear_stop()
     started = time.monotonic()
     result = assistant.run("open notepad")
     elapsed = time.monotonic() - started
+    # Completed, not merely quick: a model was unreachable throughout, so reaching a terminal state
+    # at all is the proof that the launcher - and nothing else - answered.
+    assert result.status == "completed", result.result
+    assert "notepad" in (result.result or "").lower(), result.result
     assert result.steps <= 1, f"it took {result.steps} steps"
     assert elapsed < 20.0, f"it took {elapsed:.1f}s"
 
