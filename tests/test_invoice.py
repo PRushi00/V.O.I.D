@@ -488,15 +488,39 @@ def test_the_subcommand_is_in_mains_known_set():
     assert '"invoice"' in known
 
 
-def test_the_command_refuses_honestly_with_no_brain(capsys):
+def test_the_command_refuses_honestly_with_no_brain(capsys, monkeypatch, tmp_path):
     """It needs a model to read the work description. With none, it must say so and write nothing -
-    not invent an invoice."""
+    not invent an invoice.
+
+    The no-brain condition is FORCED here, and that is the point of the fixtures. It used to be left
+    to the ambient machine, which made this a test about the developer's configuration rather than
+    about the code: ``cmd_invoice`` calls ``Config.load()``, which reads ``config/local_config.yaml``
+    from the repository - the one thing the hermetic fixture in ``tests/conftest.py`` cannot sandbox,
+    because it sandboxes ``~`` and that file does not live under ``~``. On the owner's machine it
+    names a local model, so ``providers.select()`` SUCCEEDED, the refusal branch below was never
+    reached, and the test instead called a real model and left a real ``invoice-VOID-2026-0001.pdf``
+    in the repository root. A test that only passes on a machine with no model configured is not
+    testing the refusal; it is testing the machine.
+
+    ``chdir`` is the second half of the fix: the document path is relative, so the repository root is
+    the working directory this would write into. Pointing it at ``tmp_path`` means the assertion that
+    nothing was written can actually be made, instead of assumed.
+    """
     from void.cli import cmd_invoice
+    from void.providers.registry import ProviderRegistry
+
+    def no_brain(self):
+        raise RuntimeError("no provider is configured")
+
+    monkeypatch.setattr(ProviderRegistry, "select", no_brain)
+    monkeypatch.chdir(tmp_path)
 
     code = cmd_invoice("two days for Acme at 450", "pdf", "", as_json=False)
     out = capsys.readouterr().out
     assert code == 2
     assert "No brain is available" in out and "Nothing was written" in out
+    # It said nothing was written. Check that, rather than taking the sentence's word for it.
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_the_document_is_written_through_the_confined_file_layer():

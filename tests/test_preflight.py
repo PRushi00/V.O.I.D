@@ -193,6 +193,110 @@ def test_a_probe_that_raises_becomes_one_failure_and_the_rest_still_run(home):
     assert "the probe itself raised RuntimeError" in report.probes[0].detail
 
 
+# ----------------------------------------------------------------- the two probes that lied
+
+def test_reading_voids_own_source_is_allowed_but_changing_it_is_not(home):
+    """The policy the engine actually implements, pinned so a probe cannot quietly contradict it again.
+
+    ``void.security.protected`` puts V.O.I.D's own package in the WRITE-deny set and says so in as
+    many words - "refused for mutation only". Its source is public code; the risk is a tool editing
+    the engine underneath itself, not a tool reading it. The preflight probe nonetheless demanded
+    that a READ of ``void/preflight/__init__.py`` be refused, and got away with it for as long as
+    every configuration in sight had allowed roots too narrow to reach the repository at all.
+    """
+    from void.app import Assistant
+    from void.config import _PKG_DIR
+
+    repo = Path(_PKG_DIR).parent
+    assistant = Assistant(config=config_for(home, security={"allowed_roots": [str(repo)]}))
+    own_source = str(Path(_PKG_DIR) / "preflight" / "__init__.py")
+
+    assert assistant.tools.execute("read_file", {"path": own_source}).ok, (
+        "V.O.I.D's own source is write-denied, not read-protected; refusing the read would be a new "
+        "policy, and this test exists so that it cannot arrive by accident")
+    refused = assistant.tools.execute(
+        "write_file", {"path": str(Path(_PKG_DIR) / "nope.py"), "content": "x"})
+    assert not refused.ok and "protected" in (refused.error or "")
+    assert not (Path(_PKG_DIR) / "nope.py").exists()
+
+
+def test_the_engine_protection_probe_rejects_a_refusal_it_did_not_earn(home, monkeypatch):
+    """The defect that hid the first one: a refusal used to count however it was reached.
+
+    A path refused for being outside ``security.allowed_roots`` proves confinement, not protection,
+    and a probe that cannot tell them apart reports a guarantee it never measured. That is exactly
+    what happened here - it passed on this suite's narrow roots for as long as they stayed narrow.
+    """
+    from void.actions.base import ToolResult
+    from void.actions.registry import ToolRegistry
+
+    monkeypatch.setattr(ToolRegistry, "execute", lambda self, name, args: ToolResult.failure(
+        f"'{args['path']}' is outside the allowed roots (nowhere)."))
+
+    probe = by_name(run_preflight(config_for(home), offline=True,
+                                  probes=(preflight._check_engine_protection,)))["engine protection"]
+    assert probe.status == FAIL and "not as protected" in probe.detail
+
+
+def test_a_write_that_reaches_voids_own_package_fails_loudly(home, monkeypatch):
+    from void.actions.base import ToolResult
+    from void.actions.registry import ToolRegistry
+
+    real = ToolRegistry.execute
+
+    def allow_the_write(self, name, args):
+        if name == "write_file":
+            return ToolResult.success("written")
+        return real(self, name, args)
+
+    monkeypatch.setattr(ToolRegistry, "execute", allow_the_write)
+    probe = by_name(run_preflight(config_for(home), offline=True,
+                                  probes=(preflight._check_engine_protection,)))["engine protection"]
+    assert probe.status == FAIL and "own package" in probe.detail
+
+
+def test_allowed_roots_that_cover_a_system_file_warn_rather_than_allege_an_escape(home):
+    """Reading a file INSIDE the allowed roots is the configured behaviour, not a breach.
+
+    The probe used to read a hardcoded hosts file and, on success, report it as "outside
+    security.allowed_roots" - a claim it never checked. With ``allowed_roots: [C:\\]``, which
+    ``void.security.protected`` documents as the owner's own setting and designs around, that file is
+    inside the roots. The breadth of the roots is the real finding and belongs in the report as
+    itself; a FAIL alleging an escape that did not happen only teaches the owner to stop reading.
+    """
+    root = "C:/" if os.name == "nt" else "/"
+    probe = by_name(run_preflight(config_for(home, security={"allowed_roots": [root]}),
+                                  offline=True,
+                                  probes=(preflight._check_confinement,)))["path confinement"]
+    assert probe.status == WARN
+    assert "confinement works" in probe.detail or "cannot be demonstrated" in probe.detail
+    assert "returned content" not in probe.detail
+
+
+def test_confinement_still_fails_when_a_path_outside_the_roots_is_readable(home, monkeypatch):
+    from void.actions.base import ToolResult
+    from void.actions.registry import ToolRegistry
+
+    monkeypatch.setattr(ToolRegistry, "execute",
+                        lambda self, name, args: ToolResult.success("here it is", data="root:x:0:0"))
+    probe = by_name(run_preflight(config_for(home), offline=True,
+                                  probes=(preflight._check_confinement,)))["path confinement"]
+    assert probe.status == FAIL and "returned content" in probe.detail
+
+
+def test_a_path_outside_the_roots_needs_no_existence_to_test_the_check(home):
+    """``_confine`` applies the roots test before it touches the filesystem, which is what lets the
+    probe use a path that cannot exist - and therefore cannot be refused for an unrelated reason."""
+    root = Path(home).resolve()
+    outside = preflight._a_path_outside([root])
+    assert outside is not None and not outside.exists()
+    assert not outside.is_relative_to(root)
+    # Roots that leave nothing outside are reported as such rather than guessed at. On Windows an
+    # unused drive letter is still outside C:\, so exhausting the candidates needs every letter.
+    everything = ([Path(f"{c}:/") for c in "CQRSTUVWXYZ"] if os.name == "nt" else [Path("/")])
+    assert preflight._a_path_outside(everything) is None
+
+
 # ================================================================== it is safe to run
 
 def test_the_probe_note_is_removed_from_the_owners_vault(home):

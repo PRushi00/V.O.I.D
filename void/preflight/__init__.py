@@ -224,39 +224,151 @@ def _check_secrets_are_not_in_the_repository(ctx) -> None:
                            f"every file in {state_dir} is owner-only")
 
 
+#: A refusal from ``FileActions._confine`` names which layer refused. A probe that only looks at
+#: ``ok`` cannot tell protection from confinement, and that is not a detail: it is how the engine
+#: protection probe below came to pass on a refusal the protection layer never issued.
+_PROTECTED_MARKERS = ("protected by V.O.I.D", "protected (excluded) directory")
+_CONFINEMENT_MARKER = "is outside the allowed roots"
+
+
+def _refusal(out) -> str:
+    return out.error or out.summary or ""
+
+
 def _check_engine_protection(ctx) -> None:
-    """V.O.I.D's own state and the credential store refuse the file tools, really."""
+    """V.O.I.D's own state and the credential store refuse the file tools, really.
+
+    Two guarantees, asserted separately, because ``void.security.protected`` implements two. The
+    state directory and the config directory are READ-protected: they hold the device keys, the
+    memory database, the task store, and the ``security.*`` settings that decide everything else.
+    V.O.I.D's own package is WRITE-denied, not read-protected - its source is public code, so the
+    risk there is self-modification through a file tool, not disclosure. This probe used to demand
+    that a READ of its own source be refused, which is a policy the engine has never implemented and
+    which that module's docstring explicitly disclaims ("refused for mutation only").
+
+    It also checks WHY each path was refused, and that is what hid the first problem. A refusal used
+    to count however it was reached, so on an installation whose ``security.allowed_roots`` are
+    narrow - every one of this suite's, as it happens - the probe passed on paths that were merely
+    outside those roots. It reported "protected" while measuring confinement. Nothing revealed that
+    until the owner's roots became ``C:\\``, the accidental refusal went away, and the probe failed on
+    a file it was never the protection layer's job to hide.
+
+    The write attempt is made even under ``--read-only``. It targets a name that does not exist
+    inside the package, so a correct engine refuses it and nothing is written; if something IS
+    written, that is precisely the failure this probe exists to find, and it is removed at once.
+    """
+    from void.config import _CONFIG_DIR, _PKG_DIR
+
     assistant = ctx.assistant()
-    targets = [str(ctx.config.state_dir() / "tasks.sqlite"),
-               str(Path(__file__).resolve()),
-               str(Path(ctx.config.state_dir()) / ".." / ".void" / "STOP")]
-    refused, allowed = 0, []
-    for target in targets:
-        out = assistant.tools.execute("read_file", {"path": target})
+    problems: list[str] = []
+
+    # --- read-protected: the state dir, and the config that holds the security settings.
+    # Neither target has to exist. ``_confine`` decides protection from the resolved path before it
+    # touches the filesystem, so a missing file cannot turn into an accidental pass.
+    # The third form is deliberately a traversal: <state>/../.void/STOP names the kill switch
+    # inside the protected directory by a route that only normalisation catches. It was in the
+    # original list and stays in it - an adversarial spelling is the case worth keeping.
+    reads = [Path(ctx.config.state_dir()) / "tasks.sqlite",
+             _CONFIG_DIR / "local_config.yaml",
+             Path(ctx.config.state_dir()) / ".." / ".void" / "STOP"]
+    for target in reads:
+        out = assistant.tools.execute("read_file", {"path": str(target)})
         if out.ok:
-            allowed.append(target)
-        else:
-            refused += 1
-    if allowed:
-        ctx.report.add("engine protection", FAIL,
-                       "a file tool read a path that must be protected: " + ", ".join(allowed))
+            problems.append(f"a file tool read a path that must be protected: {target}")
+        elif not any(m in _refusal(out) for m in _PROTECTED_MARKERS):
+            problems.append(f"{target} was refused, but not as protected: {_refusal(out)}")
+
+    # --- write-denied: V.O.I.D's own code cannot be changed through a file tool.
+    probe_file = Path(_PKG_DIR) / ".preflight-write-denied-probe"
+    out = assistant.tools.execute("write_file", {"path": str(probe_file), "content": "x"})
+    if out.ok or probe_file.exists():
+        problems.append(f"write_file wrote into V.O.I.D's own package: {probe_file}")
+        try:
+            probe_file.unlink()
+        except OSError:
+            pass
+    elif not any(m in _refusal(out) for m in _PROTECTED_MARKERS):
+        problems.append(f"a write into {_PKG_DIR} was refused, but not as protected: {_refusal(out)}")
+
+    if problems:
+        ctx.report.add("engine protection", FAIL, "; ".join(problems))
         return
     ctx.report.add("engine protection", OK,
-                   f"{refused} protected paths refused by the file layer (state, own source)")
+                   f"{len(reads)} read-protected paths refused as protected (state, config); "
+                   f"V.O.I.D's own package refused for changes")
+
+
+def _a_path_outside(roots) -> Path | None:
+    """A path that is certainly outside ``roots``, or None if the roots leave nothing outside.
+
+    It deliberately need not exist. ``_confine`` applies the allowed-roots test before it touches the
+    filesystem, so a non-existent path still exercises the real check - and unlike a real file it
+    cannot be refused for some unrelated reason, which is the confusion this helper exists to end.
+    """
+    def covered(p: Path) -> bool:
+        return any(p == r or p.is_relative_to(r) for r in roots)
+
+    if os.name == "nt":
+        for letter in "QRSTUVWXYZ":
+            candidate = Path(f"{letter}:/void-confinement-probe")
+            if not covered(candidate):
+                return candidate
+        return None
+    candidate = Path("/void-confinement-probe")
+    return None if covered(candidate) else candidate
 
 
 def _check_confinement(ctx) -> None:
-    """A path outside the allowed roots is refused, really."""
+    """A path outside the allowed roots is refused, really - and the owner is told when they have
+    left nothing outside them.
+
+    The previous version read a hardcoded ``C:/Windows/System32/drivers/etc/hosts`` and, when the
+    read succeeded, reported that it was "outside security.allowed_roots". It had never checked. With
+    ``security.allowed_roots: [C:\\]`` - the setting ``void.security.protected`` names as the owner's
+    own, and designs around - the hosts file is INSIDE the allowed roots, and reading it is the
+    configured behaviour rather than an escape. So the probe alleged a breach that had not happened,
+    and in doing so buried the finding that is real: the roots cover the whole drive.
+
+    Both halves are now reported for what they are. The mechanism is proved against a path that is
+    genuinely outside the roots, and the breadth of the roots is a WARN on its own terms.
+    """
     assistant = ctx.assistant()
-    outside = "/etc/passwd" if os.name != "nt" else "C:/Windows/System32/drivers/etc/hosts"
-    out = assistant.tools.execute("read_file", {"path": outside})
+    roots = ctx.config.allowed_roots()
+    shown = ", ".join(str(r) for r in roots) or "none configured"
+
+    target = _a_path_outside(roots)
+    if target is None:
+        ctx.report.add("path confinement", WARN,
+                       f"security.allowed_roots ({shown}) leaves nothing on this machine outside "
+                       f"it, so confinement cannot be demonstrated; the engine-protected paths are "
+                       f"still refused - see 'engine protection'")
+        return
+
+    out = assistant.tools.execute("read_file", {"path": str(target)})
     if out.ok:
         ctx.report.add("path confinement", FAIL,
-                       f"read_file returned content for {outside}, which is outside "
-                       f"security.allowed_roots")
+                       f"read_file returned content for {target}, which is outside "
+                       f"security.allowed_roots ({shown})")
         return
-    roots = ", ".join(str(r) for r in ctx.config.allowed_roots()) or "none configured"
-    ctx.report.add("path confinement", OK, f"{outside} refused; allowed roots: {roots}")
+    if _CONFINEMENT_MARKER not in _refusal(out):
+        ctx.report.add("path confinement", FAIL,
+                       f"{target} is outside security.allowed_roots ({shown}) but was refused for "
+                       f"another reason, so confinement itself is untested: {_refusal(out)}")
+        return
+
+    # The mechanism works. Whether it protects anything worth protecting is a separate question, and
+    # the honest answer on a machine whose root is a whole drive is "less than the name suggests".
+    sensitive = (Path("C:/Windows/System32/drivers/etc/hosts") if os.name == "nt"
+                 else Path("/etc/passwd"))
+    inside = any(sensitive == r or sensitive.is_relative_to(r) for r in roots)
+    if inside:
+        ctx.report.add("path confinement", WARN,
+                       f"{target} refused, so confinement works - but security.allowed_roots "
+                       f"({shown}) covers {sensitive}: everything on that drive except the "
+                       f"engine-protected paths is readable by the file tools")
+        return
+    ctx.report.add("path confinement", OK,
+                   f"{target} and {sensitive} refused; allowed roots: {shown}")
 
 
 def _check_task_store(ctx) -> None:

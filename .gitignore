@@ -1,3 +1,16 @@
+# Why this file is at the repository root when the project's documents are not.
+#
+# The owner deliberately moved the project's documents and configuration - README.md, pytest.ini,
+# the requirements* files - into workspace/, and that preference is respected: nothing is moved
+# back. This file is the one exception, for exactly the reason conftest.py is one: git applies a
+# .gitignore only to the directory that holds it and below, so workspace/.gitignore cannot ignore
+# config/local_config.yaml or wakeword-training/ up at the root - from there it ignores nothing at
+# all. While this file was missing from the root the whole list below was inert, and `git status`
+# offered 563 paths instead of 19: local_config.yaml and the owner's voice recordings among them,
+# untracked but NOT ignored, one `git add -A` away from being committed. This is git tooling that
+# has to sit at the root to do anything, not one of the documents the owner relocated. The copy in
+# workspace/ is left exactly where they put it.
+
 # V.O.I.D
 __pycache__/
 *.pyc
@@ -22,6 +35,14 @@ secrets.*
 # keyring; it holds no secret values). It is imported by config, the kill
 # switch and the device gateway, so a clone without it cannot run.
 !void/security/secrets.py
+
+# Invoices name the owner's clients and what each was charged. `void invoice` writes the document to
+# the working directory unless told otherwise, so the repository root is precisely where they land -
+# invoice-VOID-2026-0001.pdf was sitting here, written by a test run.
+invoice-*.pdf
+invoice-*.md
+invoice-*.txt
+invoice-*.html
 
 # OS / editor
 .DS_Store
