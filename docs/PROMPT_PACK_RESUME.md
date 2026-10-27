@@ -209,7 +209,7 @@ capability, which is the failure the receipts rule exists to prevent.
 | TypeSafe AI "Jev" (the whole Jev Part Two) | A key, and network access to `docs.typesafe.ai` / `api.typesafe.ai` — both proxy-refused. The prompt itself requires reading the live docs *before writing a line*, which cannot be done |
 | Telegram (Opus 11, 14, 15; phone 04) | A BotFather token and the owner's chat id |
 | Google Calendar/Gmail (Opus 10, 15) | A Google Cloud project, a consent screen in production, an OAuth client |
-| The live Gemini call and the Models API lookup | A Gemini credential. Both preflight probes WARN honestly without one |
+| A real `generateContent` through the harness | Nothing from the owner. The credential is present and valid (`list-keys` reports `environment`; `model reachable` passes live), but the configured `gemini-3.8-flash` is returning `503 UNAVAILABLE / high demand`. `gemini-3.5-flash` generates fine, so this is model capacity, not the key — preflight now WARNs rather than blaming the credential (P1.23) |
 | The latency budget (local/07) | A microphone, a speaker and a provider credential. Preflight already times every probe, so only the three numbers are missing |
 | Anything Windows-native | A Windows machine. The focus *sensor* in particular: the engine is verified to the second against a scripted desk, the reader needs a real foreground |
 
