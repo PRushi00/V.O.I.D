@@ -582,6 +582,32 @@ def _check_memory(ctx) -> None:
                    _ms(t0))
 
 
+#: Failure categories that say nothing about the credential or the configuration: the service was
+#: busy, slow or unreachable. Reporting one of these as FAIL tells the owner their key is broken
+#: when the evidence does not support that - the opposite mistake from the one preflight exists to
+#: prevent. Everything NOT in this set (auth, quota, unsupported_model, invalid_request) stays FAIL,
+#: because each of those is persistent and each names something the owner must actually change.
+#:
+#: The categories come from `void/providers/failures.py`, which already draws this distinction for
+#: retry and failover. Classifying provider errors a second way here would be a second taxonomy to
+#: keep in step with the first.
+_TRANSIENT_FAILURES = frozenset({"server", "timeout", "network", "rate_limit"})
+
+
+def _report_provider_failure(ctx, probe: str, subject: str, exc: Exception, took: float) -> None:
+    """Report a provider error as what it is, rather than as a verdict on the key."""
+    from void.providers.failures import classify
+    category = classify(exc)
+    if category in _TRANSIENT_FAILURES:
+        ctx.report.add(probe, WARN,
+                       f"{subject} answered with a {category} fault "
+                       f"({type(exc).__name__}: {exc}). This says nothing about the credential "
+                       f"either way - the service did not answer. Run it again.", took)
+    else:
+        ctx.report.add(probe, FAIL,
+                       f"{subject} raised {type(exc).__name__}: {exc}", took)
+
+
 def _check_provider_credential(ctx) -> None:
     """One real, minimal call with the stored credential. The pack's "is the key actually valid"."""
     if ctx.offline:
@@ -599,9 +625,9 @@ def _check_provider_credential(ctx) -> None:
     try:
         response = provider.generate([{"role": "user", "content": "Reply with the word OK."}])
     except Exception as exc:
-        ctx.report.add("provider credential", FAIL,
-                       f"{provider.name} ({getattr(provider, 'model', '?')}) raised "
-                       f"{type(exc).__name__}: {exc}", _ms(t0))
+        _report_provider_failure(ctx, "provider credential",
+                                 f"{provider.name} ({getattr(provider, 'model', '?')})",
+                                 exc, _ms(t0))
         return
     text = (response.text or "").strip()
     if not text:
@@ -644,9 +670,7 @@ def _check_model_is_reachable(ctx) -> None:
         client = gemini._client_for(credential)                 # noqa: SLF001
         info = client.models.get(model=model)
     except Exception as exc:
-        ctx.report.add("model reachable", FAIL,
-                       f"{model}: {type(exc).__name__} from models.get - the credential cannot "
-                       f"reach that id ({exc})", _ms(t0))
+        _report_provider_failure(ctx, "model reachable", f"{model} (models.get)", exc, _ms(t0))
         return
     ctx.report.add("model reachable", OK,
                    f"{model} answered models.get ({getattr(info, 'name', model)})", _ms(t0))

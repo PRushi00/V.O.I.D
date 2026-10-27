@@ -315,3 +315,85 @@ def test_windows_is_not_pretended_about(tmp_path, monkeypatch):
     target.write_text("x", encoding="utf-8")
     assert ownership.restrict(target) == ownership.NOT_APPLICABLE
     assert ownership.too_open(target) is None
+
+
+# ------------------------------------------------------------------------------------------------
+# A provider error is not automatically a verdict on the key
+# ------------------------------------------------------------------------------------------------
+class _Ctx:
+    """The two attributes ``_report_provider_failure`` touches."""
+
+    def __init__(self):
+        self.report = Report()
+
+
+@pytest.mark.parametrize("message, category", [
+    ("503 UNAVAILABLE. This model is currently experiencing high demand.", "server"),
+    ("504 deadline exceeded", "timeout"),
+    ("connection refused talking to generativelanguage.googleapis.com", "network"),
+    ("429 RESOURCE_EXHAUSTED: too many requests", "rate_limit"),
+])
+def test_a_service_fault_warns_and_does_not_blame_the_credential(message, category):
+    """Observed live: the configured model answered 503 "experiencing high demand" while the key
+    was provably valid - a real generation had just succeeded on another id.
+
+    Reported as FAIL, that line reads "your key is broken" and sends the owner to rotate a perfectly
+    good credential. The whole point of this harness is not to produce that kind of wrong certainty.
+    """
+    ctx = _Ctx()
+    preflight._report_provider_failure(ctx, "provider credential", "gemini (x)",
+                                       RuntimeError(message), 0.1)
+    probe = by_name(ctx.report)["provider credential"]
+    assert probe.status == WARN
+    assert category in probe.detail
+    assert "says nothing about the credential" in probe.detail
+
+
+@pytest.mark.parametrize("message", [
+    "401 UNAUTHENTICATED: API key not valid. Please pass a valid API key.",
+    "403 PERMISSION_DENIED",
+    "quota exceeded for this project",
+    "400 INVALID_ARGUMENT: malformed request",
+])
+def test_a_persistent_fault_still_fails(message):
+    """Each of these names something the owner must actually change, and none of them goes away on
+    its own. Downgrading these to WARN would be weakening the harness to get a clean run."""
+    ctx = _Ctx()
+    preflight._report_provider_failure(ctx, "provider credential", "gemini (x)",
+                                       RuntimeError(message), 0.1)
+    assert by_name(ctx.report)["provider credential"].status == FAIL
+
+
+def test_a_retired_model_fails_and_carries_the_api_s_own_replacement_advice():
+    """Observed live: `gemini-2.5-flash` is still listed by models.list and still answers
+    models.get with 200, but refuses generation. Only the error body says what to use instead, so
+    it has to survive into the report."""
+    ctx = _Ctx()
+    exc = RuntimeError("404 NOT_FOUND: This model models/gemini-2.5-flash is no longer available "
+                       "to new users. Please update your code to use models/gemini-3.8-flash")
+    preflight._report_provider_failure(ctx, "model reachable", "gemini-2.5-flash (models.get)",
+                                       exc, 0.1)
+    probe = by_name(ctx.report)["model reachable"]
+    assert probe.status == FAIL
+    assert "gemini-3.8-flash" in probe.detail
+
+
+def test_an_unrecognised_failure_is_treated_as_real_rather_than_waved_through():
+    """`failures.classify` returns 'other' for anything it does not know. For retrying that means
+    "try once more"; for this report it must mean FAIL, because a harness that downgrades the
+    unknown stops being evidence of anything."""
+    ctx = _Ctx()
+    preflight._report_provider_failure(ctx, "provider credential", "gemini (x)",
+                                       RuntimeError("something nobody has seen before"), 0.1)
+    assert by_name(ctx.report)["provider credential"].status == FAIL
+
+
+def test_the_transient_set_holds_only_categories_the_classifier_defines():
+    """A typo here would silently turn a real failure into a warning for ever."""
+    from void.providers.failures import POLICY
+    assert preflight._TRANSIENT_FAILURES <= set(POLICY)
+
+
+def test_no_persistent_category_leaked_into_the_transient_set():
+    for category in ("auth", "quota", "unsupported_model", "invalid_request"):
+        assert category not in preflight._TRANSIENT_FAILURES
