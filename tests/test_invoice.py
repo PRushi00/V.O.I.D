@@ -488,9 +488,24 @@ def test_the_subcommand_is_in_mains_known_set():
     assert '"invoice"' in known
 
 
-def test_the_command_refuses_honestly_with_no_brain(capsys):
+def test_the_command_refuses_honestly_with_no_brain(capsys, monkeypatch):
     """It needs a model to read the work description. With none, it must say so and write nothing -
-    not invent an invoice."""
+    not invent an invoice.
+
+    The absence is FORCED rather than assumed. This test used to call `cmd_invoice` bare and rely
+    on the machine happening to have no credential, which meant it passed for the wrong reason on a
+    developer box and, the first time a real key reached the environment, reached out to
+    generativelanguage.googleapis.com from inside the unit suite and failed on a 503 from the live
+    service. A test for "no brain" must not need the network to decide whether it is right.
+    """
+    from void.providers.base import ProviderUnavailable
+    from void.providers.registry import ProviderRegistry
+
+    def no_brain(self, *args, **kwargs):
+        raise ProviderUnavailable("No LLM provider available.")
+
+    monkeypatch.setattr(ProviderRegistry, "select", no_brain)
+
     from void.cli import cmd_invoice
 
     code = cmd_invoice("two days for Acme at 450", "pdf", "", as_json=False)

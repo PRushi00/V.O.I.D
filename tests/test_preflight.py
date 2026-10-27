@@ -346,7 +346,7 @@ def test_a_service_fault_warns_and_does_not_blame_the_credential(message, catego
     probe = by_name(ctx.report)["provider credential"]
     assert probe.status == WARN
     assert category in probe.detail
-    assert "says nothing about the credential" in probe.detail
+    assert "no evidence about the credential" in probe.detail
 
 
 @pytest.mark.parametrize("message", [
@@ -386,6 +386,52 @@ def test_an_unrecognised_failure_is_treated_as_real_rather_than_waved_through():
     preflight._report_provider_failure(ctx, "provider credential", "gemini (x)",
                                        RuntimeError("something nobody has seen before"), 0.1)
     assert by_name(ctx.report)["provider credential"].status == FAIL
+
+
+def test_the_exact_failure_observed_against_the_live_api_warns_rather_than_fails():
+    """The regression this set exists for, taken verbatim from a real run.
+
+    A session with a provably valid key - `models.get` succeeded on the same credential seconds
+    earlier, and a real generation had billed tokens on another id - got:
+
+        [FAIL] provider credential  gemini (gemini-3.8-flash) raised ProviderUnavailable:
+               Gemini did not answer within 30s. (29.21s)
+
+    reproducibly, twice. The cause was the model returning 503 "experiencing high demand"; the
+    30-second deadline hides that body, so the report named the credential instead of the outage.
+
+    The first version of `_TRANSIENT_FAILURES` did NOT catch this: `classify` short-circuits on
+    `ProviderUnavailable` before reading the message, so it returns `unavailable` rather than
+    `timeout` or `server`. This test pins the real exception, not a plausible one.
+    """
+    from void.providers.base import ProviderUnavailable
+    ctx = _Ctx()
+    exc = ProviderUnavailable("Gemini did not answer within 30s.")
+    preflight._report_provider_failure(ctx, "provider credential",
+                                       "gemini (gemini-3.8-flash)", exc, 29.21)
+    probe = by_name(ctx.report)["provider credential"]
+    assert probe.status == WARN
+    assert "no evidence about the credential" in probe.detail
+
+
+def test_a_persistent_outage_is_still_made_actionable():
+    """WARN must not mean "ignore me". If the model never serves, the id is what to change."""
+    from void.providers.base import ProviderUnavailable
+    ctx = _Ctx()
+    preflight._report_provider_failure(ctx, "provider credential", "gemini (x)",
+                                       ProviderUnavailable("did not answer within 30s."), 30.0)
+    assert "configured id" in by_name(ctx.report)["provider credential"].detail
+
+
+def test_having_no_credential_at_all_never_reaches_this_helper():
+    """`unavailable` is only safe in the transient set because the no-credential case returns
+    earlier, with its own WARN. If that guard were ever removed, a missing key would start
+    reporting as a transient outage - so this pins the guard, not the helper."""
+    import inspect
+    body = inspect.getsource(preflight._check_provider_credential)
+    guard = body.index("no provider has a usable credential here")
+    call = body.index("provider.generate(")
+    assert guard < call, "the no-credential WARN must come before any call that can raise"
 
 
 def test_the_transient_set_holds_only_categories_the_classifier_defines():

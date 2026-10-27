@@ -591,7 +591,18 @@ def _check_memory(ctx) -> None:
 #: The categories come from `void/providers/failures.py`, which already draws this distinction for
 #: retry and failover. Classifying provider errors a second way here would be a second taxonomy to
 #: keep in step with the first.
-_TRANSIENT_FAILURES = frozenset({"server", "timeout", "network", "rate_limit"})
+#:
+#: ``unavailable`` is here for a reason that took a live run to see. `classify` short-circuits on
+#: ``ProviderUnavailable`` BEFORE it reads the message, so the real observed failure -
+#: ``ProviderUnavailable: Gemini did not answer within 30s``, a 30 s deadline over a model that was
+#: returning 503 - comes back as ``unavailable`` and not as ``timeout`` or ``server``. The first
+#: version of this set omitted it and therefore missed the exact case it was written for.
+#:
+#: It is safe here specifically because of where this is called from: `_check_provider_credential`
+#: has already returned WARN for "no provider has a usable credential", so by the time a call can
+#: raise, a provider WAS selected. ``unavailable`` at this point means the selected provider could
+#: not complete the call - not that there is nothing configured.
+_TRANSIENT_FAILURES = frozenset({"server", "timeout", "network", "rate_limit", "unavailable"})
 
 
 def _report_provider_failure(ctx, probe: str, subject: str, exc: Exception, took: float) -> None:
@@ -600,9 +611,10 @@ def _report_provider_failure(ctx, probe: str, subject: str, exc: Exception, took
     category = classify(exc)
     if category in _TRANSIENT_FAILURES:
         ctx.report.add(probe, WARN,
-                       f"{subject} answered with a {category} fault "
-                       f"({type(exc).__name__}: {exc}). This says nothing about the credential "
-                       f"either way - the service did not answer. Run it again.", took)
+                       f"{subject} did not complete: {category} ({type(exc).__name__}: {exc}). "
+                       f"This is no evidence about the credential either way - the service did not "
+                       f"answer. Run it again; if it keeps saying this, the model is not serving "
+                       f"and the configured id is what to change.", took)
     else:
         ctx.report.add(probe, FAIL,
                        f"{subject} raised {type(exc).__name__}: {exc}", took)
