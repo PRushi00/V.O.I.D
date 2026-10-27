@@ -431,12 +431,21 @@ def test_an_application_request_consults_no_model(monkeypatch):
     # answers truthfully, and every other spawn in the process still runs - including the ones
     # building an Assistant makes.
     real_which, real_popen = apps_module.shutil.which, apps_module.subprocess.Popen
-    monkeypatch.setattr(apps_module.shutil, "which",
-                        lambda cmd, *a, **kw: ("/installed/notepad" if cmd == "notepad"
-                                               else real_which(cmd, *a, **kw)))
-    monkeypatch.setattr(apps_module.subprocess, "Popen",
-                        lambda args, *a, **kw: (None if "notepad" in str(args).lower()
-                                                else real_popen(args, *a, **kw)))
+
+    def which(cmd, *args, **kwargs):
+        return "/installed/notepad" if cmd == "notepad" else real_which(cmd, *args, **kwargs)
+
+    def popen(*args, **kwargs):
+        # Both call forms, because this replaces the attribute on the shared ``subprocess`` module
+        # and so stands in front of every spawn in the process for the length of the test -
+        # ``subprocess.run`` included.
+        wanted = args[0] if args else kwargs.get("args", "")
+        if "notepad" in str(wanted).lower():
+            return None
+        return real_popen(*args, **kwargs)
+
+    monkeypatch.setattr(apps_module.shutil, "which", which)
+    monkeypatch.setattr(apps_module.subprocess, "Popen", popen)
 
     assistant = Assistant()
     assistant.clear_stop()
