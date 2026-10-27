@@ -609,9 +609,16 @@ def _check_provider_credential(ctx) -> None:
                        f"{provider.name} ({getattr(provider, 'model', '?')}) answered with no text",
                        _ms(t0))
         return
+    # Name WHERE the credential came from. "A key works" and "a key is in the OS keyring" are
+    # different facts, and on a container they have different answers.
+    try:
+        from void.security import secrets
+        source = f" [key from the {secrets.secret_source(secrets.GEMINI_API_KEY)}]"
+    except Exception:                          # noqa: BLE001 - a label never fails the probe
+        source = ""
     ctx.report.add("provider credential", OK,
                    f"{provider.name} ({getattr(provider, 'model', '?')}) answered "
-                   f"{text[:30]!r}", _ms(t0))
+                   f"{text[:30]!r}{source}", _ms(t0))
 
 
 def _check_model_is_reachable(ctx) -> None:

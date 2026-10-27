@@ -121,6 +121,38 @@ the owner never asked for — there is nothing to drive.
 could raise it would be a knob that could undo the argument.
 **Would change if:** never — and if more resolution is wanted, that is C/A3's conversation.
 
+### C6. The environment may carry the API key, and may never carry the other two
+**Chosen:** `get_secret` falls back to an environment variable, but only for the names in a closed
+list, which holds the Gemini API credential and nothing else. The keyring is always tried first.
+**Rejected:** keyring-only (the status quo), and a general "any secret may come from the
+environment" fallback.
+**Why:** keyring-only sounds stricter and is, on a desktop — but a container, a CI runner and a
+server have no keyring at all, so there the rule does not mean "use the stronger store", it means
+"no credential is possible". That was not a deliberate decision, it was an unnoticed consequence,
+and it is how a key the owner really had supplied could not be read at all.
+
+The closed list is the actual security content here, and it matters more than the fallback. An
+environment variable is readable by every child process this program starts and by anything that
+can read `/proc`. `MEMORY_KEY` decrypts the owner's private memory store and `STOP_PIN` releases
+the kill switch; a revocable credential for somebody else's API is a different class of secret
+from the key to the owner's own data, and only the first kind is accepted. Tests assert the list
+has exactly one member and fail if either of the other two is ever added.
+
+C1 is unchanged and still governs: a key in a **tracked file** is one `git add` from a published
+secret. An environment variable is not a tracked file.
+**Would change if:** someone needs a second service's key in a container — then it joins the list,
+one name at a time, each with the same argument made explicitly. Never by opening the list up.
+
+### C7. A report says where a secret is, not merely that a name is configured
+**Chosen:** `secret_source()` returns keyring / environment / absent, and `void list-keys` prints
+it per name.
+**Rejected:** the previous output, which listed manifest names.
+**Why:** it printed `gemini_api_key (primary)` on an installation holding no key at all, because the
+manifest stores the name V.O.I.D looks for rather than evidence of a value. It read as "a key is
+configured" and it misled the author of this document for several minutes while diagnosing exactly
+that. Same failure the receipt judge exists to catch, in the one place that reports on credentials.
+**Would change if:** never.
+
 ---
 
 ## D. Testing and verification
