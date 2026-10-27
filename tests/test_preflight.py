@@ -547,3 +547,124 @@ def test_the_transient_set_holds_only_categories_the_classifier_defines():
 def test_no_persistent_category_leaked_into_the_transient_set():
     for category in ("auth", "quota", "unsupported_model", "invalid_request"):
         assert category not in preflight._TRANSIENT_FAILURES
+
+
+# ------------------------------------------------------------------------------------------------
+# ... but a pool that was tried and wholly refused IS a verdict on the key
+# ------------------------------------------------------------------------------------------------
+def test_every_credential_refused_fails_instead_of_warning():
+    """The case the set above does not cover, found by reading the merged probes rather than by a run.
+
+    When the pool runs out, ``_call`` raises - and ``classify`` short-circuits on
+    ProviderUnavailable before reading anything, so five rejected keys arrived here as
+    ``unavailable``, a member of _TRANSIENT_FAILURES. The report then said "no evidence about the
+    credential either way" directly beside an exception stating that every credential was rejected,
+    as a WARN, which ``exit_code`` passes. A wholly dead credential set produced a clean preflight.
+
+    The transient set is right about what it covers; this is simply not one of those cases, and the
+    two are told apart by TYPE rather than by the wording of a message.
+    """
+    from void.providers.base import CredentialsRejected
+    ctx = _Ctx()
+    exc = CredentialsRejected(
+        "All 5 Gemini credential(s) are exhausted: each was rejected or rate-limited. A rejected "
+        "key needs replacing ('python -m void set-key gemini'); a rate-limited one needs time.",
+        categories=frozenset({"auth"}))
+    preflight._report_provider_failure(ctx, "provider credential",
+                                       "gemini (gemini-3.5-flash)", exc, 2.4)
+    probe = by_name(ctx.report)["provider credential"]
+    assert probe.status == FAIL
+    assert "no evidence about the credential" not in probe.detail
+    assert "set-key gemini" in probe.detail            # the remedy has to survive into the report
+
+
+def test_the_refusal_is_recognised_by_type_rather_than_by_its_message():
+    """Two exceptions carrying the same sentence, reported differently, because only one of them came
+    from a pool that actually tried every credential.
+
+    Matching the sentence instead would be one provider rewording away from silence, and would put
+    the live-503 regression above back at risk the first time a timeout message mentioned a
+    credential. The cost of deciding by type is that a plain ProviderUnavailable saying the same
+    thing still warns - which is safe only because every exhaustion path raises the subclass, and
+    the next test pins that.
+    """
+    from void.providers.base import CredentialsRejected, ProviderUnavailable
+    sentence = "All 5 Gemini credential(s) are exhausted: each was rejected or rate-limited."
+
+    typed, untyped = _Ctx(), _Ctx()
+    preflight._report_provider_failure(
+        typed, "provider credential", "gemini (x)",
+        CredentialsRejected(sentence, categories=frozenset({"auth"})), 0.1)
+    preflight._report_provider_failure(
+        untyped, "provider credential", "gemini (x)", ProviderUnavailable(sentence), 0.1)
+
+    assert by_name(typed.report)["provider credential"].status == FAIL
+    assert by_name(untyped.report)["provider credential"].status == WARN
+
+
+def test_both_providers_raise_the_typed_exception_when_their_pool_runs_out():
+    """Checked by source because there are three such raise sites across two providers and no single
+    call reaches them all. A site left as a plain ProviderUnavailable would quietly restore the WARN
+    that this whole section exists to remove."""
+    import ast
+    import inspect
+
+    from void.providers import gemini_provider, openai_provider
+
+    for module, marker in ((gemini_provider, "are exhausted"),
+                           (openai_provider, "credentials are unavailable")):
+        tree = ast.parse(inspect.getsource(module))
+        sites = [node for node in ast.walk(tree)
+                 if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call)
+                 and marker in ast.unparse(node.exc)]
+        assert sites, f"{module.__name__}: nothing raises {marker!r} any more - update this test"
+        for node in sites:
+            raised = ast.unparse(node.exc.func)
+            assert raised == "CredentialsRejected", (
+                f"{module.__name__} raises {raised} for an exhausted pool, so preflight will "
+                f"report it as a transient outage")
+
+
+def test_a_pool_that_is_only_rate_limited_warns_without_claiming_ignorance():
+    """OpenAI can exhaust a pool on rate_limit alone, and that genuinely may clear by itself, so it
+    stays a WARN. It must not borrow the transient wording though: "no evidence about the
+    credential" is false when every credential was tried and every one answered 429."""
+    from void.providers.base import CredentialsRejected
+    ctx = _Ctx()
+    preflight._report_provider_failure(
+        ctx, "provider credential", "openai (gpt-x)",
+        CredentialsRejected("All OpenAI credentials are unavailable (last failure: rate_limit).",
+                            categories=frozenset({"rate_limit"})), 0.1)
+    probe = by_name(ctx.report)["provider credential"]
+    assert probe.status == WARN
+    assert "rate_limit" in probe.detail
+    assert "no evidence about the credential" not in probe.detail
+
+
+@pytest.mark.parametrize("categories", [
+    frozenset(),                            # the provider did not say why: not an excuse
+    frozenset({"auth"}),
+    frozenset({"quota"}),
+    frozenset({"missing_value"}),           # a reference with no stored value; not a POLICY key
+    frozenset({"rate_limit", "auth"}),      # one transient cause does not cover for the others
+])
+def test_anything_short_of_a_wholly_transient_pool_fails(categories):
+    from void.providers.base import CredentialsRejected
+    ctx = _Ctx()
+    preflight._report_provider_failure(
+        ctx, "provider credential", "gemini (x)",
+        CredentialsRejected("every credential was refused", categories=categories), 0.1)
+    assert by_name(ctx.report)["provider credential"].status == FAIL
+
+
+def test_the_new_type_changes_nothing_about_retry_or_failover():
+    """CredentialsRejected subclasses ProviderUnavailable so that nothing outside preflight needs to
+    learn about it: classify still answers `unavailable`, the policy is still (1, True), and every
+    existing ``except ProviderUnavailable`` still catches it."""
+    from void.providers.base import CredentialsRejected, ProviderUnavailable
+    from void.providers.failures import classify, policy
+
+    exc = CredentialsRejected("x", categories=frozenset({"auth"}))
+    assert isinstance(exc, ProviderUnavailable)
+    assert classify(exc) == "unavailable"
+    assert policy(classify(exc)) == (1, True)

@@ -719,7 +719,33 @@ _TRANSIENT_FAILURES = frozenset({"server", "timeout", "network", "rate_limit", "
 
 def _report_provider_failure(ctx, probe: str, subject: str, exc: Exception, took: float) -> None:
     """Report a provider error as what it is, rather than as a verdict on the key."""
+    from void.providers.base import CredentialsRejected
     from void.providers.failures import classify
+
+    if isinstance(exc, CredentialsRejected):
+        # Every credential was tried and every one was refused. `classify` cannot see that: it
+        # short-circuits on ProviderUnavailable before reading anything, so this arrives as
+        # "unavailable" and would take the transient branch below - announcing "no evidence about
+        # the credential either way" in the one case where the evidence is complete, as a WARN,
+        # which `exit_code` passes. That is the shape of failure preflight exists to catch, so it
+        # is caught by TYPE here rather than by matching the message.
+        #
+        # The test is "is EVERY cause transient", reusing _TRANSIENT_FAILURES rather than naming
+        # categories again. Gemini folds 429 into "quota" and so never reaches this with a
+        # transient cause; OpenAI can, with "rate_limit", and that genuinely may clear on its own.
+        # An empty set means the provider did not say why, and an unexplained refusal of every
+        # credential is reported as a failure, not excused as weather.
+        if exc.categories and exc.categories <= _TRANSIENT_FAILURES:
+            ctx.report.add(probe, WARN,
+                           f"{subject}: {exc} Every credential is in a state that may clear by "
+                           f"itself ({', '.join(sorted(exc.categories))}), but none is usable now.",
+                           took)
+        else:
+            ctx.report.add(probe, FAIL,
+                           f"{subject}: {exc} This is a verdict on the credentials, not on the "
+                           f"service - every one of them was tried and refused.", took)
+        return
+
     category = classify(exc)
     if category in _TRANSIENT_FAILURES:
         ctx.report.add(probe, WARN,

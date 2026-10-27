@@ -19,6 +19,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from void.providers.base import (
+    CredentialsRejected,
     LLMProvider,
     LLMResponse,
     ProviderUnavailable,
@@ -615,6 +616,11 @@ class GeminiProvider(LLMProvider):
         """
         pool = self._pool()
         last_exc: Exception | None = None
+        # Why each credential was given up on, in ``failures.POLICY``'s vocabulary. Carried out on
+        # the exception so a caller can tell "every key was refused" from "nothing answered"; see
+        # :class:`CredentialsRejected`. Note that ``_classify_error`` folds 429 into "quota" and
+        # never says "rate_limit", so nothing reaching exhaustion here is transient.
+        kinds: set[str] = set()
 
         # Bounded by the credential count so the loop always terminates: each
         # iteration either succeeds, re-raises, or cools one credential.
@@ -623,14 +629,15 @@ class GeminiProvider(LLMProvider):
             try:
                 cred = pool.get_next_available(now=now)
             except CredentialsExhausted as exc:
-                raise ProviderUnavailable(
+                raise CredentialsRejected(
                     # "quota/cooldown" was accurate while a rejected KEY could never reach here: a
                     # 400 API_KEY_INVALID short-circuited as invalid_request instead of rotating.
                     # Now that it does rotate, both causes end up at this message, and they need
                     # opposite remedies - waiting fixes a quota, never a revoked key.
                     f"All {len(pool)} Gemini credential(s) are exhausted: each was rejected or "
                     f"rate-limited. A rejected key needs replacing "
-                    f"('python -m void set-key gemini'); a rate-limited one needs time."
+                    f"('python -m void set-key gemini'); a rate-limited one needs time.",
+                    categories=frozenset(kinds),
                 ) from (last_exc or exc)
 
             try:
@@ -640,6 +647,7 @@ class GeminiProvider(LLMProvider):
                 pool.mark_unavailable(
                     cred.name, _cooldown_until(now, _MISSING_COOLDOWN_S))
                 last_exc = exc
+                kinds.add("missing_value")
                 continue
 
             try:
@@ -663,6 +671,7 @@ class GeminiProvider(LLMProvider):
                     pool.mark_unavailable(
                         cred.name, _cooldown_until(now, _QUOTA_COOLDOWN_S, exc))
                     last_exc = exc
+                    kinds.add("quota")
                     continue
                 if kind == "auth":
                     # Invalid credential: cool it and try others - never retry
@@ -670,12 +679,14 @@ class GeminiProvider(LLMProvider):
                     pool.mark_unavailable(
                         cred.name, _cooldown_until(now, _AUTH_COOLDOWN_S))
                     last_exc = exc
+                    kinds.add("auth")
                     continue
                 # 5xx / network / unrecognised: possibly transient, so preserve existing behavior (the agent's
                 # bounded retry loop handles these; there is no retry here).
                 raise
 
-        raise ProviderUnavailable(
+        raise CredentialsRejected(
             f"All {len(pool)} Gemini credential(s) are exhausted: each was rejected or "
-            f"rate-limited."
+            f"rate-limited.",
+            categories=frozenset(kinds),
         ) from last_exc

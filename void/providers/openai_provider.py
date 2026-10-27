@@ -43,6 +43,7 @@ import requests
 
 from void import perf
 from void.providers.base import (
+    CredentialsRejected,
     LLMProvider,
     LLMResponse,
     ProviderUnavailable,
@@ -421,10 +422,14 @@ class OpenAIProvider(LLMProvider):
                 self._raise_final(category)
             pool.mark_unavailable(cred.name, now + timedelta(seconds=self._cooldown_s(category, resp)))
         if not made_request:
+            # Nothing was sent, so nothing was learned about any credential. Stays a plain
+            # ProviderUnavailable on purpose: the one below is the case where every credential WAS
+            # tried and every one was refused, which is evidence and should read as such.
             raise ProviderUnavailable(f"No {self._display} credential is configured or available.")
         _log.warning("%s_CREDENTIALS_EXHAUSTED attempts=%d last=%s", self.name.upper(), attempts, last_category)
-        raise ProviderUnavailable(
-            f"All {self._display} credentials are unavailable (last failure: {last_category}).")
+        raise CredentialsRejected(
+            f"All {self._display} credentials are unavailable (last failure: {last_category}).",
+            categories=frozenset({last_category}))
 
     def _attempt(self, key: str, body: dict):
         """One HTTP request. Returns (None, response) on success, else (category, response-or-None)."""

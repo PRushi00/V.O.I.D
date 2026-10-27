@@ -8,7 +8,7 @@ import requests
 
 from void.config import Config
 from void.providers import gemini_provider as gp
-from void.providers.base import ProviderUnavailable
+from void.providers.base import CredentialsRejected, ProviderUnavailable
 from void.providers.gemini_provider import (
     DEFAULT_TIMEOUT_S,
     GeminiProvider,
@@ -375,6 +375,37 @@ def test_a_bad_key_rotates_through_the_pool_instead_of_stopping_at_the_first_one
     assert [k for k, _ in g.built] == [K1, K2]
     # And each was cooled, so neither is retried on the next request.
     assert all(c.cooldown_until is not None for c in pool.credentials())
+
+
+def test_an_exhausted_pool_says_why_each_credential_was_given_up_on():
+    """``void preflight`` tells "every credential was refused" apart from "nothing answered" by this
+    type and these categories, and reports the first as a failure. Both facts have to come from the
+    provider, because by the time the pool is empty the individual errors are gone.
+    """
+    exc = _bad_key_error()
+    p, _pool, _g = _gem({K1: _raise(exc), K2: _raise(exc)}, names=[PRIMARY, "gemini_02"])
+    with pytest.raises(CredentialsRejected) as e:
+        p.generate(MSG)
+    assert e.value.categories == frozenset({"auth"})
+    # Still a ProviderUnavailable, so failover and every existing handler are untouched.
+    assert isinstance(e.value, ProviderUnavailable)
+
+
+def test_an_exhausted_pool_distinguishes_quota_from_a_rejected_key():
+    """Different remedies - time against a new key - so the report must not merge them."""
+    p, *_ = _gem({K1: _raise(_FakeAPIError(code=429, status="RESOURCE_EXHAUSTED"))})
+    with pytest.raises(CredentialsRejected) as e:
+        p.generate(MSG)
+    assert e.value.categories == frozenset({"quota"})
+
+
+def test_a_pool_with_one_bad_key_and_one_over_quota_reports_both_causes():
+    p, _pool, _g = _gem({K1: _raise(_bad_key_error()),
+                         K2: _raise(_FakeAPIError(code=429, status="RESOURCE_EXHAUSTED"))},
+                        names=[PRIMARY, "gemini_02"])
+    with pytest.raises(CredentialsRejected) as e:
+        p.generate(MSG)
+    assert e.value.categories == frozenset({"auth", "quota"})
 
 
 def test_a_bad_key_does_not_leak_into_what_the_owner_is_told():
