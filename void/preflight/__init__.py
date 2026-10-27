@@ -383,6 +383,51 @@ def _check_invoice_arithmetic(ctx) -> None:
                    "never reused, nothing claimed as sent")
 
 
+def _check_egress(ctx) -> None:
+    """Nothing leaves this machine during an operation that has no business leaving it.
+
+    Executed, not inspected. Local retrieval is the right subject: it is the step most likely to
+    acquire a network call by accident, because "look it up" is a short walk from "look it up
+    online". If a socket opens here, something in the chain reaches outward that nobody meant to.
+
+    The second line is the honest list, derived from the syntax trees of this tree rather than from
+    a hand-written note that would be accurate for a month. It answers the question the owner should
+    ask before being told nothing leaves: what COULD.
+    """
+    from void import egress
+    assistant = ctx.assistant()
+
+    if assistant.vault is not None:
+        subject, run = "vault retrieval", lambda: assistant.vault.search("pricing retainer invoice")
+    else:
+        from void.orchestration.judge import screen
+        subject, run = "the receipt judge", lambda: screen("Three notes mention pricing.", [])
+
+    t0 = time.monotonic()
+    try:
+        result, _ = egress.drill(run)
+    except Exception as exc:                 # noqa: BLE001 - the probe reports, it does not raise
+        ctx.report.add("egress drill", FAIL,
+                       f"{subject} raised {type(exc).__name__} under the watcher", _ms(t0))
+        return
+    if result.passed:
+        ctx.report.add("egress drill", OK,
+                       f"{subject} opened {len(result.connections)} socket(s), none off-machine",
+                       _ms(t0))
+    else:
+        ctx.report.add("egress drill", FAIL,
+                       f"{subject} reached {', '.join(result.hosts())}", _ms(t0))
+
+    surface = egress.needs_network()
+    hosts = sorted({h for f in surface for h in f.hosts})
+    detail = f"{len(surface)} modules can reach outward"
+    if hosts:
+        detail += f"; named hosts: {', '.join(hosts[:6])}"
+        if len(hosts) > 6:
+            detail += f" (+{len(hosts) - 6} more)"
+    ctx.report.add("network surface", OK, detail + " - `void egress` lists them")
+
+
 def _check_model_refusal(ctx) -> None:
     """A model name this installation does not know is refused, not approximated."""
     from void.providers.catalog import ModelCatalog
@@ -747,6 +792,7 @@ PROBES = (
     _check_judge,
     _check_model_refusal,
     _check_invoice_arithmetic,
+    _check_egress,
     _check_vault,
     _check_notes_question_route,
     _check_vault_capture,

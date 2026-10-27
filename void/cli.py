@@ -1040,6 +1040,57 @@ def cmd_teardown_last(as_json: bool) -> int:
     return 0
 
 
+def cmd_egress(as_json: bool, run_drill: bool) -> int:
+    """What in this build can reach off this machine, and whether anything just did.
+
+    The list is derived from the syntax trees of the installed tree, not from a note somebody wrote
+    once, because the honest answer has to stay honest after the next feature lands. With --drill it
+    also runs a local operation under a socket watcher and reports every host that was reached,
+    which is the only form of "nothing leaves this machine" worth saying out loud.
+    """
+    from void import egress
+
+    surface = egress.needs_network()
+    result = None
+    if run_drill:
+        from void.app import Assistant
+        from void.config import Config
+        assistant = Assistant(config=Config.load())
+        if assistant.vault is not None:
+            subject = "vault retrieval"
+            def run():
+                return assistant.vault.search("pricing retainer invoice")
+        else:
+            from void.orchestration.judge import screen
+            subject = "the receipt judge"
+            def run():
+                return screen("Three notes mention pricing.", [])
+        try:
+            result, _ = egress.drill(run)
+        except Exception as exc:                   # noqa: BLE001 - report, never traceback at a user
+            print(f"The drill could not run {subject}: {type(exc).__name__}")
+            return 2
+
+    if as_json:
+        payload = {
+            "surface": [{"module": f.module, "imports": list(f.imports), "hosts": list(f.hosts)}
+                        for f in surface],
+        }
+        if result is not None:
+            payload["drill"] = {"passed": result.passed, "hosts": result.hosts(),
+                                "connections": len(result.connections)}
+        print(json.dumps(payload, indent=2))
+        return 0 if (result is None or result.passed) else 2
+
+    print(f"{len(surface)} module(s) in this build can reach off this machine:")
+    for feature in surface:
+        print(f"  {feature.line()}")
+    if result is not None:
+        print()
+        print(result.report())
+    return 0 if (result is None or result.passed) else 2
+
+
 def cmd_invoice(description: str, kind: str, out: str, as_json: bool) -> int:
     """Turn a description of work into an invoice: strict JSON in, Python's arithmetic out.
 
@@ -1282,6 +1333,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_invoice.add_argument("--out", default="", help="Where to write it (default invoice-<number>.<kind>)")
     p_invoice.add_argument("--json", action="store_true", dest="as_json")
 
+    p_egress = sub.add_parser(
+        "egress", help="What can reach off this machine, and whether anything just did")
+    p_egress.add_argument("--drill", action="store_true", dest="run_drill",
+                          help="Also run a local operation under a socket watcher")
+    p_egress.add_argument("--json", action="store_true", dest="as_json")
+
     p_doctor = sub.add_parser("doctor", help="Read-only health report (never repairs anything)")
     p_doctor.add_argument("--state-dir", default=None, help="Inspect a different state directory")
     p_doctor.add_argument("--no-probe", action="store_true",
@@ -1298,7 +1355,7 @@ def main(argv: list[str] | None = None) -> int:
              "list-keys", "remove-key", "set-pin", "tasks", "stop",
              "clear-stop", "ui", "voice", "app", "singularity", "autostart",
              "roots", "protect", "device", "perf", "doctor", "preflight", "teardown", "memory",
-             "prefs", "maintenance", "invoice", "-h", "--help"}
+             "prefs", "maintenance", "invoice", "egress", "-h", "--help"}
     if argv and argv[0] not in known:
         return cmd_run(" ".join(argv))
 
@@ -1368,6 +1425,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_preflight(args.offline, args.read_only, args.strict, args.as_json)
     if args.command == "invoice":
         return cmd_invoice(args.description, args.kind, args.out, args.as_json)
+    if args.command == "egress":
+        return cmd_egress(args.as_json, args.run_drill)
     if args.command == "teardown":
         if args.teardown_action == "diag":
             return cmd_teardown_diag(args.as_json)

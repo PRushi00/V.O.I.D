@@ -165,6 +165,15 @@ produced no card at all rather than a card in the wrong corner.
 no safeguard turned off. The three real defects behind CI's twelve were fixed **in the code**.
 **Why:** it is the directive's §6, and it is also the only way the suite stays worth running.
 
+### D6. An instruction a small model must follow is tested by repetition, not by reading it
+**Chosen:** where a model has to emit something exactly (a control tag, a strict JSON envelope), the
+test asks five times and counts the hits, rather than asking once and declaring the prompt good.
+**Rejected:** a single happy-path call.
+**Why:** borrowed from the eighth pack (local/04), which is blunt about it — if the tag misses more
+than once in five, the instruction is too complicated and gets simplified until it does not. A prompt
+that works once is a coin landing heads.
+**Would change if:** never, though the count should rise with the cost of a miss.
+
 ---
 
 ## E. Reversals — decisions I got wrong and changed
@@ -203,9 +212,10 @@ abort, and my own off-by-one). The inference held; the confidence was not earned
 
 ## F. OWNER — open, deliberately
 
-### F1. Merging to `main`
-`main` is untouched at `48a2203`. Fifteen commits sit on `claude/gracious-gauss-u81whr` with CI
-green. Merging is the owner's decision and I did not take it.
+### F1. Merging to `main` — settled
+Taken by the owner: pull request #1 merged at `15aef85`, so the first seven packs' work is on `main`.
+The decision is kept here rather than deleted, because the reason it was left open (a merge is the
+owner's call, not the agent's) still governs the next one.
 
 ### F2. The declined organs, if they are wanted after all
 The screen watch was built on explicit instruction after being declined. If the privacy trade in
@@ -215,3 +225,65 @@ A3/C4/C5 reads differently to the owner than it does to me, the switches are the
 ### F3. What to do about a bot finding that costs more to fix than it prevents
 No instance arose in this round. If one does, the owner's call on the first case should become the
 rule for later ones.
+
+---
+
+## G. The eighth pack
+
+### G1. Watch the socket, not the sixteen call sites
+**Chosen:** record at `socket.socket.connect`, which every library in this tree and every library it
+might acquire must reach to talk to anything.
+**Rejected:** editing the sixteen modules that currently open connections, and a central `void.net`
+wrapper everything is supposed to route through.
+**Why:** both rejected options are audits of today's code, and the connection that matters is the
+seventeenth — the one somebody adds next year without reading this document. Hooking the one thing
+they cannot avoid means no call site had to be edited to be covered and none can drift out of
+coverage by being forgotten. It also means the attribution has to come from the call stack rather
+than from an argument, which is why :func:`reason` is optional rather than required.
+**Would change if:** something in this tree started talking to the network without a socket — which,
+for TCP on CPython, nothing does.
+
+### G2. The retry-on-empty was found and deliberately not built
+**Chosen:** record it as PARTIAL (P7.8) with exactly what it would take, and change no provider
+behaviour.
+**Rejected:** adding "if the text came back empty, ask again with a bigger budget", which is what the
+pack prescribes and which is perhaps six lines.
+**Why:** two reasons, and the second is the real one. A model that spent its whole budget thinking
+will often spend it again, so a silent retry doubles the worst case for an uncertain gain — and more
+to the point, it cannot be exercised here against a real Ollama, so shipping it would mean claiming a
+fix nobody has seen work. V.O.I.D already defends the *cause* (`think: false`, measured), which is
+the better half of the fix and the half that is verified.
+**Would change if:** the owner runs Ollama and actually sees an empty answer. Then the retry is
+right, and it should raise the budget explicitly and once — never a loop, and never silently, because
+a reply that cost two round trips should say so.
+
+### G3. The watcher is off by default
+**Chosen:** nothing installs until the drill, `void preflight` or `void egress` asks.
+**Rejected:** watching always, from boot.
+**Why:** a process-wide socket hook is a real change to how a 92k-line program behaves. A privacy
+tool that introduces its own failure mode is a bad trade, and the thing it would protect is already
+protected by the design decisions in §A3, §C4 and §C5. Same discipline as the screen watch: the
+always-on half should be the half that can do the least.
+**Would change if:** the owner wants a running total across a session — and then it should be the
+ledger that is always on, not blocking, with the bound it already has.
+
+### G4. The honest list is derived from the code, never written by hand
+**Chosen:** `needs_network()` walks the syntax trees of the installed tree.
+**Rejected:** a curated list in a document, which is what a reader would expect.
+**Why:** a hand-written list of what reaches the internet is accurate on the day it is written and
+quietly wrong a month later, and "quietly wrong" is the whole failure mode here. It walks the AST
+rather than grepping because these files are full of prose about what they do not send — D3's lesson,
+applied from the start this time instead of after three rewrites, and there is a test that plants a
+module whose docstring names a host and asserts it is not listed.
+**Would change if:** never.
+
+### G5. It observes; it does not block
+**Chosen:** the watcher records and reports.
+**Rejected:** refusing connections to hosts not on a list, which is a short step from here and
+sounds like an improvement.
+**Why:** deciding what is *allowed* to leave is the risk gate's job and the owner's. A watcher that
+quietly started blocking would be making a security decision nobody asked it to make, and the first
+time it broke a provider call the owner would turn the whole thing off — after which nothing would be
+watched at all.
+**Would change if:** the owner asks for an allow-list. It belongs in the risk gate, next to the other
+refusals, not inside the instrument that measures.
