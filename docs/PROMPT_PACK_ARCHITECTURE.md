@@ -13,7 +13,7 @@ inserted into a funnel that already existed.
 
 ## 1. What was added, and what it depends on
 
-Nineteen modules, 6 496 lines. The dependency column is what each imports **from `void.*`** — not
+Twenty modules, 7 034 lines. The dependency column is what each imports **from `void.*`** — not
 the standard library — because that is what says how entangled a module is.
 
 | Module | Lines | Depends on (internal) |
@@ -36,9 +36,10 @@ the standard library — because that is what says how entangled a module is.
 | `teardown/panel.py` | 353 | `teardown` (one constant), `runtime.diagnostics` |
 | `perception/stillness.py` | 329 | `perception.screen` |
 | `billing/__init__.py` | 476 | `artifacts`, `security.ownership` |
-| `preflight/__init__.py` | 812 | *(deliberately everything — see §4)* |
+| `egress/__init__.py` | 492 | **nothing** |
+| `preflight/__init__.py` | 858 | *(deliberately everything — see §4)* |
 
-**Three modules import nothing of V.O.I.D's at all.** That is not an accident and it is worth
+**Four modules import nothing of V.O.I.D's at all.** That is not an accident and it is worth
 preserving:
 
 * `judge.py` is a pure function over a list of receipts. It cannot reach a provider, a tool or the
@@ -48,6 +49,10 @@ preserving:
 * `catalog.py` decides whether a spoken model name resolves. Its known set is handed in from
   configuration, so it cannot acquire a model id by observing one.
 * `ownership.py` is four filesystem calls and a status enum.
+* `egress/__init__.py` watches every socket this process opens, and imports nothing of
+  V.O.I.D's to do it. That is what lets anything load it without a cycle, and it is also why it
+  can be trusted: an instrument that imported the thing it measures could be made to measure the
+  wrong thing.
 
 The one module that depends on everything is `preflight`, and that is its entire purpose.
 
@@ -55,7 +60,7 @@ The one module that depends on everything is `preflight`, and that is its entire
 
 ## 2. Where each piece attaches
 
-Five seams, and no new ones.
+Six seams. The sixth is the first one that is not a seam in V.O.I.D at all.
 
 ### a. The route chain in `Assistant.run` — four new routes
 
@@ -130,6 +135,27 @@ that only `state()` is ever reached — because a panel that could start or end 
 second control path over the owner's attention. `poll_screen_watch` calls `tick()`, and the watch
 has no provider to call.
 
+### f. The socket — one hook, below everything
+
+`egress` does not attach to V.O.I.D. It attaches to CPython:
+
+```
+socket.socket.connect          ← the one thing every library must reach
+  Watcher.start() wraps it     (and connect_ex, and getaddrinfo, for the names)
+    → Ledger.record(Connection(host, port, reason, module))
+  Watcher.stop()  puts it back
+```
+
+The only piece in this tree that is installed rather than imported, and the choice is the whole
+point. The sixteen modules that can open a connection were **not edited**: hooking what they cannot
+avoid covers all of them, covers the libraries they call, and covers the seventeenth module that
+does not exist yet. The reason is read off the call stack rather than passed in, so no signature
+changed either.
+
+Three invariants hold it in place, each with a test: it is off until something asks, it puts the
+real socket back on the way out (including when the body raises), and a failure inside the recorder
+never reaches the connection it was recording.
+
 ### e. The artifact layer — reused, not duplicated
 
 `billing` produces an `ArtifactPlan` and hands it to the existing `artifacts.generate` /
@@ -154,6 +180,7 @@ These are the properties tests defend, stated once:
 | `stillness` | see more than 576 block means; keep anything; write anything; call a model |
 | `billing` | let a model's arithmetic reach the document; send anything |
 | `ownership` | pretend POSIX mode bits describe NTFS access |
+| `egress` | block, refuse or alter a connection; break one by failing to record it; stay installed after it is stopped |
 
 Four of these are enforced **structurally** rather than by review — the type has nowhere to put the
 forbidden thing — and the tests assert the structure, not the behaviour:
@@ -170,7 +197,7 @@ forbidden thing — and the tests assert the structure, not the behaviour:
 
 ## 4. `preflight` is deliberately the opposite shape
 
-Every other module minimises what it touches. `preflight` maximises it: twenty probes that build a
+Every other module minimises what it touches. `preflight` maximises it: twenty-one probes that build a
 real Assistant, index the real vault, write and remove a real note, engage and clear the kill switch
 in a scratch directory, run a deliberately-wrong invoice through the real engine, and ask the Models
 API for the configured model by id.
@@ -182,7 +209,7 @@ with the two that need the network last:
 assembly → source on disk → secrets/permissions → engine protection → confinement
   → task store → kill switch → risk gate → judge → model refusal → invoice arithmetic
   → vault (index, question route, capture) → memory → focus → teardown (kit, routes, no stray browser)
-  → optional layers → provider credential → model reachable
+  → egress drill + network surface → optional layers → provider credential → model reachable
 ```
 
 It is the answer to "done means preflight passed": the hermetic suite proves the units, and this
@@ -227,6 +254,25 @@ model → strict JSON (descriptions, quantities, unit prices only)
 
 The invoice ordering is the one to keep: render and verify **before** writing the ledger, so a
 failed render never burns a number and leaves a gap an accountant has to explain.
+
+---
+
+**"Did anything leave this machine?"**
+
+```
+void egress --drill
+  → needs_network()        walks this tree's syntax trees   ← what COULD leave
+  → drill(local work)
+       Watcher.start()     wraps socket.socket.connect
+       the work runs       every connect recorded: host, port, reason, module
+       Watcher.stop()      the real socket is put back
+  → Drill.escaped          everything that is not loopback
+  → passes ONLY when that list is empty
+```
+
+The two questions are answered by deliberately different means. What *could* leave is read from the
+code, so it stays true as the code changes. What *did* leave is measured, so it cannot be argued
+with.
 
 ---
 

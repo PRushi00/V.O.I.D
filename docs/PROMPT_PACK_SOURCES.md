@@ -44,6 +44,46 @@ All seven are by the same author (Zubair Trabzada / AI Workshop) and are consume
 building a "Jarvis" from an empty folder with a coding agent. They are **instructions to a coding
 agent**, not specifications of V.O.I.D, which is the central fact driving the reconciliation in §4.
 
+### 1b. An eighth pack, supplied separately
+
+**This one did not come out of `Prompt.zip`.** It was handed over on its own, after the first seven
+were already analysed and shipped, and it is recorded separately so that nobody later reads the
+archive inventory as covering it.
+
+| # | Filename (first 12) | sha256 (first 12) | Bytes | Pages | Document title (read from the PDF) |
+| --- | --- | --- | --- | --- | --- |
+| 8 | `96d5e53f-fd7d` | `4a90380f2b7f` | 436 530 | 18 | Run Jarvis Fully Local: The Prompt Pack |
+
+Same author and series (Zubair Trabzada / AI Workshop, October 2026). All 18 pages were read, not
+skimmed. `file(1)` reports "8 page(s)" for it, exactly the error §1 documents for six of the others;
+`pdfinfo` reports 18, and 18 is what the document has.
+
+**Its thesis is the opposite of the other seven**, which is the only reason it is worth anything
+here. The first seven assume cloud models and spend their safety budget on keys, confirmation and
+scope. This one assumes *no keys at all*: three local engines (Ollama on 11434 for the brain,
+VoiceStudio on 3900 for the voice, Whisper on-chip for the ears) and eight prompts that build a
+Jarvis on top of them. Its closing claim is one the other seven never make — "turn off the Wi-Fi and
+keep talking".
+
+Structure: **three installs** (brain / voice / ears, each with a one-command proof), then **eight
+prompts** — 01 the galaxy and the local brain, 02 the cloned voice, 03 the local ears, 04 a lean
+butler persona, 05 growth by voice, 06 swapping brains out loud, 07 the preflight with a latency
+budget, 08 the Wi-Fi-off drill. It ends with seven retrospective lessons, two of which are
+load-bearing and are recorded in §3 below.
+
+**Where it was right about something V.O.I.D had already got right.** Its lesson 2 — "the 9B model
+spent its entire token budget reasoning silently and returned an empty answer; only `reasoning_effort`
+set to none worked" — is a defect V.O.I.D already defends against, and had already *measured*:
+`void/providers/local_provider.py` carries a `think` switch with the numbers in its docstring
+(~9.5 s with thinking on versus ~2.7 s with it off, qwen3:8b). Two independent arrivals at the same
+fix is the strongest evidence in the whole corpus that it is a real one.
+
+**Where it was right about something V.O.I.D had got wrong.** Prompt 08. V.O.I.D makes a privacy
+argument in a dozen places and could not, before this pass, answer the owner's actual question:
+*when I asked that, did anything leave this machine?* Sixteen modules in the tree can open a
+connection and there was no single place that knew. That gap is now closed — see §4 and
+`void/egress/`.
+
 ---
 
 ## 2. Prompt sequence map

@@ -62,7 +62,17 @@ After it: **4 897 pass, 28 fail, 34 skipped, 2 xfailed; 4 961 collected.** Those
 ten were fixed along the way (see the CI table below) and **no new failure appeared**, established
 by diffing the before and after lists rather than by comparing their lengths.
 
-The remaining 28 are environment-bound and none is a code defect: no Windows (`pywin32`,
+**After the eighth pack (§8):** `4 979 pass, 19 fail, 35 skipped, 2 xfailed; 5 035 collected`, with
+`origin/main` measured in a clean worktree in the *same* environment as the control: `4 910 pass,
+19 fail, 35 skipped`. The two failure lists are **identical in both directions** - nothing new,
+nothing lost - and the pass count is up by exactly the 69 cases the egress suite adds. The failure
+count reads lower than the 28 above only because that run had three of CI's requirement files
+installed that the earlier one did not; it is the *diff against a same-environment control* that
+carries the meaning, never the absolute number. `min_collected` ratchets 4 920 -> 4 989: the previous
+floor plus exactly what this pass added, which keeps the margin the last pass chose rather than
+inventing a new one.
+
+The remaining failures are environment-bound and none is a code defect: no Windows (`pywin32`,
 `pythoncom`), no `xdg-open`, no audio or camera hardware, `faster-whisper`/`ctranslate2` not
 installed, and one OpenTelemetry patch-version pin. The exact list is reproducible with:
 
@@ -200,6 +210,7 @@ capability, which is the failure the receipts rule exists to prevent.
 | Telegram (Opus 11, 14, 15; phone 04) | A BotFather token and the owner's chat id |
 | Google Calendar/Gmail (Opus 10, 15) | A Google Cloud project, a consent screen in production, an OAuth client |
 | The live Gemini call and the Models API lookup | A Gemini credential. Both preflight probes WARN honestly without one |
+| The latency budget (local/07) | A microphone, a speaker and a provider credential. Preflight already times every probe, so only the three numbers are missing |
 | Anything Windows-native | A Windows machine. The focus *sensor* in particular: the engine is verified to the second against a scripted desk, the reader needs a real foreground |
 
 **The three items this document previously listed as declined have been built**, on the owner's
@@ -212,8 +223,9 @@ means, keeps nothing, writes nothing, has no provider to call, needs two switche
 to false, and decides only WHEN the screen has been still — never what is on it. The original
 reasoning is kept in the ledger beside the new status rather than deleted.
 
-The invoice engine (P6.4) is built too, and **the ledger now has no DECLINED rows at all**: 49
-VERIFIED, 12 BLOCKED, 9 ALREADY_SATISFIED, 6 PARTIAL, 2 INAPPLICABLE, 1 CONFLICTING. Its **delivery
+The invoice engine (P6.4) is built too, and **the ledger has no DECLINED rows at all**. With the
+eighth pack's nineteen rows added (§8), the ledger stands at **50 VERIFIED, 13 BLOCKED,
+17 ALREADY_SATISFIED, 12 PARTIAL, 4 INAPPLICABLE, 2 CONFLICTING — 98 rows**. Its **delivery
 leg is still blocked** on Telegram and is reported as such rather than stubbed — `delivered` is
 false, no code path can set it true, and a syntax-tree walk asserts the module imports no transport
 and calls nothing that sends. What is built is the part that generalises: the model describes the
@@ -232,3 +244,38 @@ model name refuses rather than loading the nearest thing; a question the notes c
 rather than improvising from a related note; a sensor that cannot see reports `blind` rather than
 accusing the owner of drifting; and an answer claiming an action with no receipt behind it does not
 reach the owner at all.
+
+
+---
+
+## 8. The eighth pack — "Run Jarvis Fully Local"
+
+Supplied separately, after the first seven had shipped and merged. Inventory and provenance are in
+SOURCES §1b; the nineteen rows are REQUIREMENTS §9; the reasoning is DECISIONS §G.
+
+**What it changed: one thing, and it was worth it.** Prompt 08 asks for proof that nothing left the
+machine. V.O.I.D made that claim in a dozen places and could not answer it: sixteen modules here can
+open a connection and nothing knew. `void/egress/` closes it — a watcher at `socket.socket.connect`
+(so no call site was edited and none can drift out of coverage), a drill that passes only when the
+off-machine list is empty, and an honest list of what still reaches outward derived from the tree's
+syntax trees rather than written by hand. 69 test cases, two new preflight probes,
+`python -m void egress [--drill]`. Preflight goes 15 pass -> **17 pass, 0 fail, 9 warn**.
+
+**What it confirmed, which is worth more than a feature.** Two of its retrospective lessons describe
+fixes this codebase had already made and already measured — the local brain that thinks itself to
+death (answered by `local_provider.think`, with the numbers in its docstring) and browser speech
+recognition as the hidden cloud (V.O.I.D has never had an ASR path that leaves the machine). An
+outside author on different hardware from a different premise arriving at the same two conclusions
+is the strongest evidence in the corpus that they are real.
+
+**What is left open on purpose.** The pack also prescribes retrying once with a bigger budget when a
+local model returns empty. The switch half of that is built and measured; the retry half is not, and
+was deliberately not guessed at — it cannot be exercised against a real Ollama here, and a silent
+retry doubles the worst case for an uncertain gain. Recorded as P7.8 with the reversal condition in
+DECISIONS §G2. **This is the one item in this pass that wants an owner's decision rather than a
+credential.**
+
+**What it did not move.** Its galaxy viewer, port-4700 server and `config.json` keys were refused for
+the same reasons as the first seven (SOURCES §4). Its voice engine is Apple-Silicon-only and
+V.O.I.D is a Windows assistant. Its latency budget needs a microphone, a speaker and a credential,
+so it is BLOCKED rather than printed as zeroes.
