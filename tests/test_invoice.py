@@ -492,25 +492,37 @@ def test_the_command_refuses_honestly_with_no_brain(capsys, monkeypatch, tmp_pat
     """It needs a model to read the work description. With none, it must say so and write nothing -
     not invent an invoice.
 
-    The no-brain condition is FORCED here, and that is the point of the fixtures. It used to be left
-    to the ambient machine, which made this a test about the developer's configuration rather than
-    about the code: ``cmd_invoice`` calls ``Config.load()``, which reads ``config/local_config.yaml``
-    from the repository - the one thing the hermetic fixture in ``tests/conftest.py`` cannot sandbox,
-    because it sandboxes ``~`` and that file does not live under ``~``. On the owner's machine it
-    names a local model, so ``providers.select()`` SUCCEEDED, the refusal branch below was never
-    reached, and the test instead called a real model and left a real ``invoice-VOID-2026-0001.pdf``
-    in the repository root. A test that only passes on a machine with no model configured is not
-    testing the refusal; it is testing the machine.
+    The no-brain condition is FORCED here, and both fixtures are load-bearing. This test used to
+    call ``cmd_invoice`` bare and rely on the machine happening to have no model, which made it a
+    test about the developer's configuration rather than about the code - and it failed that way
+    twice, in opposite directions. ``cmd_invoice`` calls ``Config.load()``, which reads
+    ``config/local_config.yaml`` from the repository: the one thing the hermetic fixture in
+    ``tests/conftest.py`` cannot sandbox, because it sandboxes ``~`` and that file does not live
+    under ``~``. On the owner's machine that file names a local model, so ``providers.select()``
+    SUCCEEDED, the refusal branch below was never reached, and the test called a real model and
+    left a real ``invoice-VOID-2026-0001.pdf`` in the repository root. The first time a real cloud
+    key reached the environment instead, the same gap sent a unit test out to
+    generativelanguage.googleapis.com, where it failed on a 503 from the live service. A test for
+    "no brain" must not need the network - or one particular machine - to decide whether it is
+    right.
 
-    ``chdir`` is the second half of the fix: the document path is relative, so the repository root is
-    the working directory this would write into. Pointing it at ``tmp_path`` means the assertion that
-    nothing was written can actually be made, instead of assumed.
+    ``ProviderUnavailable`` rather than a bare ``RuntimeError`` because that is what the registry
+    actually raises; it is a ``RuntimeError`` subclass, so the handler in ``cmd_invoice`` is
+    exercised either way, but a double that lies about the exception type teaches the next reader
+    the wrong thing. ``*args, **kwargs`` keeps it from breaking the day ``select()`` takes an
+    argument.
+
+    ``chdir`` is the other half of the fix. The document path is relative, so the repository root
+    is the working directory this would otherwise write into. Pointing it at ``tmp_path`` is what
+    lets the last assertion check that nothing was written, instead of taking the printed
+    sentence's word for it.
     """
     from void.cli import cmd_invoice
+    from void.providers.base import ProviderUnavailable
     from void.providers.registry import ProviderRegistry
 
-    def no_brain(self):
-        raise RuntimeError("no provider is configured")
+    def no_brain(self, *args, **kwargs):
+        raise ProviderUnavailable("No LLM provider available.")
 
     monkeypatch.setattr(ProviderRegistry, "select", no_brain)
     monkeypatch.chdir(tmp_path)

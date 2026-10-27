@@ -5,6 +5,14 @@
 # `requirements.txt` / `requirements-voice.txt` stay the human-edited, minimum-version
 # source of truth; this file pins what was actually tested.
 #
+# Two pins carry `sys_platform == "win32"` markers, and the reason is worth keeping: without
+# them this file could not be installed on Linux AT ALL, so a contributor or a cloud container
+# could not reach the test suite without editing the lock by hand. `pywin32` publishes no
+# non-Windows distribution, and `openwakeword` requires `tflite-runtime` on Linux, which has no
+# wheel for current CPython. Neither is used off Windows - `void preflight` already reports the
+# wake word as an absent optional layer there - so the markers describe what was always true
+# rather than dropping anything. Windows resolves both exactly as it did before.
+#
 #     python -m venv .venv
 #     .venv\Scripts\python.exe -m pip install -r requirements.lock
 #
@@ -54,7 +62,7 @@ narwhals==2.26.0
 numpy==2.5.2
 onnxruntime==1.29.0
 opencv-python-headless==5.0.0.93
-openwakeword==0.6.0
+openwakeword==0.6.0; sys_platform == "win32"
 packaging==26.3
 pluggy==1.6.0
 proto-plus==1.28.2
@@ -71,7 +79,7 @@ PySide6==6.11.2
 PySide6_Addons==6.11.2
 PySide6_Essentials==6.11.2
 pytest==9.1.1
-pywin32==312
+pywin32==312; sys_platform == "win32"
 pywin32-ctypes==0.2.3
 PyYAML==6.0.3
 requests==2.34.2
