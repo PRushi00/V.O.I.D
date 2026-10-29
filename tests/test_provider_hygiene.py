@@ -8,7 +8,7 @@ import requests
 
 from void.config import Config
 from void.providers import gemini_provider as gp
-from void.providers.base import ProviderUnavailable
+from void.providers.base import CredentialsRejected, ProviderUnavailable
 from void.providers.gemini_provider import (
     DEFAULT_TIMEOUT_S,
     GeminiProvider,
@@ -261,6 +261,159 @@ def test_all_keys_rate_limited_is_provider_unavailable_after_one_attempt_each():
     with pytest.raises(ProviderUnavailable):
         p.generate(MSG)
     assert [k for k, _ in g.built] == [K1, K2]
+
+
+# --- a rejected KEY is not a rejected REQUEST ---------------------------------------------------------
+#
+# Measured against the live API on 2026-10-27: an invalid key answers 400 INVALID_ARGUMENT, not 401 or
+# 403. The status checks in _classify_error missed it, classify_failure called it "invalid_request",
+# and that is the one category _call never rotates on - so a bad primary key meant the other four
+# credentials in the pool were never tried, and the owner was told their REQUEST was invalid.
+
+class _BadKey400(Exception):
+    """The live bad-key error, reproduced including its ``__str__``.
+
+    ``_FakeAPIError`` stringifies to its message alone, but the real ``ClientError`` renders the whole
+    JSON body - and that is the only place ``reason: API_KEY_INVALID`` can be read, because the
+    classifier's message fallback sees ``exc.message`` (the sentence) and ``str(exc)`` (the body) but
+    never ``exc.details``. A fake that hid the reason would let the reason-only case below pass
+    without testing anything, which is exactly what it did on the first run.
+    """
+
+    def __init__(self, message="API key not valid. Please pass a valid API key.",
+                 reason="API_KEY_INVALID"):
+        body = {"error": {"code": 400, "message": message, "status": "INVALID_ARGUMENT",
+                          "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                                       "reason": reason, "domain": "googleapis.com"}]}}
+        super().__init__(f"400 INVALID_ARGUMENT. {body}")
+        self.code, self.status, self.message = 400, "INVALID_ARGUMENT", message
+        self.details = body["error"]["details"]
+
+
+def _bad_key_error(**kw):
+    return _BadKey400(**kw)
+
+
+class _BadKey400RealDetails(_BadKey400):
+    """As the live SDK actually presents it: ``details`` is the WHOLE response body, not the inner list.
+
+    Captured from google-genai 2.22.0 on 2026-10-27. ``_FakeAPIError`` sets ``details`` to the inner
+    list, so a classifier that only understood one of the two shapes would pass the suite and still
+    miss every real bad key. Both shapes are therefore tested.
+    """
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.details = {"error": {"code": 400, "status": "INVALID_ARGUMENT",
+                                  "message": self.message,
+                                  "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                                               "reason": "API_KEY_INVALID",
+                                               "domain": "googleapis.com"}]}}
+
+
+@pytest.mark.parametrize("exc, expected", [
+    (_BadKey400(), "API_KEY_INVALID"),                              # inner list (test-double shape)
+    (_BadKey400RealDetails(), "API_KEY_INVALID"),                   # whole body (live SDK shape)
+    (_FakeAPIError(code=400, status="INVALID_ARGUMENT"), ""),        # details=None
+    (_FakeAPIError(code=400, details="not a container"), ""),       # junk, must not raise
+    (_FakeAPIError(code=400, details={"no": "error key"}), ""),
+])
+def test_the_structured_reason_is_read_from_either_details_shape(exc, expected):
+    assert gp._error_reasons(exc) == expected
+
+
+def test_a_prompt_that_quotes_the_key_error_cannot_classify_itself_as_an_auth_failure():
+    """The reason is read from ``details``, never from ``str(exc)``.
+
+    ``str(exc)`` renders the whole body, and a 400 about the CONTENT of a request can quote that
+    request back - so scanning it would let a prompt containing "api key not valid" cool every
+    credential in the pool. Here the phrase is only in the echoed request, not in the API's own
+    message and not in any reason code, so it must stay an invalid_request.
+    """
+    echoed = _FakeAPIError(
+        code=400, status="INVALID_ARGUMENT",
+        message="Invalid value at contents[0].parts[0]: 'my api key not valid, please help'")
+    assert "api key not valid" in str(echoed).lower()      # the phrase really is in the rendering
+    assert gp._error_reasons(echoed) == ""                  # but it is not a reason code
+    assert gp.classify_failure(echoed) == "invalid_request"
+
+
+@pytest.mark.parametrize("exc", [
+    _bad_key_error(),
+    # The reason alone, should Google ever reword the sentence.
+    _bad_key_error(message="Request had invalid authentication credentials."),
+    # The sentence alone, should the structured detail ever go missing.
+    _FakeAPIError(code=400, status="INVALID_ARGUMENT",
+                  message="API key not valid. Please pass a valid API key."),
+])
+def test_a_400_that_names_the_key_is_an_auth_failure_not_an_invalid_request(exc):
+    assert gp._classify_error(exc) == "auth"
+    assert gp.classify_failure(exc) == "auth"
+
+
+@pytest.mark.parametrize("exc", [
+    _FakeAPIError(code=400, status="INVALID_ARGUMENT", message="thinking_level"),
+    _FakeAPIError(code=400, status="INVALID_ARGUMENT",
+                  message="Manually set deadline 1s is too short. Minimum allowed deadline is 10s."),
+    _FakeAPIError(code=400, status="INVALID_ARGUMENT", message="bad tool schema"),
+    _FakeAPIError(code=400, status="FAILED_PRECONDITION"),
+    _FakeAPIError(code=400, status="INVALID_ARGUMENT"),
+])
+def test_a_genuinely_malformed_request_still_fails_fast_and_never_burns_a_key(exc):
+    """The other half of the fix. Widening 400 to "auth" wholesale would spend every credential in the
+    pool on a request that was wrong to begin with, so these must stay invalid_request."""
+    assert gp.classify_failure(exc) == "invalid_request"
+
+
+def test_a_bad_key_rotates_through_the_pool_instead_of_stopping_at_the_first_one():
+    """The behaviour the dead branch was supposed to provide: five keys, so try the others."""
+    exc = _bad_key_error()
+    p, pool, g = _gem({K1: _raise(exc), K2: _raise(exc)}, names=[PRIMARY, "gemini_02"])
+    with pytest.raises(ProviderUnavailable):
+        p.generate(MSG)
+    # Both credentials were actually built and attempted, in order.
+    assert [k for k, _ in g.built] == [K1, K2]
+    # And each was cooled, so neither is retried on the next request.
+    assert all(c.cooldown_until is not None for c in pool.credentials())
+
+
+def test_an_exhausted_pool_says_why_each_credential_was_given_up_on():
+    """``void preflight`` tells "every credential was refused" apart from "nothing answered" by this
+    type and these categories, and reports the first as a failure. Both facts have to come from the
+    provider, because by the time the pool is empty the individual errors are gone.
+    """
+    exc = _bad_key_error()
+    p, _pool, _g = _gem({K1: _raise(exc), K2: _raise(exc)}, names=[PRIMARY, "gemini_02"])
+    with pytest.raises(CredentialsRejected) as e:
+        p.generate(MSG)
+    assert e.value.categories == frozenset({"auth"})
+    # Still a ProviderUnavailable, so failover and every existing handler are untouched.
+    assert isinstance(e.value, ProviderUnavailable)
+
+
+def test_an_exhausted_pool_distinguishes_quota_from_a_rejected_key():
+    """Different remedies - time against a new key - so the report must not merge them."""
+    p, *_ = _gem({K1: _raise(_FakeAPIError(code=429, status="RESOURCE_EXHAUSTED"))})
+    with pytest.raises(CredentialsRejected) as e:
+        p.generate(MSG)
+    assert e.value.categories == frozenset({"quota"})
+
+
+def test_a_pool_with_one_bad_key_and_one_over_quota_reports_both_causes():
+    p, _pool, _g = _gem({K1: _raise(_bad_key_error()),
+                         K2: _raise(_FakeAPIError(code=429, status="RESOURCE_EXHAUSTED"))},
+                        names=[PRIMARY, "gemini_02"])
+    with pytest.raises(CredentialsRejected) as e:
+        p.generate(MSG)
+    assert e.value.categories == frozenset({"auth", "quota"})
+
+
+def test_a_bad_key_does_not_leak_into_what_the_owner_is_told():
+    secret_text = f"API key not valid: {K1}"
+    p, *_ = _gem({K1: _raise(_bad_key_error(message=secret_text))})
+    with pytest.raises(ProviderUnavailable) as e:
+        p.generate(MSG)
+    assert K1 not in str(e.value)
 
 
 def test_failure_messages_never_contain_a_key_or_the_provider_error_text():

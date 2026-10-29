@@ -193,6 +193,110 @@ def test_a_probe_that_raises_becomes_one_failure_and_the_rest_still_run(home):
     assert "the probe itself raised RuntimeError" in report.probes[0].detail
 
 
+# ----------------------------------------------------------------- the two probes that lied
+
+def test_reading_voids_own_source_is_allowed_but_changing_it_is_not(home):
+    """The policy the engine actually implements, pinned so a probe cannot quietly contradict it again.
+
+    ``void.security.protected`` puts V.O.I.D's own package in the WRITE-deny set and says so in as
+    many words - "refused for mutation only". Its source is public code; the risk is a tool editing
+    the engine underneath itself, not a tool reading it. The preflight probe nonetheless demanded
+    that a READ of ``void/preflight/__init__.py`` be refused, and got away with it for as long as
+    every configuration in sight had allowed roots too narrow to reach the repository at all.
+    """
+    from void.app import Assistant
+    from void.config import _PKG_DIR
+
+    repo = Path(_PKG_DIR).parent
+    assistant = Assistant(config=config_for(home, security={"allowed_roots": [str(repo)]}))
+    own_source = str(Path(_PKG_DIR) / "preflight" / "__init__.py")
+
+    assert assistant.tools.execute("read_file", {"path": own_source}).ok, (
+        "V.O.I.D's own source is write-denied, not read-protected; refusing the read would be a new "
+        "policy, and this test exists so that it cannot arrive by accident")
+    refused = assistant.tools.execute(
+        "write_file", {"path": str(Path(_PKG_DIR) / "nope.py"), "content": "x"})
+    assert not refused.ok and "protected" in (refused.error or "")
+    assert not (Path(_PKG_DIR) / "nope.py").exists()
+
+
+def test_the_engine_protection_probe_rejects_a_refusal_it_did_not_earn(home, monkeypatch):
+    """The defect that hid the first one: a refusal used to count however it was reached.
+
+    A path refused for being outside ``security.allowed_roots`` proves confinement, not protection,
+    and a probe that cannot tell them apart reports a guarantee it never measured. That is exactly
+    what happened here - it passed on this suite's narrow roots for as long as they stayed narrow.
+    """
+    from void.actions.base import ToolResult
+    from void.actions.registry import ToolRegistry
+
+    monkeypatch.setattr(ToolRegistry, "execute", lambda self, name, args: ToolResult.failure(
+        f"'{args['path']}' is outside the allowed roots (nowhere)."))
+
+    probe = by_name(run_preflight(config_for(home), offline=True,
+                                  probes=(preflight._check_engine_protection,)))["engine protection"]
+    assert probe.status == FAIL and "not as protected" in probe.detail
+
+
+def test_a_write_that_reaches_voids_own_package_fails_loudly(home, monkeypatch):
+    from void.actions.base import ToolResult
+    from void.actions.registry import ToolRegistry
+
+    real = ToolRegistry.execute
+
+    def allow_the_write(self, name, args):
+        if name == "write_file":
+            return ToolResult.success("written")
+        return real(self, name, args)
+
+    monkeypatch.setattr(ToolRegistry, "execute", allow_the_write)
+    probe = by_name(run_preflight(config_for(home), offline=True,
+                                  probes=(preflight._check_engine_protection,)))["engine protection"]
+    assert probe.status == FAIL and "own package" in probe.detail
+
+
+def test_allowed_roots_that_cover_a_system_file_warn_rather_than_allege_an_escape(home):
+    """Reading a file INSIDE the allowed roots is the configured behaviour, not a breach.
+
+    The probe used to read a hardcoded hosts file and, on success, report it as "outside
+    security.allowed_roots" - a claim it never checked. With ``allowed_roots: [C:\\]``, which
+    ``void.security.protected`` documents as the owner's own setting and designs around, that file is
+    inside the roots. The breadth of the roots is the real finding and belongs in the report as
+    itself; a FAIL alleging an escape that did not happen only teaches the owner to stop reading.
+    """
+    root = "C:/" if os.name == "nt" else "/"
+    probe = by_name(run_preflight(config_for(home, security={"allowed_roots": [root]}),
+                                  offline=True,
+                                  probes=(preflight._check_confinement,)))["path confinement"]
+    assert probe.status == WARN
+    assert "confinement works" in probe.detail or "cannot be demonstrated" in probe.detail
+    assert "returned content" not in probe.detail
+
+
+def test_confinement_still_fails_when_a_path_outside_the_roots_is_readable(home, monkeypatch):
+    from void.actions.base import ToolResult
+    from void.actions.registry import ToolRegistry
+
+    monkeypatch.setattr(ToolRegistry, "execute",
+                        lambda self, name, args: ToolResult.success("here it is", data="root:x:0:0"))
+    probe = by_name(run_preflight(config_for(home), offline=True,
+                                  probes=(preflight._check_confinement,)))["path confinement"]
+    assert probe.status == FAIL and "returned content" in probe.detail
+
+
+def test_a_path_outside_the_roots_needs_no_existence_to_test_the_check(home):
+    """``_confine`` applies the roots test before it touches the filesystem, which is what lets the
+    probe use a path that cannot exist - and therefore cannot be refused for an unrelated reason."""
+    root = Path(home).resolve()
+    outside = preflight._a_path_outside([root])
+    assert outside is not None and not outside.exists()
+    assert not outside.is_relative_to(root)
+    # Roots that leave nothing outside are reported as such rather than guessed at. On Windows an
+    # unused drive letter is still outside C:\, so exhausting the candidates needs every letter.
+    everything = ([Path(f"{c}:/") for c in "CQRSTUVWXYZ"] if os.name == "nt" else [Path("/")])
+    assert preflight._a_path_outside(everything) is None
+
+
 # ================================================================== it is safe to run
 
 def test_the_probe_note_is_removed_from_the_owners_vault(home):
@@ -443,3 +547,124 @@ def test_the_transient_set_holds_only_categories_the_classifier_defines():
 def test_no_persistent_category_leaked_into_the_transient_set():
     for category in ("auth", "quota", "unsupported_model", "invalid_request"):
         assert category not in preflight._TRANSIENT_FAILURES
+
+
+# ------------------------------------------------------------------------------------------------
+# ... but a pool that was tried and wholly refused IS a verdict on the key
+# ------------------------------------------------------------------------------------------------
+def test_every_credential_refused_fails_instead_of_warning():
+    """The case the set above does not cover, found by reading the merged probes rather than by a run.
+
+    When the pool runs out, ``_call`` raises - and ``classify`` short-circuits on
+    ProviderUnavailable before reading anything, so five rejected keys arrived here as
+    ``unavailable``, a member of _TRANSIENT_FAILURES. The report then said "no evidence about the
+    credential either way" directly beside an exception stating that every credential was rejected,
+    as a WARN, which ``exit_code`` passes. A wholly dead credential set produced a clean preflight.
+
+    The transient set is right about what it covers; this is simply not one of those cases, and the
+    two are told apart by TYPE rather than by the wording of a message.
+    """
+    from void.providers.base import CredentialsRejected
+    ctx = _Ctx()
+    exc = CredentialsRejected(
+        "All 5 Gemini credential(s) are exhausted: each was rejected or rate-limited. A rejected "
+        "key needs replacing ('python -m void set-key gemini'); a rate-limited one needs time.",
+        categories=frozenset({"auth"}))
+    preflight._report_provider_failure(ctx, "provider credential",
+                                       "gemini (gemini-3.5-flash)", exc, 2.4)
+    probe = by_name(ctx.report)["provider credential"]
+    assert probe.status == FAIL
+    assert "no evidence about the credential" not in probe.detail
+    assert "set-key gemini" in probe.detail            # the remedy has to survive into the report
+
+
+def test_the_refusal_is_recognised_by_type_rather_than_by_its_message():
+    """Two exceptions carrying the same sentence, reported differently, because only one of them came
+    from a pool that actually tried every credential.
+
+    Matching the sentence instead would be one provider rewording away from silence, and would put
+    the live-503 regression above back at risk the first time a timeout message mentioned a
+    credential. The cost of deciding by type is that a plain ProviderUnavailable saying the same
+    thing still warns - which is safe only because every exhaustion path raises the subclass, and
+    the next test pins that.
+    """
+    from void.providers.base import CredentialsRejected, ProviderUnavailable
+    sentence = "All 5 Gemini credential(s) are exhausted: each was rejected or rate-limited."
+
+    typed, untyped = _Ctx(), _Ctx()
+    preflight._report_provider_failure(
+        typed, "provider credential", "gemini (x)",
+        CredentialsRejected(sentence, categories=frozenset({"auth"})), 0.1)
+    preflight._report_provider_failure(
+        untyped, "provider credential", "gemini (x)", ProviderUnavailable(sentence), 0.1)
+
+    assert by_name(typed.report)["provider credential"].status == FAIL
+    assert by_name(untyped.report)["provider credential"].status == WARN
+
+
+def test_both_providers_raise_the_typed_exception_when_their_pool_runs_out():
+    """Checked by source because there are three such raise sites across two providers and no single
+    call reaches them all. A site left as a plain ProviderUnavailable would quietly restore the WARN
+    that this whole section exists to remove."""
+    import ast
+    import inspect
+
+    from void.providers import gemini_provider, openai_provider
+
+    for module, marker in ((gemini_provider, "are exhausted"),
+                           (openai_provider, "credentials are unavailable")):
+        tree = ast.parse(inspect.getsource(module))
+        sites = [node for node in ast.walk(tree)
+                 if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call)
+                 and marker in ast.unparse(node.exc)]
+        assert sites, f"{module.__name__}: nothing raises {marker!r} any more - update this test"
+        for node in sites:
+            raised = ast.unparse(node.exc.func)
+            assert raised == "CredentialsRejected", (
+                f"{module.__name__} raises {raised} for an exhausted pool, so preflight will "
+                f"report it as a transient outage")
+
+
+def test_a_pool_that_is_only_rate_limited_warns_without_claiming_ignorance():
+    """OpenAI can exhaust a pool on rate_limit alone, and that genuinely may clear by itself, so it
+    stays a WARN. It must not borrow the transient wording though: "no evidence about the
+    credential" is false when every credential was tried and every one answered 429."""
+    from void.providers.base import CredentialsRejected
+    ctx = _Ctx()
+    preflight._report_provider_failure(
+        ctx, "provider credential", "openai (gpt-x)",
+        CredentialsRejected("All OpenAI credentials are unavailable (last failure: rate_limit).",
+                            categories=frozenset({"rate_limit"})), 0.1)
+    probe = by_name(ctx.report)["provider credential"]
+    assert probe.status == WARN
+    assert "rate_limit" in probe.detail
+    assert "no evidence about the credential" not in probe.detail
+
+
+@pytest.mark.parametrize("categories", [
+    frozenset(),                            # the provider did not say why: not an excuse
+    frozenset({"auth"}),
+    frozenset({"quota"}),
+    frozenset({"missing_value"}),           # a reference with no stored value; not a POLICY key
+    frozenset({"rate_limit", "auth"}),      # one transient cause does not cover for the others
+])
+def test_anything_short_of_a_wholly_transient_pool_fails(categories):
+    from void.providers.base import CredentialsRejected
+    ctx = _Ctx()
+    preflight._report_provider_failure(
+        ctx, "provider credential", "gemini (x)",
+        CredentialsRejected("every credential was refused", categories=categories), 0.1)
+    assert by_name(ctx.report)["provider credential"].status == FAIL
+
+
+def test_the_new_type_changes_nothing_about_retry_or_failover():
+    """CredentialsRejected subclasses ProviderUnavailable so that nothing outside preflight needs to
+    learn about it: classify still answers `unavailable`, the policy is still (1, True), and every
+    existing ``except ProviderUnavailable`` still catches it."""
+    from void.providers.base import CredentialsRejected, ProviderUnavailable
+    from void.providers.failures import classify, policy
+
+    exc = CredentialsRejected("x", categories=frozenset({"auth"}))
+    assert isinstance(exc, ProviderUnavailable)
+    assert classify(exc) == "unavailable"
+    assert policy(classify(exc)) == (1, True)

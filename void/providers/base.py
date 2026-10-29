@@ -52,6 +52,31 @@ class ProviderUnavailable(RuntimeError):
     """Raised when a provider cannot serve a request (no key, offline, ...)."""
 
 
+class CredentialsRejected(ProviderUnavailable):
+    """Every credential in the pool was tried, and every one of them was refused.
+
+    A subclass of :class:`ProviderUnavailable` for exactly the reason :class:`VisionUnsupported` is
+    one: every caller that already handles "this provider cannot serve this request" handles this
+    too, and ``failures.classify`` still answers ``unavailable``, so retry and failover behaviour is
+    unchanged by this class existing.
+
+    What it adds is a distinction the caller cannot otherwise make. "The service did not answer" and
+    "every credential I have was refused" arrive as the same ``ProviderUnavailable``, and they need
+    opposite things said to the owner: the first is no evidence about the credentials at all, the
+    second is decisive evidence about all of them. ``void preflight`` reported the second as a
+    warning saying the first, which is the case this class exists to separate.
+
+    ``categories`` says why each credential was given up on, using ``failures.POLICY``'s names where
+    the provider has them. Ask whether EVERY category is transient rather than matching names one by
+    one: a cause with no POLICY key (a credential reference with no stored value, say) is allowed on
+    purpose and is not transient.
+    """
+
+    def __init__(self, message: str, *, categories: frozenset[str] = frozenset()) -> None:
+        super().__init__(message)
+        self.categories = categories
+
+
 class VisionUnsupported(ProviderUnavailable):
     """Raised when a provider is asked to look at an image and cannot.
 

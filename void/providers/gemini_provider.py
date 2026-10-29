@@ -19,6 +19,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from void.providers.base import (
+    CredentialsRejected,
     LLMProvider,
     LLMResponse,
     ProviderUnavailable,
@@ -94,8 +95,25 @@ def _decode_signature(sig: str | None) -> bytes | None:
 # of re-hammering the same one. An explicit retry delay from the SDK is honored
 # only when it is LONGER than the floor (never shorter, to avoid re-hammering).
 _QUOTA_COOLDOWN_S = 3600     # 429 RESOURCE_EXHAUSTED
-_AUTH_COOLDOWN_S = 3600      # 401/403 invalid credential
+_AUTH_COOLDOWN_S = 3600      # rejected credential: 401/403, or a 400 that names the key as invalid
 _MISSING_COOLDOWN_S = 3600   # credential has no stored value
+
+
+def _error_reasons(exc: object) -> str:
+    """The machine-readable ``reason`` codes from an APIError's details, or "" if there are none.
+
+    Two shapes, both real: the live SDK sets ``details`` to the ENTIRE response body
+    (``{'error': {'code':…, 'details': [...]}}``), while a duck-typed double may set it to the inner
+    list directly. Anything else - None, a string, a surprise - yields "", because this feeds a
+    security-relevant classification and guessing is worse than not knowing.
+    """
+    details = getattr(exc, "details", None)
+    if isinstance(details, dict):
+        error = details.get("error")
+        details = error.get("details") if isinstance(error, dict) else None
+    if not isinstance(details, (list, tuple)):
+        return ""
+    return " ".join(str(d.get("reason", "")) for d in details if isinstance(d, dict))
 
 
 def _classify_error(exc: Exception) -> str:
@@ -114,6 +132,38 @@ def _classify_error(exc: Exception) -> str:
     text = str(getattr(exc, "message", None) or exc)
     if "RESOURCE_EXHAUSTED" in text or " 429" in text:
         return "quota"
+    # A REJECTED KEY IS NOT A REJECTED REQUEST. Measured against the live API on 2026-10-27, an
+    # invalid key answers 400 INVALID_ARGUMENT - not 401 or 403 - so the status checks above miss it
+    # and ``classify_failure`` went on to call it ``invalid_request``. That is the one category
+    # ``_call`` refuses to rotate on, so a single bad primary key stopped every other credential in
+    # the pool from ever being tried: the rotation branch written for exactly this case was dead, and
+    # the owner was told "Gemini rejected the request as invalid" - pointing at their prompt rather
+    # than at their key. What the API actually sends, on the wire:
+    #
+    #   code=400  status='INVALID_ARGUMENT'
+    #   message='API key not valid. Please pass a valid API key.'
+    #   error.details=[{'@type': '...rpc.ErrorInfo', 'reason': 'API_KEY_INVALID', ...}]
+    #
+    # Note that ``exc.details`` is NOT that list: the SDK puts the whole body there. See
+    # :func:`_error_reasons`, which is where that difference is handled.
+    #
+    # The structured reason is the primary signal; the sentence is a fallback for the day a reason
+    # code goes missing. Two things are deliberately avoided here, because a 400 about the CONTENT
+    # of a request can quote that request back:
+    #
+    #   * ``str(exc)`` is never scanned, though the reason is visible in it - that rendering is the
+    #     whole response body, echoed request included;
+    #   * the sentence is matched as a PREFIX, not a substring. Google's own message is exactly
+    #     "API key not valid. Please pass a valid API key."; a complaint about request content starts
+    #     "Invalid value at contents[0]...". A plain ``in`` test would let a prompt that merely
+    #     mentions the phrase classify itself as an auth failure and cool every key in the pool.
+    #
+    # Narrow on purpose - a genuinely malformed request (a bad tool schema, an unsupported thinking
+    # level, a deadline under the API's 10s floor) carries neither signal and still classifies as
+    # invalid_request, which must keep failing fast instead of spending five keys on a bad request.
+    if ("API_KEY_INVALID" in _error_reasons(exc).upper()
+            or text.strip().lower().startswith("api key not valid")):
+        return "auth"
     return "other"
 
 
@@ -566,6 +616,11 @@ class GeminiProvider(LLMProvider):
         """
         pool = self._pool()
         last_exc: Exception | None = None
+        # Why each credential was given up on, in ``failures.POLICY``'s vocabulary. Carried out on
+        # the exception so a caller can tell "every key was refused" from "nothing answered"; see
+        # :class:`CredentialsRejected`. Note that ``_classify_error`` folds 429 into "quota" and
+        # never says "rate_limit", so nothing reaching exhaustion here is transient.
+        kinds: set[str] = set()
 
         # Bounded by the credential count so the loop always terminates: each
         # iteration either succeeds, re-raises, or cools one credential.
@@ -574,9 +629,15 @@ class GeminiProvider(LLMProvider):
             try:
                 cred = pool.get_next_available(now=now)
             except CredentialsExhausted as exc:
-                raise ProviderUnavailable(
-                    "All Gemini credentials are exhausted (quota/cooldown). "
-                    "Add or wait for a credential."
+                raise CredentialsRejected(
+                    # "quota/cooldown" was accurate while a rejected KEY could never reach here: a
+                    # 400 API_KEY_INVALID short-circuited as invalid_request instead of rotating.
+                    # Now that it does rotate, both causes end up at this message, and they need
+                    # opposite remedies - waiting fixes a quota, never a revoked key.
+                    f"All {len(pool)} Gemini credential(s) are exhausted: each was rejected or "
+                    f"rate-limited. A rejected key needs replacing "
+                    f"('python -m void set-key gemini'); a rate-limited one needs time.",
+                    categories=frozenset(kinds),
                 ) from (last_exc or exc)
 
             try:
@@ -586,6 +647,7 @@ class GeminiProvider(LLMProvider):
                 pool.mark_unavailable(
                     cred.name, _cooldown_until(now, _MISSING_COOLDOWN_S))
                 last_exc = exc
+                kinds.add("missing_value")
                 continue
 
             try:
@@ -609,6 +671,7 @@ class GeminiProvider(LLMProvider):
                     pool.mark_unavailable(
                         cred.name, _cooldown_until(now, _QUOTA_COOLDOWN_S, exc))
                     last_exc = exc
+                    kinds.add("quota")
                     continue
                 if kind == "auth":
                     # Invalid credential: cool it and try others - never retry
@@ -616,11 +679,14 @@ class GeminiProvider(LLMProvider):
                     pool.mark_unavailable(
                         cred.name, _cooldown_until(now, _AUTH_COOLDOWN_S))
                     last_exc = exc
+                    kinds.add("auth")
                     continue
                 # 5xx / network / unrecognised: possibly transient, so preserve existing behavior (the agent's
                 # bounded retry loop handles these; there is no retry here).
                 raise
 
-        raise ProviderUnavailable(
-            "All Gemini credentials are exhausted (quota/cooldown)."
+        raise CredentialsRejected(
+            f"All {len(pool)} Gemini credential(s) are exhausted: each was rejected or "
+            f"rate-limited.",
+            categories=frozenset(kinds),
         ) from last_exc
